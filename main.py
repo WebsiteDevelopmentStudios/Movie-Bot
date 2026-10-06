@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -481,6 +480,8 @@ async def download_m3u8(url: str) -> tuple[bool, str, Path | None]:
             "-y",
             "-protocol_whitelist",
             "http,https,tcp,tls,crypto",
+            "-allowed_extensions",
+            "ALL",
             "-i",
             url,
             "-c",
