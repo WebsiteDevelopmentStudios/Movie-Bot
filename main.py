@@ -13,6 +13,8 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+load_dotenv()
+
 BASE_DIR = Path(__file__).resolve().parent
 MOVIES_DIR = BASE_DIR / "Movies"
 CONFIG_FILE = BASE_DIR / "config.json"
@@ -23,11 +25,12 @@ HOST_EXPIRY_BUFFER_SECONDS = 30
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
 active_host = None
 host_lock = asyncio.Lock()
-
-load_dotenv()
+cloudflared_process = None
+cloudflared_log_task = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -462,6 +465,104 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def start_cloudflare_quick_tunnel() -> bool:
+    global PUBLIC_BASE_URL, cloudflared_process, cloudflared_log_task
+
+    if cloudflared_process is not None:
+        return bool(PUBLIC_BASE_URL)
+
+    try:
+        cloudflared_process = await asyncio.create_subprocess_exec(
+            CLOUDFLARED_BIN,
+            "tunnel",
+            "--url",
+            f"http://127.0.0.1:{WEB_PORT}",
+            "--no-autoupdate",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        logger.error("cloudflared was not found. Install cloudflared and make sure it is in PATH.")
+        cloudflared_process = None
+        return False
+    except OSError as exc:
+        logger.error("Could not start cloudflared: %s", exc)
+        cloudflared_process = None
+        return False
+
+    url_pattern = re.compile(r"https://[a-z0-9-]+\\.trycloudflare\\.com", re.IGNORECASE)
+
+    try:
+        while True:
+            line = await asyncio.wait_for(cloudflared_process.stdout.readline(), timeout=60)
+            if not line:
+                break
+
+            text_line = line.decode("utf-8", errors="replace").strip()
+            match = url_pattern.search(text_line)
+            if match:
+                PUBLIC_BASE_URL = match.group(0).rstrip("/")
+                logger.info("Cloudflare Quick Tunnel URL: %s", PUBLIC_BASE_URL)
+                cloudflared_log_task = asyncio.create_task(_drain_cloudflared_output(cloudflared_process))
+                return True
+    except asyncio.TimeoutError:
+        logger.error("Timed out waiting for cloudflared to provide a public URL.")
+    except (OSError, RuntimeError) as exc:
+        logger.error("Could not read cloudflared output: %s", exc)
+
+    if cloudflared_process.returncode is None:
+        cloudflared_process.terminate()
+        try:
+            await asyncio.wait_for(cloudflared_process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            cloudflared_process.kill()
+            await cloudflared_process.wait()
+    cloudflared_process = None
+    return False
+
+
+async def _drain_cloudflared_output(process: asyncio.subprocess.Process) -> None:
+    if process.stdout is None:
+        return
+
+    try:
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            text_line = line.decode("utf-8", errors="replace").strip()
+            if text_line:
+                logger.debug("cloudflared: %s", text_line)
+    except asyncio.CancelledError:
+        raise
+    except OSError as exc:
+        logger.debug("cloudflared output reader stopped: %s", exc)
+
+
+async def stop_cloudflare_quick_tunnel() -> None:
+    global cloudflared_process, cloudflared_log_task, PUBLIC_BASE_URL
+
+    if cloudflared_log_task is not None:
+        cloudflared_log_task.cancel()
+        try:
+            await cloudflared_log_task
+        except asyncio.CancelledError:
+            pass
+        cloudflared_log_task = None
+
+    process = cloudflared_process
+    cloudflared_process = None
+    if process is not None and process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
+    PUBLIC_BASE_URL = ""
+
+
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
@@ -548,6 +649,9 @@ class MovieBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.movie_web_runner = await start_movie_web_server()
+        tunnel_started = await start_cloudflare_quick_tunnel()
+        if not tunnel_started:
+            logger.warning("Movie web hosting is unavailable until cloudflared is installed and running.")
         try:
             synced = await self.tree.sync()
             logger.info("Synced %d slash command(s).", len(synced))
@@ -555,6 +659,7 @@ class MovieBot(discord.Client):
             logger.error("Failed to sync slash commands: %s", exc)
 
     async def close(self) -> None:
+        await stop_cloudflare_quick_tunnel()
         if self.movie_web_runner is not None:
             await self.movie_web_runner.cleanup()
             self.movie_web_runner = None
