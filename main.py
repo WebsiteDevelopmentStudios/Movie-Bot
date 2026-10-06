@@ -1,7 +1,11 @@
+import asyncio
 import json
 import logging
 import os
+import re
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -12,6 +16,8 @@ BASE_DIR = Path(__file__).resolve().parent
 MOVIES_DIR = BASE_DIR / "Movies"
 CONFIG_FILE = BASE_DIR / "config.json"
 SUPPORTED_EXTENSIONS = {".mp4", ".mp3"}
+M3U8_SUFFIX = ".m3u8"
+DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
 
 load_dotenv()
 
@@ -429,9 +435,129 @@ async def movie_list(interaction: discord.Interaction) -> None:
     )
 
 
-@movie_group.command(name="play", description="Send an available movie to the movie channel.")
-@app_commands.describe(movie="Movie name, without the .mp4 or .mp3 extension.")
+def is_m3u8_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return False
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+
+    path = parsed.path.lower()
+    return path.endswith(".m3u8") or ".m3u8" in path
+
+
+def safe_download_name(url: str) -> str:
+    parsed = urlparse(url)
+    raw_name = Path(parsed.path).stem or "movie"
+    raw_name = re.sub(r"[^A-Za-z0-9._ -]+", "", raw_name).strip(" .")
+    raw_name = raw_name[:80] or "movie"
+
+    candidate = MOVIES_DIR / f"{raw_name}.mp4"
+    number = 2
+    while candidate.exists():
+        candidate = MOVIES_DIR / f"{raw_name} ({number}).mp4"
+        number += 1
+    return candidate.name
+
+
+async def download_m3u8(url: str) -> tuple[bool, str, Path | None]:
+    ensure_movies_dir()
+
+    if not is_m3u8_url(url):
+        return False, "That is not a valid HTTP/HTTPS M3U8 URL.", None
+
+    filename = safe_download_name(url)
+    output = MOVIES_DIR / filename
+    temp_output = MOVIES_DIR / f".{filename}.part"
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-protocol_whitelist",
+            "http,https,tcp,tls,crypto",
+            "-i",
+            url,
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return (
+            False,
+            "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.",
+            None,
+        )
+    except OSError as exc:
+        logger.warning("Could not start FFmpeg: %s", exc)
+        return False, "I could not start the M3U8 download.", None
+
+    try:
+        _, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        temp_output.unlink(missing_ok=True)
+        return False, "The M3U8 download timed out after 30 minutes.", None
+
+    if process.returncode != 0 or not temp_output.exists():
+        error_text = stderr.decode("utf-8", errors="replace").strip()
+        logger.warning("FFmpeg M3U8 download failed: %s", error_text[-2000:])
+        temp_output.unlink(missing_ok=True)
+        return (
+            False,
+            "FFmpeg could not download that M3U8 stream. The URL may be expired, protected, or incompatible.",
+            None,
+        )
+
+    try:
+        temp_output.replace(output)
+    except OSError as exc:
+        logger.warning("Could not finalize downloaded movie: %s", exc)
+        temp_output.unlink(missing_ok=True)
+        return False, "The download completed, but I could not save the movie.", None
+
+    return True, f"Downloaded {output.stem} into the Movies folder.", output
+
+
+@movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
+@app_commands.describe(movie="Movie name, or an HTTP/HTTPS .m3u8 URL.")
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
+    if is_m3u8_url(movie):
+        await interaction.response.defer(ephemeral=True)
+        success, message, downloaded = await download_m3u8(movie)
+
+        if not success or downloaded is None:
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        success, send_message = await send_movie(downloaded, interaction.user)
+        if success:
+            await interaction.followup.send(
+                f"{message} {send_message}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"{message} However, I could not send it to Discord: {send_message}",
+                ephemeral=True,
+            )
+        return
+
     if not get_movie_files():
         await interaction.response.send_message(
             "No movies are currently available.",
@@ -442,7 +568,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     selected = find_movie(movie)
     if selected is None:
         await interaction.response.send_message(
-            "That movie is not available. Use /movie list to see the available movies.",
+            "That movie is not available. Use /movie list or provide an HTTP/HTTPS .m3u8 URL.",
             ephemeral=True,
         )
         return
