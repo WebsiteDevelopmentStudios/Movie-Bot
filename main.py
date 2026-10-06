@@ -1481,6 +1481,38 @@ async def finish_m3u8_host(
                 return
             current["downloading"] = False
             current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
+            message_id = current.get("discord_message_id")
+            channel_id = current.get("discord_channel_id")
+
+        # Discord may cache the first URL it unfurls. While the M3U8 is
+        # downloading, /media/<token> intentionally redirects to the web
+        # player, so do not give Discord the direct-media URL until the MP4
+        # actually exists. Editing the message after completion gives Discord
+        # a fresh direct MP4 URL to unfurl.
+        if message_id and channel_id and output.exists():
+            try:
+                channel = bot.get_channel(channel_id)
+                if channel is None:
+                    fetched = await bot.fetch_channel(channel_id)
+                    channel = fetched if isinstance(fetched, discord.TextChannel) else None
+                if channel is not None:
+                    message = await channel.fetch_message(message_id)
+                    direct_media_url = f"{PUBLIC_BASE_URL}/media/{token}"
+                    embed = discord.Embed(
+                        title=f"Now Playing: {output.stem}",
+                        description=f"[▶ Watch Movie]({f'{PUBLIC_BASE_URL}/movie/{token}'})",
+                        color=discord.Color.blurple(),
+                    )
+                    embed.add_field(name="Format", value="MP4", inline=True)
+                    embed.add_field(name="Playback", value="Streaming", inline=True)
+                    embed.set_footer(text="Direct video preview is now available.")
+                    await message.edit(
+                        content=f"▶ **Now Playing:** {output.stem}\n{direct_media_url}",
+                        embed=embed,
+                    )
+                    logger.info("Updated Discord movie message with direct MP4 preview: %s", token)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("Could not update Discord movie embed for %s: %s", token, exc)
 
         await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
         await clear_hosted_movie(token, reason="completed movie expired")
@@ -1543,15 +1575,18 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
                 if active_host is not None
                 else player_url
             )
-            await channel.send(
+            posted_message = await channel.send(
                 content=(
                     f"▶ **Now Playing:** {movie_name}\n"
-                    f"{direct_media_url}\n\n"
-                    f"Web player: {player_url}"
+                    f"{player_url}"
                 ),
                 embed=embed,
                 suppress_embeds=False,
             )
+            async with host_lock:
+                if active_host is not None and active_host["token"] == active_host.get("token"):
+                    active_host["discord_message_id"] = posted_message.id
+                    active_host["discord_channel_id"] = channel.id
             await interaction.followup.send(
                 f"Now streaming {movie_name} in {channel.mention}.",
                 ephemeral=True,
