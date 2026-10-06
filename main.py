@@ -242,7 +242,7 @@ class MovieConfirmView(discord.ui.View):
         embed.set_footer(text="This movie link expires automatically when the movie ends.")
 
         try:
-            await channel.send(embed=embed)
+            await channel.send(content=message, embed=embed)
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
             await interaction.edit_original_response(content="I could not post the movie player in the configured channel.", view=self)
@@ -628,12 +628,17 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} - Movie Bot</title>
-<meta property="og:title" content="{title}">
-<meta property="og:description" content="Watch {title}">
+<meta property="og:title" content="Watch {title}">
+<meta property="og:description" content="Watch {title} directly in your browser.">
 <meta property="og:type" content="video.other">
 <meta property="og:url" content="{PUBLIC_BASE_URL}/movie/{token}">
+<meta property="og:video" content="{PUBLIC_BASE_URL}/media/{token}">
+<meta property="og:video:secure_url" content="{PUBLIC_BASE_URL}/media/{token}">
+<meta property="og:video:type" content="video/mp4">
+<meta property="og:video:width" content="1280">
+<meta property="og:video:height" content="720">
 <meta name="twitter:card" content="player">
-<meta name="twitter:title" content="{title}">
+<meta name="twitter:title" content="Watch {title}">
 <style>
 body {{
     margin: 0;
@@ -675,6 +680,34 @@ h1 {{
         text=html,
         content_type="text/html",
         headers={"Cache-Control": "no-store"},
+    )
+
+
+async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
+    """Serve the original MP4 as a direct video URL for Discord crawlers."""
+    token = request.match_info.get("token", "")
+    current = await _get_active_host(token)
+    if current is None:
+        return web.Response(status=404, text="Movie is no longer being hosted.")
+
+    movie = current["movie"]
+    if movie.suffix.lower() != ".mp4":
+        return web.Response(status=404, text="Direct video preview is unavailable for this media.")
+
+    try:
+        resolved = movie.resolve()
+        if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
+            return web.Response(status=404, text="Movie is no longer being hosted.")
+    except OSError:
+        return web.Response(status=404, text="Movie is no longer being hosted.")
+
+    return web.FileResponse(
+        path=resolved,
+        headers={
+            "Content-Type": "video/mp4",
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
+        },
     )
 
 
@@ -856,6 +889,7 @@ async def stop_cloudflare_quick_tunnel() -> None:
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
+    app.router.add_get("/media/{token}", hosted_media_handler)
     app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1161,7 +1195,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         embed.add_field(name="Format", value=downloaded.suffix.lower().lstrip(".").upper())
         embed.set_footer(text="This movie link expires automatically when the movie ends.")
         try:
-            await channel.send(embed=embed)
+            await channel.send(content=message, embed=embed)
             await interaction.followup.send(f"{message} Now hosting {downloaded.stem} in {channel.mention}.", ephemeral=True)
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
@@ -1211,7 +1245,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     embed.add_field(name="Format", value=selected.suffix.lower().lstrip(".").upper())
     embed.set_footer(text="This movie link expires automatically when the movie ends.")
     try:
-        await channel.send(embed=embed)
+        await channel.send(content=message, embed=embed)
         await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
     except (discord.Forbidden, discord.HTTPException):
         await clear_hosted_movie(active_host["token"] if active_host else "")
