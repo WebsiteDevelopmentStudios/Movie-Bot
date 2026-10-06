@@ -557,11 +557,19 @@ async def _get_active_host(token: str):
             resolved_hls = hls_dir.resolve()
             if (
                 resolved_movie.parent != MOVIES_DIR.resolve()
-                or not resolved_movie.is_file()
                 or resolved_hls.parent != HLS_CACHE_DIR.resolve()
                 or not resolved_hls.is_dir()
             ):
                 return None
+
+            # An M3U8 movie is playable before its MP4 file is complete.
+            # During that phase the HLS cache is the source of truth.
+            if not resolved_movie.is_file():
+                if not current.get("downloading"):
+                    return None
+                ffmpeg_process = current.get("ffmpeg_process")
+                if ffmpeg_process is None or ffmpeg_process.returncode is not None:
+                    return None
         except OSError:
             return None
 
