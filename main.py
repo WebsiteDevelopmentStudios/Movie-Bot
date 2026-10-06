@@ -303,59 +303,53 @@ async def send_movie(movie: Path, requester: discord.abc.User) -> tuple[bool, st
     return True, f"Sent {resolved.stem} to <#{channel.id}>."
 
 
-class TextChannelPicker(app_commands.Transformer):
-    # Keep Discord's native channel picker while resolving the selected
-    # channel ourselves. This avoids discord.py's cache-only conversion
-    # failure when the selected channel is not currently cached.
-    type = discord.AppCommandOptionType.channel
+class ChannelLinkView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="Choose the movie channel...",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.channel_select.callback = self.channel_selected
+        self.add_item(self.channel_select)
 
-    async def transform(
-        self,
-        interaction: discord.Interaction,
-        value: str,
-    ) -> discord.TextChannel:
-        try:
-            channel_id = int(value)
-        except (TypeError, ValueError) as exc:
-            raise app_commands.TransformerError(
-                value,
-                self.type,
-                self,
-            ) from exc
+    async def channel_selected(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This channel selector belongs to the administrator who opened it.",
+                ephemeral=True,
+            )
+            return
 
-        channel = None
-
-        if interaction.guild is not None:
-            channel = interaction.guild.get_channel(channel_id)
-
-        if channel is None:
-            channel = bot.get_channel(channel_id)
-
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                raise app_commands.TransformerError(
-                    value,
-                    self.type,
-                    self,
-                ) from exc
-
+        channel = self.channel_select.values[0]
         if not isinstance(channel, discord.TextChannel):
-            raise app_commands.TransformerError(
-                value,
-                self.type,
-                self,
+            await interaction.response.send_message(
+                "Please select a text channel.",
+                ephemeral=True,
             )
+            return
 
-        if interaction.guild is not None and channel.guild.id != interaction.guild.id:
-            raise app_commands.TransformerError(
-                value,
-                self.type,
-                self,
+        config["channel_id"] = channel.id
+        try:
+            save_config(config)
+        except OSError as exc:
+            logger.error("Could not save config: %s", exc)
+            await interaction.response.send_message(
+                "I could not save the channel configuration.",
+                ephemeral=True,
             )
+            return
 
-        return channel
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"Movie channel linked to {channel.mention}.",
+            view=self,
+        )
+        self.stop()
 
 
 class MovieBot(discord.Client):
@@ -388,27 +382,12 @@ movie_group = app_commands.Group(
 )
 
 
-@channel_group.command(name="link", description="Set the channel where movies will be sent.")
-@app_commands.describe(channel="The Discord text channel to use for movies.")
+@channel_group.command(name="link", description="Choose the channel where movies will be sent.")
 @app_commands.checks.has_permissions(administrator=True)
-async def channel_link(
-    interaction: discord.Interaction,
-    channel: app_commands.Transform[discord.TextChannel, TextChannelPicker],
-) -> None:
-    config["channel_id"] = channel.id
-
-    try:
-        save_config(config)
-    except OSError as exc:
-        logger.error("Could not save config: %s", exc)
-        await interaction.response.send_message(
-            "I could not save the channel configuration.",
-            ephemeral=True,
-        )
-        return
-
+async def channel_link(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
-        f"Movie channel linked to {channel.mention}.",
+        "Choose the Discord text channel where movies should be sent:",
+        view=ChannelLinkView(interaction.user.id),
         ephemeral=True,
     )
 
