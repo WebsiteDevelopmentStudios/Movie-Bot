@@ -1005,44 +1005,44 @@ async def stop_cloudflare_quick_tunnel() -> None:
     PUBLIC_BASE_URL = ""
 
 
+async def hosted_cdn_handler(request: web.Request) -> web.StreamResponse:
+    """Serve completed MP4s from a direct .mp4 URL for Discord media detection."""
+    token = request.match_info["token"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token):
+        raise web.HTTPNotFound()
+
+    async with host_lock:
+        current = active_host
+        if current is None or not secrets.compare_digest(current["token"], token):
+            raise web.HTTPNotFound()
+        movie = current["movie"]
+        downloading = current.get("downloading", False)
+
+    if downloading or not movie.exists() or not movie.is_file():
+        raise web.HTTPNotFound()
+
+    try:
+        resolved = movie.resolve()
+        if resolved.parent != MOVIES_DIR.resolve() or resolved.suffix.lower() != ".mp4":
+            raise web.HTTPNotFound()
+    except OSError:
+        raise web.HTTPNotFound()
+
+    return web.FileResponse(
+        resolved,
+        headers={
+            "Content-Type": "video/mp4",
+            "Content-Disposition": "inline",
+            "Cache-Control": "public, max-age=30",
+            "Accept-Ranges": "bytes",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
-    async def hosted_cdn_handler(request: web.Request) -> web.StreamResponse:
-        """Serve completed MP4s from a direct .mp4 URL for Discord media detection."""
-        token = request.match_info["token"]
-        if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token):
-            raise web.HTTPNotFound()
-
-        async with host_lock:
-            current = active_host
-            if current is None or not secrets.compare_digest(current["token"], token):
-                raise web.HTTPNotFound()
-            movie = current["movie"]
-            downloading = current.get("downloading", False)
-
-        if downloading or not movie.exists() or not movie.is_file():
-            raise web.HTTPNotFound()
-
-        try:
-            resolved = movie.resolve()
-            if resolved.parent != MOVIES_DIR.resolve() or resolved.suffix.lower() != ".mp4":
-                raise web.HTTPNotFound()
-        except OSError:
-            raise web.HTTPNotFound()
-
-        return web.FileResponse(
-            resolved,
-            headers={
-                "Content-Type": "video/mp4",
-                "Content-Disposition": "inline",
-                "Cache-Control": "public, max-age=30",
-                "Accept-Ranges": "bytes",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-
-app.router.add_get("/media/{token}", hosted_media_handler)
+    app.router.add_get("/media/{token}", hosted_media_handler)
     app.router.add_get("/cdn/{token}.mp4", hosted_cdn_handler)
     app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
     app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
