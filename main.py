@@ -568,14 +568,13 @@ async def _get_active_host(token: str):
             ):
                 return None
 
-            # An M3U8 movie is playable before its MP4 file is complete.
-            # During that phase the HLS cache is the source of truth.
-            if not resolved_movie.is_file():
-                if not current.get("downloading"):
-                    return None
-                ffmpeg_process = current.get("ffmpeg_process")
-                if ffmpeg_process is None or ffmpeg_process.returncode is not None:
-                    return None
+            # The HLS cache is the source of truth while an M3U8 movie is
+            # being prepared. Do not reject the host just because the final
+            # MP4 has not been written yet; the browser player can use HLS.
+            if not resolved_movie.is_file() and not current.get("downloading"):
+                # A completed host must have its final media file available.
+                # (The normal local-file host also requires this.)
+                return None
         except OSError:
             return None
 
@@ -762,19 +761,17 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
 
     try:
         resolved = movie.resolve()
-        if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
-            # During an active M3U8 download there is no completed MP4 yet.
-            # Send browsers to the HLS player instead of exposing a misleading
-            # "not ready" error.
-            if current.get("downloading"):
-                raise web.HTTPFound(location=f"/movie/{token}")
-            return web.Response(status=404, text="Movie is not ready yet.")
+        if resolved.parent != MOVIES_DIR.resolve():
+            return web.Response(status=404, text="Movie is unavailable.")
+        if not resolved.is_file():
+            # An active M3U8 host may not have its final MP4 yet. Always send
+            # it to the HLS player instead of exposing a misleading readiness
+            # error.
+            raise web.HTTPFound(location=f"/movie/{token}")
     except web.HTTPException:
         raise
     except OSError:
-        if current.get("downloading"):
-            raise web.HTTPFound(location=f"/movie/{token}")
-        return web.Response(status=404, text="Movie is not ready yet.")
+        raise web.HTTPFound(location=f"/movie/{token}")
 
     # aiohttp's FileResponse handles byte ranges, which Discord and browsers
     # need when probing/streaming large MP4 files.
