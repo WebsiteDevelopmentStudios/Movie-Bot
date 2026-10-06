@@ -384,7 +384,7 @@ async def get_media_duration(movie: Path) -> float | None:
         return None
 
 
-async def clear_hosted_movie(token: str) -> None:
+async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
     global active_host
 
     async with host_lock:
@@ -394,11 +394,14 @@ async def clear_hosted_movie(token: str) -> None:
         current = active_host
         task = current.get("task")
         ffmpeg_process = current.get("ffmpeg_process")
+        stderr_task = current.get("ffmpeg_stderr_task")
         hls_dir = current.get("hls_dir")
         active_host = None
 
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+        if stderr_task is not None and stderr_task is not asyncio.current_task():
+            stderr_task.cancel()
 
     if ffmpeg_process is not None and ffmpeg_process.returncode is None:
         ffmpeg_process.terminate()
@@ -417,7 +420,7 @@ async def clear_hosted_movie(token: str) -> None:
         except OSError:
             pass
 
-    logger.info("Hosted movie expired and HLS cache removed.")
+    logger.info("Hosted movie cleanup: %s.", reason)
 
 
 async def expire_hosted_movie(token: str, duration: float) -> None:
@@ -1149,11 +1152,18 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             hls_dir.rmdir()
             return False, "I could not start the M3U8 stream.", None
 
+        ffmpeg_stderr_lines: list[str] = []
+        ffmpeg_stderr_task = asyncio.create_task(
+            _collect_ffmpeg_stderr(process, ffmpeg_stderr_lines)
+        )
+
         active_host = {
             "token": token,
             "movie": output,
             "hls_dir": hls_dir,
             "ffmpeg_process": process,
+            "ffmpeg_stderr_lines": ffmpeg_stderr_lines,
+            "ffmpeg_stderr_task": ffmpeg_stderr_task,
             "expires_at": float("inf"),
             "task": None,
             "downloading": True,
@@ -1179,14 +1189,13 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
                 return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
         if process.returncode is not None:
-            _, stderr = await process.communicate()
-            error_text = stderr.decode("utf-8", errors="replace").strip()
+            error_text = "\n".join(ffmpeg_stderr_lines[-50:])
             logger.error(
                 "FFmpeg exited before M3U8 playback became ready (code %s): %s",
                 process.returncode,
                 error_text[-5000:] or "(no stderr output)",
             )
-            await clear_hosted_movie(token)
+            await clear_hosted_movie(token, reason="FFmpeg exited before playback started")
             return False, "FFmpeg could not start playback. Check the bot console for the FFmpeg error.", None
 
         if _ % 10 == 0:
@@ -1195,8 +1204,25 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         await asyncio.sleep(0.5)
 
     logger.error("M3U8 playback did not produce playable HLS data within 150 seconds: %s", url)
-    await clear_hosted_movie(token)
+    await clear_hosted_movie(token, reason="M3U8 startup timeout")
     return False, "The M3U8 stream took too long to start. Check the bot console for the FFmpeg error.", None
+
+
+async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: list[str]) -> None:
+    if process.stderr is None:
+        return
+    try:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            value = line.decode("utf-8", errors="replace").rstrip()
+            if value:
+                lines.append(value)
+                if len(lines) > 100:
+                    del lines[:-100]
+    except asyncio.CancelledError:
+        raise
 
 
 async def finish_m3u8_host(
@@ -1206,35 +1232,41 @@ async def finish_m3u8_host(
     output: Path,
 ) -> None:
     try:
-        _, stderr = await process.communicate()
-        error_text = stderr.decode("utf-8", errors="replace").strip()
+        await process.wait()
 
         async with host_lock:
             current = active_host
             if current is None or current["token"] != token:
                 return
+            stderr_task = current.get("ffmpeg_stderr_task")
+            stderr_lines = current.get("ffmpeg_stderr_lines", [])
 
+        if stderr_task is not None:
+            await stderr_task
+
+        error_text = "\n".join(stderr_lines[-100:])
         if process.returncode != 0 or not playlist.exists() or playlist.stat().st_size == 0:
-            logger.warning("M3U8 download failed after playback started: %s", error_text[-2000:])
-            await clear_hosted_movie(token)
+            logger.error(
+                "FFmpeg finished M3U8 download with code %s: %s",
+                process.returncode,
+                error_text[-5000:] or "(no stderr output)",
+            )
+            await clear_hosted_movie(token, reason="M3U8 download failed")
             return
 
-        # The network download is now complete. Convert the already-downloaded
-        # HLS segments into the normal Movies/*.mp4 file without downloading
-        # the source a second time.
         async with host_lock:
             current = active_host
             if current is None or current["token"] != token:
                 return
             current["downloading"] = False
 
+        # Convert the cached HLS segments into the normal local MP4 without
+        # contacting the original M3U8 URL again.
         remux_temp = output.with_name(f".{output.name}.part")
         try:
             remux = await asyncio.create_subprocess_exec(
                 "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-y",
+                "-hide_banner", "-loglevel", "error", "-y",
                 "-allowed_extensions", "ALL",
                 "-i", str(playlist),
                 "-c", "copy",
@@ -1246,8 +1278,10 @@ async def finish_m3u8_host(
             )
             _, remux_stderr = await remux.communicate()
             if remux.returncode != 0 or not remux_temp.exists() or remux_temp.stat().st_size == 0:
-                remux_error = remux_stderr.decode("utf-8", errors="replace").strip()
-                logger.warning("Could not save completed M3U8 movie as MP4: %s", remux_error[-2000:])
+                logger.warning(
+                    "Could not save completed M3U8 movie as MP4: %s",
+                    remux_stderr.decode("utf-8", errors="replace")[-5000:],
+                )
                 remux_temp.unlink(missing_ok=True)
             else:
                 remux_temp.replace(output)
@@ -1262,63 +1296,12 @@ async def finish_m3u8_host(
             current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
 
         await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
-        await clear_hosted_movie(token)
+        await clear_hosted_movie(token, reason="completed movie expired")
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.warning("M3U8 streaming task failed: %s", exc)
-        await clear_hosted_movie(token)
-
-
-async def finish_m3u8_host(
-    token: str,
-    process: asyncio.subprocess.Process,
-    temp_output: Path,
-    output: Path,
-) -> None:
-    try:
-        _, stderr = await process.communicate()
-        error_text = stderr.decode("utf-8", errors="replace").strip()
-
-        async with host_lock:
-            current = active_host
-            if current is None or current["token"] != token:
-                return
-
-        if process.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
-            logger.warning("M3U8 download failed after playback started: %s", error_text[-2000:])
-            await clear_hosted_movie(token)
-            temp_output.unlink(missing_ok=True)
-            return
-
-        try:
-            temp_output.replace(output)
-        except OSError as exc:
-            logger.warning("Could not finalize M3U8 movie: %s", exc)
-            await clear_hosted_movie(token)
-            temp_output.unlink(missing_ok=True)
-            return
-
-        async with host_lock:
-            current = active_host
-            if current is None or current["token"] != token:
-                return
-            current["movie"] = output
-            current["downloading"] = False
-            # Keep the player alive briefly after the source finishes so the
-            # final HLS segments can be watched before the cache is removed.
-            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
-
-        await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
-        await clear_hosted_movie(token)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning("M3U8 streaming task failed: %s", exc)
-        await clear_hosted_movie(token)
-        temp_output.unlink(missing_ok=True)
-
-
+        logger.exception("M3U8 streaming task failed: %s", exc)
+        await clear_hosted_movie(token, reason="M3U8 streaming task failed")
 
 
 @movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
