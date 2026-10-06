@@ -1084,7 +1084,7 @@ def safe_download_name(url: str) -> str:
 
 
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
-    """Stream an M3U8 immediately and save the completed HLS stream as MP4."""
+    """Start an HLS player as soon as FFmpeg has produced playable data."""
     global active_host
 
     ensure_movies_dir()
@@ -1117,14 +1117,10 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         playlist = hls_dir / "playlist.m3u8"
 
         try:
-            # Use HLS as the primary download target. This is deliberately
-            # separate from MP4 output because FFmpeg's tee muxer can fail
-            # when an MP4 output and HLS output have different finalization
-            # requirements. The HLS segments are later remuxed locally to MP4.
             process = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-hide_banner",
-                "-loglevel", "error",
+                "-loglevel", "warning",
                 "-y",
                 "-protocol_whitelist", "http,https,tcp,tls,crypto",
                 "-allowed_extensions", "ALL",
@@ -1149,7 +1145,7 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             hls_dir.rmdir()
             return False, "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.", None
         except OSError as exc:
-            logger.warning("Could not start streaming M3U8 download: %s", exc)
+            logger.exception("Could not start FFmpeg for M3U8 stream: %s", exc)
             hls_dir.rmdir()
             return False, "I could not start the M3U8 stream.", None
 
@@ -1167,22 +1163,38 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             finish_m3u8_host(token, process, playlist, output)
         )
 
-    # Wait only for the first HLS playlist, not the entire movie.
-    for _ in range(120):
+    # Do not require a completed VOD playlist. A growing EVENT playlist is
+    # enough as soon as it contains at least one segment.
+    for _ in range(300):
         if playlist.exists() and playlist.stat().st_size > 0:
-            if progress is not None:
-                await progress("Embedding movie...")
-            return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+            try:
+                playlist_text = playlist.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                playlist_text = ""
+
+            if "#EXTINF:" in playlist_text or "#EXT-X-MAP:" in playlist_text:
+                if progress is not None:
+                    await progress("Embedding movie...")
+                logger.info("M3U8 playback ready: %s", token)
+                return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
         if process.returncode is not None:
             _, stderr = await process.communicate()
             error_text = stderr.decode("utf-8", errors="replace").strip()
-            logger.warning("M3U8 streaming failed: %s", error_text[-2000:])
+            logger.error(
+                "FFmpeg exited before M3U8 playback became ready (code %s): %s",
+                process.returncode,
+                error_text[-5000:] or "(no stderr output)",
+            )
             await clear_hosted_movie(token)
-            return False, "FFmpeg could not start playback for that M3U8 URL.", None
+            return False, "FFmpeg could not start playback. Check the bot console for the FFmpeg error.", None
+
+        if _ % 10 == 0:
+            logger.info("Waiting for M3U8 playback data... %.1fs", _ * 0.5)
 
         await asyncio.sleep(0.5)
 
+    logger.error("M3U8 playback did not produce playable HLS data within 150 seconds: %s", url)
     await clear_hosted_movie(token)
     return False, "The M3U8 stream took too long to start. Check the bot console for the FFmpeg error.", None
 
