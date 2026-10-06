@@ -303,10 +303,66 @@ async def send_movie(movie: Path, requester: discord.abc.User) -> tuple[bool, st
     return True, f"Sent {resolved.stem} to <#{channel.id}>."
 
 
-class MovieBot(commands.Bot):
+class TextChannelPicker(app_commands.Transformer):
+    # Keep Discord's native channel picker while resolving the selected
+    # channel ourselves. This avoids discord.py's cache-only conversion
+    # failure when the selected channel is not currently cached.
+    type = discord.AppCommandOptionType.channel
+
+    async def transform(
+        self,
+        interaction: discord.Interaction,
+        value: str,
+    ) -> discord.TextChannel:
+        try:
+            channel_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise app_commands.TransformerError(
+                value,
+                self.type,
+                self,
+            ) from exc
+
+        channel = None
+
+        if interaction.guild is not None:
+            channel = interaction.guild.get_channel(channel_id)
+
+        if channel is None:
+            channel = bot.get_channel(channel_id)
+
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                raise app_commands.TransformerError(
+                    value,
+                    self.type,
+                    self,
+                ) from exc
+
+        if not isinstance(channel, discord.TextChannel):
+            raise app_commands.TransformerError(
+                value,
+                self.type,
+                self,
+            )
+
+        if interaction.guild is not None and channel.guild.id != interaction.guild.id:
+            raise app_commands.TransformerError(
+                value,
+                self.type,
+                self,
+            )
+
+        return channel
+
+
+class MovieBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         try:
@@ -337,7 +393,7 @@ movie_group = app_commands.Group(
 @app_commands.checks.has_permissions(administrator=True)
 async def channel_link(
     interaction: discord.Interaction,
-    channel: discord.TextChannel,
+    channel: app_commands.Transform[discord.TextChannel, TextChannelPicker],
 ) -> None:
     config["channel_id"] = channel.id
 
