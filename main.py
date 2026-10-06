@@ -413,9 +413,12 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
 
     if hls_dir is not None:
         try:
-            for path in hls_dir.iterdir():
+            for path in hls_dir.rglob("*"):
                 if path.is_file():
                     path.unlink(missing_ok=True)
+            for path in sorted(hls_dir.rglob("*"), reverse=True):
+                if path.is_dir():
+                    path.rmdir()
             hls_dir.rmdir()
         except OSError:
             pass
@@ -588,6 +591,12 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
     movie = current["movie"]
     title = escape(movie.stem)
     playlist_url = f"/hls/{token}/playlist.m3u8"
+    parts = current.get("parts")
+    part_urls = (
+        [f"/parts/{token}/part1.mp4", f"/parts/{token}/part2.mp4"]
+        if parts is not None and len(parts) == 2
+        else []
+    )
 
     if movie.suffix.lower() == ".mp4":
         player = f"""
@@ -596,21 +605,65 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
         <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
         <script>
         const video = document.getElementById("player");
-        const source = {json.dumps(playlist_url)};
-        if (video.canPlayType("application/vnd.apple.mpegurl")) {{
-            video.src = source;
-        }} else if (window.Hls && Hls.isSupported()) {{
-            const hls = new Hls({{
-                enableWorker: true,
-                lowLatencyMode: false,
-                backBufferLength: 30
-            }});
-            hls.loadSource(source);
-            hls.attachMedia(video);
-        }} else {{
-            document.getElementById("status").textContent =
-                "This browser does not support HLS playback.";
+        const parts = {json.dumps(part_urls)};
+        const hlsSource = {json.dumps(playlist_url)};
+
+        async function playHostedMovie() {{
+            // Once both large parts exist, append them to one MediaSource.
+            // This avoids changing the video element's src at the halfway point.
+            if (parts.length === 2 && window.MediaSource && MediaSource.isTypeSupported("video/mp4")) {{
+                try {{
+                    const mediaSource = new MediaSource();
+                    video.src = URL.createObjectURL(mediaSource);
+                    await new Promise(resolve =>
+                        mediaSource.addEventListener("sourceopen", resolve, {{once: true}})
+                    );
+                    const buffer = mediaSource.addSourceBuffer("video/mp4");
+
+                    for (const url of parts) {{
+                        const response = await fetch(url);
+                        if (!response.ok) throw new Error("Movie part unavailable");
+                        const data = await response.arrayBuffer();
+                        await new Promise((resolve, reject) => {{
+                            const onEnd = () => {{
+                                buffer.removeEventListener("updateend", onEnd);
+                                resolve();
+                            }};
+                            const onError = () => {{
+                                buffer.removeEventListener("updateend", onEnd);
+                                reject(new Error("Media buffer error"));
+                            }};
+                            buffer.addEventListener("updateend", onEnd);
+                            buffer.addEventListener("error", onError, {{once: true}});
+                            buffer.appendBuffer(data);
+                        }});
+                    }}
+
+                    if (mediaSource.readyState === "open") mediaSource.endOfStream();
+                    document.getElementById("status").textContent = "Playing movie";
+                    return;
+                }} catch (error) {{
+                    console.warn("Two-part playback unavailable, using HLS fallback.", error);
+                }}
+            }}
+
+            if (video.canPlayType("application/vnd.apple.mpegurl")) {{
+                video.src = hlsSource;
+            }} else if (window.Hls && Hls.isSupported()) {{
+                const hls = new Hls({{
+                    enableWorker: true,
+                    lowLatencyMode: false,
+                    backBufferLength: 30
+                }});
+                hls.loadSource(hlsSource);
+                hls.attachMedia(video);
+            }} else {{
+                document.getElementById("status").textContent =
+                    "This browser does not support HLS playback.";
+            }}
         }}
+
+        playHostedMovie();
         </script>
         """
     else:
@@ -725,6 +778,39 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
             "Accept-Ranges": "bytes",
         },
     )
+
+async def hosted_part_handler(request: web.Request) -> web.StreamResponse:
+    token = request.match_info.get("token", "")
+    filename = request.match_info.get("filename", "")
+    current = await _get_active_host(token)
+    if current is None:
+        return web.Response(status=404, text="Movie is no longer being hosted.")
+
+    if filename not in {"part1.mp4", "part2.mp4"}:
+        return web.Response(status=404, text="Movie part not found.")
+
+    parts_dir = current.get("parts_dir")
+    if parts_dir is None:
+        return web.Response(status=404, text="Movie parts are not ready.")
+
+    target = Path(parts_dir) / filename
+    try:
+        resolved = target.resolve()
+        if resolved.parent != Path(parts_dir).resolve() or not resolved.is_file():
+            return web.Response(status=404, text="Movie part not found.")
+    except OSError:
+        return web.Response(status=404, text="Movie part not found.")
+
+    return web.FileResponse(
+        path=resolved,
+        headers={
+            "Content-Type": "video/mp4",
+            "Content-Disposition": "inline",
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
 
 async def hosted_hls_handler(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token", "")
@@ -917,6 +1003,7 @@ async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
     app.router.add_get("/media/{token}", hosted_media_handler)
+    app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
     app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1242,6 +1329,75 @@ async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: lis
         raise
 
 
+async def split_movie_into_parts(source: Path, parts_dir: Path) -> tuple[Path, Path] | None:
+    """Create two fragmented MP4 files for site-side sequential playback."""
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(source),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await probe.communicate()
+        if probe.returncode != 0:
+            logger.warning("Could not determine movie duration: %s",
+                           stderr.decode("utf-8", errors="replace")[-2000:])
+            return None
+        duration = float(stdout.decode().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+    if duration <= 2:
+        return None
+
+    halfway = duration / 2
+    first = parts_dir / "part1.mp4"
+    second = parts_dir / "part2.mp4"
+    common = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-map", "0:v:0?", "-map", "0:a:0?",
+        "-c", "copy",
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+    ]
+
+    try:
+        p1 = await asyncio.create_subprocess_exec(
+            *common, "-t", str(halfway), str(first),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, e1 = await p1.communicate()
+        if p1.returncode != 0 or not first.exists() or first.stat().st_size == 0:
+            logger.warning("Movie part 1 creation failed: %s",
+                           e1.decode("utf-8", errors="replace")[-3000:])
+            first.unlink(missing_ok=True)
+            return None
+
+        p2 = await asyncio.create_subprocess_exec(
+            *common, "-ss", str(halfway), str(second),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, e2 = await p2.communicate()
+        if p2.returncode != 0 or not second.exists() or second.stat().st_size == 0:
+            logger.warning("Movie part 2 creation failed: %s",
+                           e2.decode("utf-8", errors="replace")[-3000:])
+            first.unlink(missing_ok=True)
+            second.unlink(missing_ok=True)
+            return None
+
+        logger.info("Created two site-hosted movie parts.")
+        return first, second
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("Movie part creation failed: %s", exc)
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+        return None
+
+
 async def finish_m3u8_host(
     token: str,
     process: asyncio.subprocess.Process,
@@ -1305,6 +1461,15 @@ async def finish_m3u8_host(
         except (FileNotFoundError, OSError) as exc:
             logger.warning("Could not remux completed M3U8 movie: %s", exc)
             remux_temp.unlink(missing_ok=True)
+
+        parts_dir = HLS_CACHE_DIR / token / "parts"
+        parts = await split_movie_into_parts(output, parts_dir) if output.exists() else None
+
+        async with host_lock:
+            current = active_host
+            if current is not None and current["token"] == token and parts is not None:
+                current["parts_dir"] = parts_dir
+                current["parts"] = parts
 
         async with host_lock:
             current = active_host
