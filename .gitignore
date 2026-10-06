@@ -11,5 +11,6 @@ Movies/*
 !Movies/.gitkeep
 .vscode/
 .idea/
+.movie_hls/
 .DS_Store
 Thumbs.db
