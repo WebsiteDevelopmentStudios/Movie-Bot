@@ -324,7 +324,25 @@ class ChannelLinkView(discord.ui.View):
             )
             return
 
-        channel = self.channel_select.values[0]
+        selected_channel = self.channel_select.values[0]
+
+        # Resolve the selected channel by ID so Discord's ChannelSelect
+        # response works consistently across channel object types.
+        channel_id = getattr(selected_channel, "id", None)
+        if not isinstance(channel_id, int):
+            await interaction.response.send_message(
+                "I could not read the selected channel. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        channel = interaction.guild.get_channel(channel_id) if interaction.guild else None
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message(
                 "Please select a text channel.",
