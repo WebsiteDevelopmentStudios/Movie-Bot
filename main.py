@@ -470,60 +470,96 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
     )
 
 
+cloudflare_start_lock = asyncio.Lock()
+
 async def start_cloudflare_quick_tunnel() -> bool:
     global PUBLIC_BASE_URL, cloudflared_process, cloudflared_log_task
 
-    if cloudflared_process is not None:
-        return bool(PUBLIC_BASE_URL)
+    if PUBLIC_BASE_URL:
+        return True
 
-    try:
-        cloudflared_process = await asyncio.create_subprocess_exec(
-            CLOUDFLARED_BIN,
-            "tunnel",
-            "--url",
-            f"http://127.0.0.1:{WEB_PORT}",
-            "--no-autoupdate",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        logger.error("cloudflared was not found. Install cloudflared and make sure it is in PATH.")
-        cloudflared_process = None
-        return False
-    except OSError as exc:
-        logger.error("Could not start cloudflared: %s", exc)
-        cloudflared_process = None
-        return False
+    async with cloudflare_start_lock:
+        if PUBLIC_BASE_URL:
+            return True
 
-    url_pattern = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
+        # If another caller already started cloudflared, wait for that caller
+        # to finish instead of incorrectly reporting that the tunnel failed.
+        if cloudflared_process is not None:
+            for _ in range(120):
+                if PUBLIC_BASE_URL:
+                    return True
+                if cloudflared_process.returncode is not None:
+                    cloudflared_process = None
+                    break
+                await asyncio.sleep(0.5)
+            return bool(PUBLIC_BASE_URL)
 
-    try:
-        while True:
-            line = await asyncio.wait_for(cloudflared_process.stdout.readline(), timeout=60)
-            if not line:
-                break
-
-            text_line = line.decode("utf-8", errors="replace").strip()
-            match = url_pattern.search(text_line)
-            if match:
-                PUBLIC_BASE_URL = match.group(0).rstrip("/")
-                logger.info("Cloudflare Quick Tunnel URL: %s", PUBLIC_BASE_URL)
-                cloudflared_log_task = asyncio.create_task(_drain_cloudflared_output(cloudflared_process))
-                return True
-    except asyncio.TimeoutError:
-        logger.error("Timed out waiting for cloudflared to provide a public URL.")
-    except (OSError, RuntimeError) as exc:
-        logger.error("Could not read cloudflared output: %s", exc)
-
-    if cloudflared_process.returncode is None:
-        cloudflared_process.terminate()
         try:
-            await asyncio.wait_for(cloudflared_process.wait(), timeout=5)
+            cloudflared_process = await asyncio.create_subprocess_exec(
+                CLOUDFLARED_BIN,
+                "tunnel",
+                "--url",
+                f"http://127.0.0.1:{WEB_PORT}",
+                "--no-autoupdate",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            logger.error(
+                "cloudflared was not found. Install cloudflared and make sure it is in PATH."
+            )
+            cloudflared_process = None
+            return False
+        except OSError as exc:
+            logger.error("Could not start cloudflared: %s", exc)
+            cloudflared_process = None
+            return False
+
+        # Quick Tunnel output is human-readable and may contain prefixes,
+        # timestamps, whitespace, or other log text. Match the URL anywhere
+        # in the line rather than assuming a specific hostname shape.
+        url_pattern = re.compile(
+            r"https://[^\\s\\"'<>]+\\.trycloudflare\\.com(?:/[^\\s\\"'<>]*)?",
+            re.IGNORECASE,
+        )
+
+        try:
+            while True:
+                if cloudflared_process.stdout is None:
+                    break
+
+                line = await asyncio.wait_for(
+                    cloudflared_process.stdout.readline(),
+                    timeout=90,
+                )
+                if not line:
+                    break
+
+                text_line = line.decode("utf-8", errors="replace").strip()
+                match = url_pattern.search(text_line)
+                if match:
+                    PUBLIC_BASE_URL = match.group(0).rstrip("/.,;")
+                    logger.info("Cloudflare Quick Tunnel URL: %s", PUBLIC_BASE_URL)
+                    cloudflared_log_task = asyncio.create_task(
+                        _drain_cloudflared_output(cloudflared_process)
+                    )
+                    return True
+
         except asyncio.TimeoutError:
-            cloudflared_process.kill()
-            await cloudflared_process.wait()
-    cloudflared_process = None
-    return False
+            logger.error("Timed out waiting for cloudflared to provide a public URL.")
+        except (OSError, RuntimeError) as exc:
+            logger.error("Could not read cloudflared output: %s", exc)
+
+        if cloudflared_process.returncode is None:
+            cloudflared_process.terminate()
+            try:
+                await asyncio.wait_for(cloudflared_process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                cloudflared_process.kill()
+                await cloudflared_process.wait()
+
+        cloudflared_process = None
+        return False
 
 
 async def _drain_cloudflared_output(process: asyncio.subprocess.Process) -> None:
