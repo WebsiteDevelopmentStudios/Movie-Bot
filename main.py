@@ -519,7 +519,7 @@ async def start_cloudflare_quick_tunnel() -> bool:
         # timestamps, whitespace, or other log text. Match the URL anywhere
         # in the line rather than assuming a specific hostname shape.
         url_pattern = re.compile(
-            r"https://[^\\s\\"'<>]+\\.trycloudflare\\.com(?:/[^\\s\\"'<>]*)?",
+            r"""https://[^\s"'<>]+\.trycloudflare\.com(?:/[^\s"'<>]*)?""",
             re.IGNORECASE,
         )
 
