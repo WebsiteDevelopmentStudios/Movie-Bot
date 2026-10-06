@@ -62,7 +62,7 @@ From the repository directory:
 
     python main.py
 
-The bot syncs its slash commands when it starts.
+The bot syncs its slash commands when it starts. It also starts a Cloudflare Quick Tunnel automatically so the movie web player can be reached from the internet without owning a domain or configuring DNS.
 
 ## Link the movie channel
 
@@ -124,12 +124,19 @@ Large movies do not need to be uploaded to Discord. The bot can host one local m
 
 The hosted link uses a random, unguessable token and expires automatically after the detected media duration plus a small safety buffer. When it expires, the movie is no longer available and another movie can be hosted.
 
-Set these environment variables in .env:
+The bot automatically starts a Cloudflare Quick Tunnel for the built-in web server. You do not need to own a domain or add DNS records.
 
-    PUBLIC_BASE_URL=https://your-public-host.example
-    MOVIE_PORT=8080
+The tunnel creates a temporary HTTPS address such as:
 
-PUBLIC_BASE_URL must point to the public HTTPS address that forwards to MOVIE_PORT on the machine running the bot. Port 8080 must be reachable by that public address. A reverse proxy, tunnel, or hosted server can provide this public address.
+    https://random-words.trycloudflare.com
+
+That address is detected automatically and used for movie player links. The tunnel forwards to the local MOVIE_PORT (8080 by default).
+
+Install Cloudflare's `cloudflared` command and make sure it is available in PATH before running the bot. You can override the executable name/path with:
+
+    CLOUDFLARED_BIN=cloudflared
+
+Quick Tunnel URLs are temporary and normally change when the bot is restarted. If cloudflared is unavailable, Discord commands still start, but web movie hosting will be unavailable until cloudflared is installed and the bot is restarted.
 
 Only one movie is intentionally hosted at a time. If someone tries to start another movie while one is active, the bot tells them to wait until the current movie expires.
 
