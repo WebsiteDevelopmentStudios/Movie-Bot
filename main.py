@@ -1075,7 +1075,15 @@ def safe_download_name(url: str) -> str:
     return candidate.name
 
 
-async def download_m3u8(url: str, progress=None) -> tuple[bool, str, Path | None]:
+async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
+    """Start HLS playback immediately while FFmpeg downloads the M3U8 in parallel.
+
+    FFmpeg reads the remote HLS stream once and uses the tee muxer to write both:
+    - a growing HLS playlist/segments for immediate playback
+    - a local MP4 copy that becomes the saved movie when the download finishes
+    """
+    global active_host
+
     ensure_movies_dir()
 
     if not is_m3u8_url(url):
@@ -1084,78 +1092,158 @@ async def download_m3u8(url: str, progress=None) -> tuple[bool, str, Path | None
     if progress is not None:
         await progress("Downloading movie...")
 
+    if not PUBLIC_BASE_URL:
+        if progress is not None:
+            await progress("Connecting movie player...")
+        await bot.ensure_cloudflare_tunnel()
+
+    if not PUBLIC_BASE_URL:
+        return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot."
+
     filename = safe_download_name(url)
     output = MOVIES_DIR / filename
     temp_output = MOVIES_DIR / f".{filename}.part"
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-protocol_whitelist",
-            "http,https,tcp,tls,crypto",
-            "-allowed_extensions",
-            "ALL",
-            "-extension_picky",
-            "0",
-            "-http_persistent",
-            "1",
-            "-i",
-            url,
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            str(temp_output),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        return (
-            False,
-            "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.",
-            None,
-        )
-    except OSError as exc:
-        logger.warning("Could not start FFmpeg: %s", exc)
-        return False, "I could not start the M3U8 download.", None
+    async with host_lock:
+        if active_host is not None:
+            return False, "Another movie is currently being hosted. Please wait until it finishes.", None
 
-    try:
-        _, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=DOWNLOAD_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
-        temp_output.unlink(missing_ok=True)
-        return False, "The M3U8 download timed out after 30 minutes.", None
+        token = secrets.token_urlsafe(32)
+        HLS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        hls_dir = HLS_CACHE_DIR / token
+        hls_dir.mkdir(parents=True, exist_ok=False)
+        playlist = hls_dir / "playlist.m3u8"
 
-    if process.returncode != 0 or not temp_output.exists():
+        # FFmpeg's tee muxer lets one network download feed both the growing
+        # HLS stream and the local MP4 file. This avoids downloading the source
+        # twice and lets the first HLS segments become playable immediately.
+        tee_output = (
+            f"[f=mp4:movflags=+faststart]{temp_output}|"
+            f"[f=hls:hls_time=6:hls_list_size=0:"
+            f"hls_flags=independent_segments+append_list]{playlist}"
+        )
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-protocol_whitelist",
+                "http,https,tcp,tls,crypto",
+                "-allowed_extensions",
+                "ALL",
+                "-extension_picky",
+                "0",
+                "-http_persistent",
+                "1",
+                "-i",
+                url,
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-f",
+                "tee",
+                tee_output,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            hls_dir.rmdir()
+            return False, "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.", None
+        except OSError as exc:
+            logger.warning("Could not start streaming M3U8 download: %s", exc)
+            hls_dir.rmdir()
+            return False, "I could not start the M3U8 stream.", None
+
+        active_host = {
+            "token": token,
+            "movie": output,
+            "hls_dir": hls_dir,
+            "ffmpeg_process": process,
+            "expires_at": float("inf"),
+            "task": None,
+            "downloading": True,
+        }
+
+        active_host["task"] = asyncio.create_task(
+            finish_m3u8_host(token, process, temp_output, output)
+        )
+
+    for _ in range(120):
+        if playlist.exists() and playlist.stat().st_size > 0:
+            if progress is not None:
+                await progress("Embedding movie...")
+            return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+
+        if process.returncode is not None:
+            _, stderr = await process.communicate()
+            error_text = stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("M3U8 streaming failed: %s", error_text[-2000:])
+            await clear_hosted_movie(token)
+            temp_output.unlink(missing_ok=True)
+            return False, "FFmpeg could not start playback for that M3U8 URL.", None
+
+        await asyncio.sleep(0.5)
+
+    await clear_hosted_movie(token)
+    temp_output.unlink(missing_ok=True)
+    return False, "The M3U8 stream took too long to start.", None
+
+
+async def finish_m3u8_host(
+    token: str,
+    process: asyncio.subprocess.Process,
+    temp_output: Path,
+    output: Path,
+) -> None:
+    try:
+        _, stderr = await process.communicate()
         error_text = stderr.decode("utf-8", errors="replace").strip()
-        logger.warning("FFmpeg M3U8 download failed: %s", error_text[-2000:])
-        temp_output.unlink(missing_ok=True)
-        return (
-            False,
-            "FFmpeg could not download that M3U8 stream. The URL may be expired, protected, or incompatible.",
-            None,
-        )
 
-    try:
-        temp_output.replace(output)
-    except OSError as exc:
-        logger.warning("Could not finalize downloaded movie: %s", exc)
-        temp_output.unlink(missing_ok=True)
-        return False, "The download completed, but I could not save the movie.", None
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
 
-    return True, f"Downloaded {output.stem} into the Movies folder.", output
+        if process.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
+            logger.warning("M3U8 download failed after playback started: %s", error_text[-2000:])
+            await clear_hosted_movie(token)
+            temp_output.unlink(missing_ok=True)
+            return
+
+        try:
+            temp_output.replace(output)
+        except OSError as exc:
+            logger.warning("Could not finalize M3U8 movie: %s", exc)
+            await clear_hosted_movie(token)
+            temp_output.unlink(missing_ok=True)
+            return
+
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            current["movie"] = output
+            current["downloading"] = False
+            # Keep the player alive briefly after the source finishes so the
+            # final HLS segments can be watched before the cache is removed.
+            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
+
+        await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
+        await clear_hosted_movie(token)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("M3U8 streaming task failed: %s", exc)
+        await clear_hosted_movie(token)
+        temp_output.unlink(missing_ok=True)
+
+
 
 
 @movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
@@ -1170,37 +1258,47 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
             except discord.HTTPException:
                 pass
 
-        success, message, downloaded = await download_m3u8(movie, progress)
+        success, player_url, downloaded = await stream_m3u8_movie(movie, progress)
 
-        if not success or downloaded is None:
-            await interaction.followup.send(message, ephemeral=True)
-            return
-
-        success, player_url = await host_movie(downloaded)
-        if not success:
-            await interaction.followup.send(f"{message} However, I could not host it: {player_url}", ephemeral=True)
+        if not success or player_url is None:
+            await interaction.followup.send(
+                "I could not start that M3U8 movie.",
+                ephemeral=True,
+            )
             return
 
         channel = await get_movie_channel()
         if channel is None:
             await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send("The movie was downloaded, but the configured movie channel is unavailable.", ephemeral=True)
+            await interaction.followup.send(
+                "The movie stream started, but the configured movie channel is unavailable.",
+                ephemeral=True,
+            )
             return
 
+        movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
         embed = discord.Embed(
-            title=f"Now Playing: {downloaded.stem}",
+            title=f"Now Playing: {movie_name}",
             description=f"[▶ Watch Movie]({player_url})",
             color=discord.Color.blurple(),
         )
-        embed.add_field(name="Format", value=downloaded.suffix.lower().lstrip(".").upper())
-        embed.set_footer(text="This movie link expires automatically when the movie ends.")
+        embed.add_field(name="Format", value="MP4")
+        embed.set_footer(text="Playback starts while the movie is still downloading. The link expires automatically when the movie finishes.")
+
         try:
             await channel.send(content=player_url, embed=embed)
-            await interaction.followup.send(f"{message} Now hosting {downloaded.stem} in {channel.mention}.", ephemeral=True)
+            await interaction.followup.send(
+                f"Now streaming {movie_name} in {channel.mention}.",
+                ephemeral=True,
+            )
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send("The movie was downloaded, but I could not post the movie player.", ephemeral=True)
+            await interaction.followup.send(
+                "The movie stream started, but I could not post the movie player.",
+                ephemeral=True,
+            )
         return
+
 
     if not get_movie_files():
         await interaction.response.send_message(
