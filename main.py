@@ -1436,11 +1436,9 @@ async def finish_m3u8_host(
             await clear_hosted_movie(token, reason="M3U8 download failed")
             return
 
-        async with host_lock:
-            current = active_host
-            if current is None or current["token"] != token:
-                return
-            current["downloading"] = False
+        # Keep the host marked as downloading until the completed MP4 has
+        # actually been written. Otherwise /media/<token> can briefly return
+        # "Movie is not ready yet" during the remux/split phase.
 
         # Convert the cached HLS segments into the normal local MP4 without
         # contacting the original M3U8 URL again.
@@ -1484,6 +1482,7 @@ async def finish_m3u8_host(
             current = active_host
             if current is None or current["token"] != token:
                 return
+            current["downloading"] = False
             current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
 
         await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
