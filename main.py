@@ -646,6 +646,8 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
 <meta property="og:video" content="{PUBLIC_BASE_URL}/media/{token}">
 <meta property="og:video:secure_url" content="{PUBLIC_BASE_URL}/media/{token}">
 <meta property="og:video:type" content="video/mp4">
+<meta property="og:video:url" content="{PUBLIC_BASE_URL}/media/{token}">
+<meta property="og:video:duration" content="0">
 <meta property="og:video:width" content="1280">
 <meta property="og:video:height" content="720">
 <meta name="twitter:card" content="player">
@@ -695,7 +697,7 @@ h1 {{
 
 
 async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
-    """Serve the original MP4 as a direct video URL for Discord crawlers."""
+    """Serve a completed MP4 with HTTP range support for Discord/media players."""
     token = request.match_info.get("token", "")
     current = await _get_active_host(token)
     if current is None:
@@ -708,19 +710,21 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
     try:
         resolved = movie.resolve()
         if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
-            return web.Response(status=404, text="Movie is no longer being hosted.")
+            return web.Response(status=404, text="Movie is not ready yet.")
     except OSError:
-        return web.Response(status=404, text="Movie is no longer being hosted.")
+        return web.Response(status=404, text="Movie is not ready yet.")
 
+    # aiohttp's FileResponse handles byte ranges, which Discord and browsers
+    # need when probing/streaming large MP4 files.
     return web.FileResponse(
         path=resolved,
         headers={
             "Content-Type": "video/mp4",
-            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="{escape(movie.name)}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate",
             "Accept-Ranges": "bytes",
         },
     )
-
 
 async def hosted_hls_handler(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token", "")
@@ -1364,8 +1368,17 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         )
 
         try:
+            direct_media_url = (
+                f"{PUBLIC_BASE_URL}/media/{active_host['token']}"
+                if active_host is not None
+                else player_url
+            )
             await channel.send(
-                content=f"▶ **Now Playing:** {movie_name}\n{player_url}",
+                content=(
+                    f"▶ **Now Playing:** {movie_name}\n"
+                    f"{direct_media_url}\n\n"
+                    f"Web player: {player_url}"
+                ),
                 embed=embed,
                 suppress_embeds=False,
             )
