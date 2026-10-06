@@ -775,7 +775,7 @@ async def start_cloudflare_quick_tunnel() -> bool:
         # If another caller already started cloudflared, wait for that caller
         # to finish instead of incorrectly reporting that the tunnel failed.
         if cloudflared_process is not None:
-            for _ in range(120):
+            for _ in range(300):
                 if PUBLIC_BASE_URL:
                     return True
                 if cloudflared_process.returncode is not None:
@@ -1135,10 +1135,11 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
                 "-map", "0:a:0?",
                 "-c", "copy",
                 "-start_number", "0",
-                "-hls_time", "6",
+                "-hls_time", "2",
                 "-hls_list_size", "0",
-                "-hls_playlist_type", "vod",
-                "-hls_flags", "independent_segments",
+                "-hls_playlist_type", "event",
+                "-hls_flags", "independent_segments+append_list+temp_file",
+                "-hls_segment_type", "fmp4",
                 "-f", "hls",
                 str(playlist),
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1183,7 +1184,7 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         await asyncio.sleep(0.5)
 
     await clear_hosted_movie(token)
-    return False, "The M3U8 stream took too long to start.", None
+    return False, "The M3U8 stream took too long to start. Check the bot console for the FFmpeg error.", None
 
 
 async def finish_m3u8_host(
