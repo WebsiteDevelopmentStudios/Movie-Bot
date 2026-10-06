@@ -1350,14 +1350,25 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
         embed = discord.Embed(
             title=f"Now Playing: {movie_name}",
-            description=f"[▶ Watch Movie]({player_url})",
+            description=(
+                "Your movie is ready to watch.\n\n"
+                f"[▶ Watch Movie]({player_url})"
+            ),
             color=discord.Color.blurple(),
         )
-        embed.add_field(name="Format", value="MP4")
-        embed.set_footer(text="Playback starts while the movie is still downloading. The link expires automatically when the movie finishes.")
+        embed.add_field(name="Format", value="MP4", inline=True)
+        embed.add_field(name="Playback", value="Streaming", inline=True)
+        embed.set_footer(
+            text="Playback starts while the movie is still downloading. "
+                 "The link expires automatically when the movie finishes."
+        )
 
         try:
-            await channel.send(content=player_url, embed=embed)
+            await channel.send(
+                content=f"▶ **Now Playing:** {movie_name}\n{player_url}",
+                embed=embed,
+                suppress_embeds=False,
+            )
             await interaction.followup.send(
                 f"Now streaming {movie_name} in {channel.mention}.",
                 ephemeral=True,
@@ -1408,13 +1419,25 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
 
     embed = discord.Embed(
         title=f"Now Playing: {selected.stem}",
-        description=f"[▶ Watch Movie]({message})",
+        description=(
+            "Your movie is ready to watch.\n\n"
+            f"[▶ Watch Movie]({message})"
+        ),
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="Format", value=selected.suffix.lower().lstrip(".").upper())
+    embed.add_field(
+        name="Format",
+        value=selected.suffix.lower().lstrip(".").upper(),
+        inline=True,
+    )
+    embed.add_field(name="Playback", value="Streaming", inline=True)
     embed.set_footer(text="This movie link expires automatically when the movie ends.")
     try:
-        await channel.send(content=message, embed=embed)
+        await channel.send(
+            content=f"▶ **Now Playing:** {selected.stem}\n{message}",
+            embed=embed,
+            suppress_embeds=False,
+        )
         await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
     except (discord.Forbidden, discord.HTTPException):
         await clear_hosted_movie(active_host["token"] if active_host else "")
