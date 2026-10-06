@@ -2,7 +2,7 @@
 
 A Python Discord bot that lets members browse media files stored locally in the repository's Movies folder and send selected files to a configured Discord text channel.
 
-The bot does not download movies from the internet. Only files manually placed in Movies are available.
+The bot can send manually stored movies and can download a user-provided HTTP/HTTPS M3U8 stream into Movies. It does not search for or discover movies automatically.
 
 ## Features
 
@@ -16,6 +16,8 @@ The bot does not download movies from the internet. Only files manually placed i
 - Supports .mp4 and .mp3
 - Automatically detects added and removed files without restarting
 - Rejects filesystem paths and path traversal
+- Expiring web video/audio player for large files
+- Only one movie is hosted at a time; the player expires automatically when the movie ends
 - Graceful Discord upload and permission errors
 
 ## Requirements
@@ -92,7 +94,7 @@ Example:
 
 Do not put movie files in subfolders. Do not commit copyrighted or otherwise unauthorized media to a public repository.
 
-The bot does not download, execute, convert, or generate media files.
+The bot does not search for media or automatically discover downloads. User-provided M3U8 URLs are downloaded on request. Movies are never executed.
 
 ## List movies
 
@@ -115,6 +117,23 @@ Use the movie name without its extension:
 For example, Avatar matches Movies/Avatar.mp4.
 
 Movie names are matched case-insensitively. The requested movie must exist in Movies; the bot never searches the internet or downloads a missing movie.
+
+## Large movie streaming
+
+Large movies do not need to be uploaded to Discord. The bot can host one local movie at a time through its built-in web player and posts an embed with a Watch Movie link.
+
+The hosted link uses a random, unguessable token and expires automatically after the detected media duration plus a small safety buffer. When it expires, the movie is no longer available and another movie can be hosted.
+
+Set these environment variables in .env:
+
+    PUBLIC_BASE_URL=https://your-public-host.example
+    MOVIE_PORT=8080
+
+PUBLIC_BASE_URL must point to the public HTTPS address that forwards to MOVIE_PORT on the machine running the bot. Port 8080 must be reachable by that public address. A reverse proxy, tunnel, or hosted server can provide this public address.
+
+Only one movie is intentionally hosted at a time. If someone tries to start another movie while one is active, the bot tells them to wait until the current movie expires.
+
+The web player supports HTTP range requests so viewers can seek through MP4 files without downloading the entire file first.
 
 ## Discord upload limits
 
