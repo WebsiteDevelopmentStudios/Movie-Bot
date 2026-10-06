@@ -6,6 +6,7 @@ import re
 import secrets
 from pathlib import Path
 from urllib.parse import urlparse
+from html import escape
 
 import discord
 from aiohttp import web
@@ -24,6 +25,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
 HOST_EXPIRY_BUFFER_SECONDS = 30
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
+HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
@@ -384,14 +386,38 @@ async def get_media_duration(movie: Path) -> float | None:
 
 async def clear_hosted_movie(token: str) -> None:
     global active_host
+
     async with host_lock:
         if active_host is None or active_host["token"] != token:
             return
-        task = active_host.get("task")
+
+        current = active_host
+        task = current.get("task")
+        ffmpeg_process = current.get("ffmpeg_process")
+        hls_dir = current.get("hls_dir")
         active_host = None
+
         if task is not None and task is not asyncio.current_task():
             task.cancel()
-    logger.info("Hosted movie expired.")
+
+    if ffmpeg_process is not None and ffmpeg_process.returncode is None:
+        ffmpeg_process.terminate()
+        try:
+            await asyncio.wait_for(ffmpeg_process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            ffmpeg_process.kill()
+            await ffmpeg_process.wait()
+
+    if hls_dir is not None:
+        try:
+            for path in hls_dir.iterdir():
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+            hls_dir.rmdir()
+        except OSError:
+            pass
+
+    logger.info("Hosted movie expired and HLS cache removed.")
 
 
 async def expire_hosted_movie(token: str, duration: float) -> None:
@@ -420,7 +446,7 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
         return False, "I could not access that movie."
 
     if progress is not None:
-        await progress("Preparing movie player...")
+        await progress("Preparing HLS stream...")
 
     duration = await get_media_duration(resolved)
     if duration is None:
@@ -434,36 +460,259 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
             return False, f"Another movie is currently being hosted. Please wait about {minutes}m {seconds:02d}s."
 
         token = secrets.token_urlsafe(32)
+        HLS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        hls_dir = HLS_CACHE_DIR / token
+        hls_dir.mkdir(parents=True, exist_ok=False)
+        playlist = hls_dir / "playlist.m3u8"
+
+        try:
+            ffmpeg_process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(resolved),
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-start_number",
+                "0",
+                "-hls_time",
+                "6",
+                "-hls_list_size",
+                "0",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_flags",
+                "independent_segments",
+                "-f",
+                "hls",
+                str(playlist),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            try:
+                hls_dir.rmdir()
+            except OSError:
+                pass
+            return False, "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot."
+        except OSError as exc:
+            logger.warning("Could not start HLS FFmpeg process: %s", exc)
+            try:
+                hls_dir.rmdir()
+            except OSError:
+                pass
+            return False, "I could not start the movie stream."
+        except Exception:
+            try:
+                hls_dir.rmdir()
+            except OSError:
+                pass
+            raise
+
         active_host = {
             "token": token,
             "movie": resolved,
+            "hls_dir": hls_dir,
+            "ffmpeg_process": ffmpeg_process,
             "expires_at": asyncio.get_running_loop().time() + duration + HOST_EXPIRY_BUFFER_SECONDS,
             "task": None,
         }
         active_host["task"] = asyncio.create_task(expire_hosted_movie(token, duration))
 
-    return True, f"{PUBLIC_BASE_URL}/movie/{token}"
+    # Wait until FFmpeg has produced the playlist so the first viewer does not
+    # receive a blank page. Segment files are then requested individually by
+    # the HLS player, rather than sending the entire movie at once.
+    for _ in range(60):
+        if playlist.exists() and playlist.stat().st_size > 0:
+            return True, f"{PUBLIC_BASE_URL}/movie/{token}"
+        if ffmpeg_process.returncode is not None:
+            _, stderr = await ffmpeg_process.communicate()
+            error_text = stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("HLS preparation failed: %s", error_text[-2000:])
+            await clear_hosted_movie(token)
+            return False, "FFmpeg could not prepare this movie for streaming."
+        await asyncio.sleep(0.5)
+
+    await clear_hosted_movie(token)
+    return False, "The movie stream took too long to start."
+
+
+async def _get_active_host(token: str):
+    async with host_lock:
+        current = active_host
+        if current is None or not secrets.compare_digest(current["token"], token):
+            return None
+
+        movie = current["movie"]
+        hls_dir = current["hls_dir"]
+        try:
+            resolved_movie = movie.resolve()
+            resolved_hls = hls_dir.resolve()
+            if (
+                resolved_movie.parent != MOVIES_DIR.resolve()
+                or not resolved_movie.is_file()
+                or resolved_hls.parent != HLS_CACHE_DIR.resolve()
+                or not resolved_hls.is_dir()
+            ):
+                return None
+        except OSError:
+            return None
+
+        return current
 
 
 async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
-    async with host_lock:
-        current = active_host
-        token = request.match_info.get("token", "")
-        if current is None or not secrets.compare_digest(current["token"], token):
-            return web.Response(status=404, text="Movie is no longer being hosted.")
-        movie = current["movie"]
-        try:
-            resolved = movie.resolve()
-            if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
-                return web.Response(status=404, text="Movie is no longer available.")
-        except OSError:
-            return web.Response(status=404, text="Movie is no longer available.")
+    token = request.match_info.get("token", "")
+    current = await _get_active_host(token)
+    if current is None:
+        return web.Response(status=404, text="Movie is no longer being hosted.")
 
-    content_type = "video/mp4" if movie.suffix.lower() == ".mp4" else "audio/mpeg"
+    movie = current["movie"]
+    title = escape(movie.stem)
+    playlist_url = f"/hls/{token}/playlist.m3u8"
+
+    if movie.suffix.lower() == ".mp4":
+        player = f"""
+        <video id="player" controls playsinline preload="metadata"
+               style="width:100%;max-height:78vh;background:#000;border-radius:12px"></video>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+        <script>
+        const video = document.getElementById("player");
+        const source = {json.dumps(playlist_url)};
+        if (video.canPlayType("application/vnd.apple.mpegurl")) {{
+            video.src = source;
+        }} else if (window.Hls && Hls.isSupported()) {{
+            const hls = new Hls({{
+                enableWorker: true,
+                lowLatencyMode: false,
+                backBufferLength: 30
+            }});
+            hls.loadSource(source);
+            hls.attachMedia(video);
+        }} else {{
+            document.getElementById("status").textContent =
+                "This browser does not support HLS playback.";
+        }}
+        </script>
+        """
+    else:
+        player = f"""
+        <audio id="player" controls preload="metadata" style="width:100%"></audio>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+        <script>
+        const audio = document.getElementById("player");
+        const source = {json.dumps(playlist_url)};
+        if (audio.canPlayType("application/vnd.apple.mpegurl")) {{
+            audio.src = source;
+        }} else if (window.Hls && Hls.isSupported()) {{
+            const hls = new Hls();
+            hls.loadSource(source);
+            hls.attachMedia(audio);
+        }} else {{
+            document.getElementById("status").textContent =
+                "This browser does not support HLS playback.";
+        }}
+        </script>
+        """
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} - Movie Bot</title>
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="Watch {title}">
+<meta property="og:type" content="video.other">
+<meta property="og:url" content="{PUBLIC_BASE_URL}/movie/{token}">
+<meta name="twitter:card" content="player">
+<meta name="twitter:title" content="{title}">
+<style>
+body {{
+    margin: 0;
+    min-height: 100vh;
+    background: #101114;
+    color: #fff;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+main {{
+    width: min(1200px, calc(100% - 32px));
+    margin: 0 auto;
+    padding: 28px 0;
+}}
+h1 {{
+    margin: 0 0 18px;
+    font-size: clamp(24px, 4vw, 38px);
+}}
+.player {{
+    background: #000;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 18px 50px rgba(0,0,0,.35);
+}}
+#status {{
+    margin-top: 14px;
+    color: #aaa;
+}}
+</style>
+</head>
+<body>
+<main>
+<h1>{title}</h1>
+<div class="player">{player}</div>
+<div id="status">Loading movie stream...</div>
+</main>
+</body>
+</html>"""
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def hosted_hls_handler(request: web.Request) -> web.StreamResponse:
+    token = request.match_info.get("token", "")
+    filename = request.match_info.get("filename", "")
+
+    current = await _get_active_host(token)
+    if current is None:
+        return web.Response(status=404, text="Movie is no longer being hosted.")
+
+    if Path(filename).name != filename or filename in {".", ".."}:
+        return web.Response(status=400, text="Invalid stream resource.")
+
+    if not (filename == "playlist.m3u8" or filename.lower().endswith(".ts")):
+        return web.Response(status=404, text="Stream resource not found.")
+
+    target = current["hls_dir"] / filename
+    try:
+        resolved_target = target.resolve()
+        if resolved_target.parent != current["hls_dir"].resolve() or not resolved_target.is_file():
+            return web.Response(status=404, text="Stream resource not found.")
+    except OSError:
+        return web.Response(status=404, text="Stream resource not found.")
+
+    if filename == "playlist.m3u8":
+        return web.FileResponse(
+            path=resolved_target,
+            headers={
+                "Content-Type": "application/vnd.apple.mpegurl",
+                "Cache-Control": "no-store",
+            },
+        )
+
     return web.FileResponse(
-        path=movie,
+        path=resolved_target,
         headers={
-            "Content-Type": content_type,
+            "Content-Type": "video/mp2t",
             "Cache-Control": "no-store",
             "Accept-Ranges": "bytes",
         },
@@ -607,6 +856,7 @@ async def stop_cloudflare_quick_tunnel() -> None:
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
+    app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
