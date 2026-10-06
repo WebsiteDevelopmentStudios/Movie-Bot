@@ -1149,8 +1149,8 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
                 "-hls_time", "2",
                 "-hls_list_size", "0",
                 "-hls_playlist_type", "event",
-                "-hls_flags", "independent_segments+append_list+temp_file",
-                "-hls_segment_type", "fmp4",
+                "-hls_flags", "independent_segments+temp_file",
+                "-hls_segment_type", "mpegts",
                 "-f", "hls",
                 str(playlist),
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1194,7 +1194,8 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             except OSError:
                 playlist_text = ""
 
-            if "#EXTINF:" in playlist_text or "#EXT-X-MAP:" in playlist_text:
+            has_segment = any(hls_dir.glob("*.ts")) or any(hls_dir.glob("*.m4s"))
+            if "#EXTINF:" in playlist_text and has_segment:
                 if progress is not None:
                     await progress("Embedding movie...")
                 logger.info("M3U8 playback ready: %s", token)
