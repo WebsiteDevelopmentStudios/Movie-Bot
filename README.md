@@ -120,9 +120,11 @@ Movie names are matched case-insensitively. The requested movie must exist in Mo
 
 ## Large movie streaming
 
-Large movies do not need to be uploaded to Discord. The bot can host one local movie at a time through its built-in web player and posts an embed with a Watch Movie link.
+Large movies do not need to be uploaded to Discord. The bot can host one local movie at a time through its built-in HLS web player and posts an embed with a Watch Movie link.
 
-The hosted link uses a random, unguessable token and expires automatically after the detected media duration plus a small safety buffer. When it expires, the movie is no longer available and another movie can be hosted.
+The hosted player prepares the movie as HLS segments instead of serving one giant download. The browser requests the playlist and individual short segments as playback progresses, similar to the basic streaming model used by services such as YouTube. MP4 playback uses hls.js when the browser does not provide native HLS support.
+
+The hosted link uses a random, unguessable token and expires automatically after the detected media duration plus a small safety buffer. When it expires, the movie is no longer available, the temporary HLS segments are deleted, and another movie can be hosted.
 
 The bot automatically starts a Cloudflare Quick Tunnel for the built-in web server. You do not need to own a domain or add DNS records.
 
@@ -140,7 +142,7 @@ Quick Tunnel URLs are temporary and normally change when the bot is restarted. I
 
 Only one movie is intentionally hosted at a time. If someone tries to start another movie while one is active, the bot tells them to wait until the current movie expires.
 
-The web player supports HTTP range requests so viewers can seek through MP4 files without downloading the entire file first.
+The HLS player requests individual media segments as needed rather than requiring the complete movie before playback can begin. The temporary HLS cache is kept outside the Movies folder and is removed when the hosted movie expires.
 
 ## Discord upload limits
 
