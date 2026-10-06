@@ -1084,12 +1084,7 @@ def safe_download_name(url: str) -> str:
 
 
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
-    """Start HLS playback immediately while FFmpeg downloads the M3U8 in parallel.
-
-    FFmpeg reads the remote HLS stream once and uses the tee muxer to write both:
-    - a growing HLS playlist/segments for immediate playback
-    - a local MP4 copy that becomes the saved movie when the download finishes
-    """
+    """Stream an M3U8 immediately and save the completed HLS stream as MP4."""
     global active_host
 
     ensure_movies_dir()
@@ -1110,7 +1105,6 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
 
     filename = safe_download_name(url)
     output = MOVIES_DIR / filename
-    temp_output = MOVIES_DIR / f".{filename}.part"
 
     async with host_lock:
         if active_host is not None:
@@ -1122,41 +1116,31 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         hls_dir.mkdir(parents=True, exist_ok=False)
         playlist = hls_dir / "playlist.m3u8"
 
-        # FFmpeg's tee muxer lets one network download feed both the growing
-        # HLS stream and the local MP4 file. This avoids downloading the source
-        # twice and lets the first HLS segments become playable immediately.
-        tee_output = (
-            f"[f=mp4:movflags=+faststart]{temp_output}|"
-            f"[f=hls:hls_time=6:hls_list_size=0:"
-            f"hls_flags=independent_segments+append_list]{playlist}"
-        )
-
         try:
+            # Use HLS as the primary download target. This is deliberately
+            # separate from MP4 output because FFmpeg's tee muxer can fail
+            # when an MP4 output and HLS output have different finalization
+            # requirements. The HLS segments are later remuxed locally to MP4.
             process = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-hide_banner",
-                "-loglevel",
-                "error",
+                "-loglevel", "error",
                 "-y",
-                "-protocol_whitelist",
-                "http,https,tcp,tls,crypto",
-                "-allowed_extensions",
-                "ALL",
-                "-extension_picky",
-                "0",
-                "-http_persistent",
-                "1",
-                "-i",
-                url,
-                "-map",
-                "0:v:0?",
-                "-map",
-                "0:a:0?",
-                "-c",
-                "copy",
-                "-f",
-                "tee",
-                tee_output,
+                "-protocol_whitelist", "http,https,tcp,tls,crypto",
+                "-allowed_extensions", "ALL",
+                "-extension_picky", "0",
+                "-http_persistent", "1",
+                "-i", url,
+                "-map", "0:v:0?",
+                "-map", "0:a:0?",
+                "-c", "copy",
+                "-start_number", "0",
+                "-hls_time", "6",
+                "-hls_list_size", "0",
+                "-hls_playlist_type", "vod",
+                "-hls_flags", "independent_segments",
+                "-f", "hls",
+                str(playlist),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1179,9 +1163,10 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         }
 
         active_host["task"] = asyncio.create_task(
-            finish_m3u8_host(token, process, temp_output, output)
+            finish_m3u8_host(token, process, playlist, output)
         )
 
+    # Wait only for the first HLS playlist, not the entire movie.
     for _ in range(120):
         if playlist.exists() and playlist.stat().st_size > 0:
             if progress is not None:
@@ -1193,14 +1178,83 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             error_text = stderr.decode("utf-8", errors="replace").strip()
             logger.warning("M3U8 streaming failed: %s", error_text[-2000:])
             await clear_hosted_movie(token)
-            temp_output.unlink(missing_ok=True)
             return False, "FFmpeg could not start playback for that M3U8 URL.", None
 
         await asyncio.sleep(0.5)
 
     await clear_hosted_movie(token)
-    temp_output.unlink(missing_ok=True)
     return False, "The M3U8 stream took too long to start.", None
+
+
+async def finish_m3u8_host(
+    token: str,
+    process: asyncio.subprocess.Process,
+    playlist: Path,
+    output: Path,
+) -> None:
+    try:
+        _, stderr = await process.communicate()
+        error_text = stderr.decode("utf-8", errors="replace").strip()
+
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+
+        if process.returncode != 0 or not playlist.exists() or playlist.stat().st_size == 0:
+            logger.warning("M3U8 download failed after playback started: %s", error_text[-2000:])
+            await clear_hosted_movie(token)
+            return
+
+        # The network download is now complete. Convert the already-downloaded
+        # HLS segments into the normal Movies/*.mp4 file without downloading
+        # the source a second time.
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            current["downloading"] = False
+
+        remux_temp = output.with_name(f".{output.name}.part")
+        try:
+            remux = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-y",
+                "-allowed_extensions", "ALL",
+                "-i", str(playlist),
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart",
+                str(remux_temp),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, remux_stderr = await remux.communicate()
+            if remux.returncode != 0 or not remux_temp.exists() or remux_temp.stat().st_size == 0:
+                remux_error = remux_stderr.decode("utf-8", errors="replace").strip()
+                logger.warning("Could not save completed M3U8 movie as MP4: %s", remux_error[-2000:])
+                remux_temp.unlink(missing_ok=True)
+            else:
+                remux_temp.replace(output)
+        except (FileNotFoundError, OSError) as exc:
+            logger.warning("Could not remux completed M3U8 movie: %s", exc)
+            remux_temp.unlink(missing_ok=True)
+
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
+
+        await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
+        await clear_hosted_movie(token)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("M3U8 streaming task failed: %s", exc)
+        await clear_hosted_movie(token)
 
 
 async def finish_m3u8_host(
