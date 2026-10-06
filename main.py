@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import re
+import secrets
 from pathlib import Path
 from urllib.parse import urlparse
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -17,6 +19,13 @@ CONFIG_FILE = BASE_DIR / "config.json"
 SUPPORTED_EXTENSIONS = {".mp4", ".mp3"}
 M3U8_SUFFIX = ".m3u8"
 DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
+HOST_EXPIRY_BUFFER_SECONDS = 30
+WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
+WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+active_host = None
+host_lock = asyncio.Lock()
 
 load_dotenv()
 
@@ -199,13 +208,38 @@ class MovieConfirmView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        success, message = await send_movie(self.movie, interaction.user)
+        success, message = await host_movie(self.movie)
 
-        if success:
-            button.disabled = True
+        if not success:
             await interaction.edit_original_response(content=message, view=self)
-        else:
-            await interaction.edit_original_response(content=message, view=self)
+            return
+
+        channel = await get_movie_channel()
+        if channel is None:
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.edit_original_response(content="The configured movie channel is unavailable.", view=self)
+            return
+
+        embed = discord.Embed(
+            title=f"Now Playing: {self.movie.stem}",
+            description=f"[▶ Watch Movie]({message})",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Format", value=self.movie.suffix.lower().lstrip(".").upper())
+        embed.set_footer(text="This movie link expires automatically when the movie ends.")
+
+        try:
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.edit_original_response(content="I could not post the movie player in the configured channel.", view=self)
+            return
+
+        button.disabled = True
+        await interaction.edit_original_response(
+            content=f"Now hosting {self.movie.stem} in {channel.mention}.",
+            view=self,
+        )
 
 
 class MovieListView(discord.ui.View):
@@ -307,6 +341,125 @@ async def send_movie(movie: Path, requester: discord.abc.User) -> tuple[bool, st
 
     return True, f"Sent {resolved.stem} to <#{channel.id}>."
 
+async def get_media_duration(movie: Path) -> float | None:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(movie),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return None
+
+    if process.returncode != 0:
+        return None
+
+    try:
+        duration = float(stdout.decode("utf-8", errors="replace").strip())
+        return duration if duration > 0 else None
+    except ValueError:
+        return None
+
+
+async def clear_hosted_movie(token: str) -> None:
+    global active_host
+    async with host_lock:
+        if active_host is None or active_host["token"] != token:
+            return
+        task = active_host.get("task")
+        active_host = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+    logger.info("Hosted movie expired.")
+
+
+async def expire_hosted_movie(token: str, duration: float) -> None:
+    await asyncio.sleep(duration + HOST_EXPIRY_BUFFER_SECONDS)
+    await clear_hosted_movie(token)
+
+
+async def host_movie(movie: Path) -> tuple[bool, str]:
+    global active_host
+
+    if not PUBLIC_BASE_URL:
+        return False, "Movie streaming is not configured. Set PUBLIC_BASE_URL to the public URL of this bot's web server."
+
+    try:
+        resolved = movie.resolve()
+        if resolved.parent != MOVIES_DIR.resolve() or resolved.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return False, "That file is not a supported movie in the Movies folder."
+        if not resolved.exists() or not resolved.is_file():
+            return False, "That movie is no longer available."
+    except OSError:
+        return False, "I could not access that movie."
+
+    duration = await get_media_duration(resolved)
+    if duration is None:
+        return False, "I could not determine the movie length. Make sure FFmpeg/ffprobe is installed."
+
+    async with host_lock:
+        if active_host is not None:
+            remaining = max(0, active_host["expires_at"] - asyncio.get_running_loop().time())
+            minutes = int(remaining // 60)
+            seconds = int(remaining % 60)
+            return False, f"Another movie is currently being hosted. Please wait about {minutes}m {seconds:02d}s."
+
+        token = secrets.token_urlsafe(32)
+        active_host = {
+            "token": token,
+            "movie": resolved,
+            "expires_at": asyncio.get_running_loop().time() + duration + HOST_EXPIRY_BUFFER_SECONDS,
+            "task": None,
+        }
+        active_host["task"] = asyncio.create_task(expire_hosted_movie(token, duration))
+
+    return True, f"{PUBLIC_BASE_URL}/movie/{token}"
+
+
+async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
+    async with host_lock:
+        current = active_host
+        token = request.match_info.get("token", "")
+        if current is None or not secrets.compare_digest(current["token"], token):
+            return web.Response(status=404, text="Movie is no longer being hosted.")
+        movie = current["movie"]
+        try:
+            resolved = movie.resolve()
+            if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
+                return web.Response(status=404, text="Movie is no longer available.")
+        except OSError:
+            return web.Response(status=404, text="Movie is no longer available.")
+
+    content_type = "video/mp4" if movie.suffix.lower() == ".mp4" else "audio/mpeg"
+    return web.FileResponse(
+        path=movie,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+async def start_movie_web_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/movie/{token}", hosted_movie_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
+    logger.info("Movie web server listening on %s:%d", WEB_HOST, WEB_PORT)
+    return runner
+
 
 class ChannelLinkView(discord.ui.View):
     def __init__(self, owner_id: int):
@@ -377,16 +530,24 @@ class ChannelLinkView(discord.ui.View):
 
 class MovieBot(discord.Client):
     def __init__(self) -> None:
+        self.movie_web_runner: web.AppRunner | None = None
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
+        self.movie_web_runner = await start_movie_web_server()
         try:
             synced = await self.tree.sync()
             logger.info("Synced %d slash command(s).", len(synced))
         except discord.HTTPException as exc:
             logger.error("Failed to sync slash commands: %s", exc)
+
+    async def close(self) -> None:
+        if self.movie_web_runner is not None:
+            await self.movie_web_runner.cleanup()
+            self.movie_web_runner = None
+        await super().close()
 
     async def on_ready(self) -> None:
         if self.user:
@@ -552,17 +713,30 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
             await interaction.followup.send(message, ephemeral=True)
             return
 
-        success, send_message = await send_movie(downloaded, interaction.user)
-        if success:
-            await interaction.followup.send(
-                f"{message} {send_message}",
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(
-                f"{message} However, I could not send it to Discord: {send_message}",
-                ephemeral=True,
-            )
+        success, player_url = await host_movie(downloaded)
+        if not success:
+            await interaction.followup.send(f"{message} However, I could not host it: {player_url}", ephemeral=True)
+            return
+
+        channel = await get_movie_channel()
+        if channel is None:
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.followup.send("The movie was downloaded, but the configured movie channel is unavailable.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"Now Playing: {downloaded.stem}",
+            description=f"[▶ Watch Movie]({player_url})",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Format", value=downloaded.suffix.lower().lstrip(".").upper())
+        embed.set_footer(text="This movie link expires automatically when the movie ends.")
+        try:
+            await channel.send(embed=embed)
+            await interaction.followup.send(f"{message} Now hosting {downloaded.stem} in {channel.mention}.", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.followup.send("The movie was downloaded, but I could not post the movie player.", ephemeral=True)
         return
 
     if not get_movie_files():
@@ -581,8 +755,30 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         return
 
     await interaction.response.defer(ephemeral=True)
-    success, message = await send_movie(selected, interaction.user)
-    await interaction.followup.send(message, ephemeral=True)
+    success, message = await host_movie(selected)
+    if not success:
+        await interaction.followup.send(message, ephemeral=True)
+        return
+
+    channel = await get_movie_channel()
+    if channel is None:
+        await clear_hosted_movie(active_host["token"] if active_host else "")
+        await interaction.followup.send("The configured movie channel is unavailable.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"Now Playing: {selected.stem}",
+        description=f"[▶ Watch Movie]({message})",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Format", value=selected.suffix.lower().lstrip(".").upper())
+    embed.set_footer(text="This movie link expires automatically when the movie ends.")
+    try:
+        await channel.send(embed=embed)
+        await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException):
+        await clear_hosted_movie(active_host["token"] if active_host else "")
+        await interaction.followup.send("I could not post the movie player in the configured channel.", ephemeral=True)
 
 
 bot.tree.add_command(channel_group)
