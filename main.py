@@ -733,7 +733,13 @@ async def hosted_hls_handler(request: web.Request) -> web.StreamResponse:
     if Path(filename).name != filename or filename in {".", ".."}:
         return web.Response(status=400, text="Invalid stream resource.")
 
-    if not (filename == "playlist.m3u8" or filename.lower().endswith(".ts")):
+    lower_filename = filename.lower()
+    if not (
+        filename == "playlist.m3u8"
+        or lower_filename.endswith(".ts")
+        or lower_filename.endswith(".m4s")
+        or lower_filename == "init.mp4"
+    ):
         return web.Response(status=404, text="Stream resource not found.")
 
     target = current["hls_dir"] / filename
@@ -756,7 +762,13 @@ async def hosted_hls_handler(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(
         path=resolved_target,
         headers={
-            "Content-Type": "video/mp2t",
+            "Content-Type": (
+                "video/iso.segment"
+                if lower_filename.endswith(".m4s")
+                else "video/mp4"
+                if lower_filename == "init.mp4"
+                else "video/mp2t"
+            ),
             "Cache-Control": "no-store",
             "Accept-Ranges": "bytes",
         },
