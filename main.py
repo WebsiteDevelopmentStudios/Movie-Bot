@@ -1195,7 +1195,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         embed.add_field(name="Format", value=downloaded.suffix.lower().lstrip(".").upper())
         embed.set_footer(text="This movie link expires automatically when the movie ends.")
         try:
-            await channel.send(content=message, embed=embed)
+            await channel.send(content=player_url, embed=embed)
             await interaction.followup.send(f"{message} Now hosting {downloaded.stem} in {channel.mention}.", ephemeral=True)
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
