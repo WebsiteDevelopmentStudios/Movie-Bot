@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env
+config.json
+Movies/*
+!Movies/.gitkeep
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
