@@ -494,6 +494,8 @@ async def download_m3u8(url: str) -> tuple[bool, str, Path | None]:
             "aac_adtstoasc",
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             str(temp_output),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
