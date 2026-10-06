@@ -208,7 +208,15 @@ class MovieConfirmView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        success, message = await host_movie(self.movie)
+
+        async def progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message, view=self)
+            except discord.HTTPException:
+                pass
+
+        await progress("Embedding movie...")
+        success, message = await host_movie(self.movie, progress)
 
         if not success:
             await interaction.edit_original_response(content=message, view=self)
@@ -388,7 +396,7 @@ async def expire_hosted_movie(token: str, duration: float) -> None:
     await clear_hosted_movie(token)
 
 
-async def host_movie(movie: Path) -> tuple[bool, str]:
+async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
     global active_host
 
     if not PUBLIC_BASE_URL:
@@ -402,6 +410,9 @@ async def host_movie(movie: Path) -> tuple[bool, str]:
             return False, "That movie is no longer available."
     except OSError:
         return False, "I could not access that movie."
+
+    if progress is not None:
+        await progress("Preparing movie player...")
 
     duration = await get_media_duration(resolved)
     if duration is None:
@@ -622,11 +633,14 @@ def safe_download_name(url: str) -> str:
     return candidate.name
 
 
-async def download_m3u8(url: str) -> tuple[bool, str, Path | None]:
+async def download_m3u8(url: str, progress=None) -> tuple[bool, str, Path | None]:
     ensure_movies_dir()
 
     if not is_m3u8_url(url):
         return False, "That is not a valid HTTP/HTTPS M3U8 URL.", None
+
+    if progress is not None:
+        await progress("Downloading movie...")
 
     filename = safe_download_name(url)
     output = MOVIES_DIR / filename
@@ -707,7 +721,14 @@ async def download_m3u8(url: str) -> tuple[bool, str, Path | None]:
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     if is_m3u8_url(movie):
         await interaction.response.defer(ephemeral=True)
-        success, message, downloaded = await download_m3u8(movie)
+
+        async def progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message)
+            except discord.HTTPException:
+                pass
+
+        success, message, downloaded = await download_m3u8(movie, progress)
 
         if not success or downloaded is None:
             await interaction.followup.send(message, ephemeral=True)
@@ -755,7 +776,15 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         return
 
     await interaction.response.defer(ephemeral=True)
-    success, message = await host_movie(selected)
+
+    async def progress(message: str) -> None:
+        try:
+            await interaction.edit_original_response(content=message)
+        except discord.HTTPException:
+            pass
+
+    await progress("Embedding movie...")
+    success, message = await host_movie(selected, progress)
     if not success:
         await interaction.followup.send(message, ephemeral=True)
         return
