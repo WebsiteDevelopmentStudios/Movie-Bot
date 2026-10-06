@@ -403,7 +403,12 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
     global active_host
 
     if not PUBLIC_BASE_URL:
-        return False, "Movie streaming is not configured. Set PUBLIC_BASE_URL to the public URL of this bot's web server."
+        if progress is not None:
+            await progress("Connecting movie player...")
+        await bot.ensure_cloudflare_tunnel()
+
+    if not PUBLIC_BASE_URL:
+        return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot."
 
     try:
         resolved = movie.resolve()
@@ -490,7 +495,7 @@ async def start_cloudflare_quick_tunnel() -> bool:
         cloudflared_process = None
         return False
 
-    url_pattern = re.compile(r"https://[a-z0-9-]+\\.trycloudflare\\.com", re.IGNORECASE)
+    url_pattern = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 
     try:
         while True:
@@ -649,14 +654,26 @@ class MovieBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.movie_web_runner = await start_movie_web_server()
-        tunnel_started = await start_cloudflare_quick_tunnel()
-        if not tunnel_started:
-            logger.warning("Movie web hosting is unavailable until cloudflared is installed and running.")
+
+        # Do not block Discord login while cloudflared starts.
+        asyncio.create_task(self.ensure_cloudflare_tunnel())
+
         try:
             synced = await self.tree.sync()
             logger.info("Synced %d slash command(s).", len(synced))
         except discord.HTTPException as exc:
             logger.error("Failed to sync slash commands: %s", exc)
+
+    async def ensure_cloudflare_tunnel(self) -> bool:
+        if PUBLIC_BASE_URL:
+            return True
+
+        tunnel_started = await start_cloudflare_quick_tunnel()
+        if not tunnel_started:
+            logger.warning(
+                "Movie web hosting is unavailable until cloudflared is installed and running."
+            )
+        return tunnel_started
 
     async def close(self) -> None:
         await stop_cloudflare_quick_tunnel()
