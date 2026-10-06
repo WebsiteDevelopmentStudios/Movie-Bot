@@ -763,8 +763,17 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
     try:
         resolved = movie.resolve()
         if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
+            # During an active M3U8 download there is no completed MP4 yet.
+            # Send browsers to the HLS player instead of exposing a misleading
+            # "not ready" error.
+            if current.get("downloading"):
+                raise web.HTTPFound(location=f"/movie/{token}")
             return web.Response(status=404, text="Movie is not ready yet.")
+    except web.HTTPException:
+        raise
     except OSError:
+        if current.get("downloading"):
+            raise web.HTTPFound(location=f"/movie/{token}")
         return web.Response(status=404, text="Movie is not ready yet.")
 
     # aiohttp's FileResponse handles byte ranges, which Discord and browsers
