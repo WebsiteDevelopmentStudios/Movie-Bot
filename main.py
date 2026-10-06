@@ -101,38 +101,6 @@ async def get_movie_channel() -> discord.TextChannel | None:
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
-async def resolve_text_channel(value: str) -> discord.TextChannel | None:
-    value = value.strip()
-    if not value:
-        return None
-
-    # Accept a raw channel ID.
-    if value.isdigit():
-        channel = bot.get_channel(int(value))
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(int(value))
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                return None
-        return channel if isinstance(channel, discord.TextChannel) else None
-
-    # Accept a channel mention such as <#123456789012345678>.
-    if value.startswith("<#") and value.endswith(">"):
-        channel_id = value[2:-1]
-        if channel_id.isdigit():
-            return await resolve_text_channel(channel_id)
-        return None
-
-    # Accept an exact channel name, including names with emoji and special characters.
-    lowered = value.casefold()
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            if channel.name.casefold() == lowered:
-                return channel
-
-    return None
-
-
 def movie_embed(movies: list[Path], page: int, per_page: int = 10) -> discord.Embed:
     start = page * per_page
     page_movies = movies[start:start + per_page]
@@ -365,22 +333,13 @@ movie_group = app_commands.Group(
 
 
 @channel_group.command(name="link", description="Set the channel where movies will be sent.")
-@app_commands.describe(channel="Channel name, mention, or ID.")
+@app_commands.describe(channel="The Discord text channel to use for movies.")
 @app_commands.checks.has_permissions(administrator=True)
 async def channel_link(
     interaction: discord.Interaction,
-    channel: str,
+    channel: discord.TextChannel,
 ) -> None:
-    resolved_channel = await resolve_text_channel(channel)
-
-    if resolved_channel is None:
-        await interaction.response.send_message(
-            "I could not find that text channel. Use its exact name, a channel mention, or its channel ID.",
-            ephemeral=True,
-        )
-        return
-
-    config["channel_id"] = resolved_channel.id
+    config["channel_id"] = channel.id
 
     try:
         save_config(config)
@@ -393,7 +352,7 @@ async def channel_link(
         return
 
     await interaction.response.send_message(
-        f"Movie channel linked to {resolved_channel.mention}.",
+        f"Movie channel linked to {channel.mention}.",
         ephemeral=True,
     )
 
