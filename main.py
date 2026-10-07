@@ -1501,6 +1501,16 @@ async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
                 continue
 
     lyrics.sort(key=lambda item: item[0])
+
+    # Keep the lyric database duration so playback can automatically skip
+    # an extra intro that some YouTube uploads add before the actual song.
+    try:
+        lyric_duration = float(best.get("duration")) if best.get("duration") is not None else None
+    except (TypeError, ValueError):
+        lyric_duration = None
+    if lyric_duration is not None and lyric_duration > 0:
+        track["lyrics_duration"] = lyric_duration
+
     return lyrics
 
 
@@ -1591,10 +1601,33 @@ async def start_track(guild_id: int) -> None:
             logger.warning("Lyrics lookup failed: %s", exc)
             lyrics = []
 
+        # Some YouTube uploads contain a short instrumental/video intro
+        # before the standard track begins. LRCLIB's timestamps are aligned
+        # to the standard track, so use the duration difference as a safe
+        # automatic intro offset when it is small and positive.
+        intro_offset = 0.0
+        source_duration = track.get("duration")
+        lyric_duration = track.get("lyrics_duration")
         try:
+            if source_duration is not None and lyric_duration is not None:
+                difference = float(source_duration) - float(lyric_duration)
+                if 1.5 <= difference <= 20.0:
+                    intro_offset = difference
+                    logger.info(
+                        "Skipping %.2fs of extra intro for %s",
+                        intro_offset,
+                        track.get("title", "unknown"),
+                    )
+        except (TypeError, ValueError):
+            intro_offset = 0.0
+
+        try:
+            before_options = "-nostdin"
+            if intro_offset > 0:
+                before_options += f" -ss {intro_offset:.3f}"
             source = discord.FFmpegPCMAudio(
                 str(source_path),
-                before_options="-nostdin",
+                before_options=before_options,
                 options="-vn",
             )
             source = discord.PCMVolumeTransformer(source, volume=float(state["volume"]))
