@@ -1636,6 +1636,78 @@ async def connect_member_voice(interaction: discord.Interaction) -> discord.Voic
     state = get_music_state(interaction.guild.id)
     voice = state.get("voice")
 
+    if voice is not None and voice.is_connected():
+        if voice.channel.id != voice_channel.id:
+            await voice.move_to(voice_channel)
+        return voice
+
+    try:
+        voice = await voice_channel.connect()
+    except (discord.ClientException, discord.Forbidden, discord.HTTPException):
+        return None
+
+    state["voice"] = voice
+    return voice
+
+
+async def start_track(guild_id: int) -> None:
+    state = get_music_state(guild_id)
+
+    while state["queue"]:
+        voice = state.get("voice")
+        if voice is None or not voice.is_connected():
+            state["current"] = None
+            return
+
+        track = state["queue"].pop(0)
+        state["current"] = track
+        source_path = track.get("path")
+
+        if source_path is None or not source_path.exists():
+            state["current"] = None
+            continue
+
+        # Fetch lyrics before starting the audio. Previously this happened
+        # after voice.play(), so a slow lyrics API could make the first line late.
+        try:
+            lyrics = await fetch_lyrics(track)
+        except Exception as exc:
+            logger.warning("Lyrics lookup failed: %s", exc)
+            lyrics = []
+
+        # Some YouTube uploads contain a short instrumental/video intro
+        # before the standard track begins. LRCLIB's timestamps are aligned
+        # to the standard track, so use the duration difference as a safe
+        # automatic intro offset when it is small and positive.
+        intro_offset = 0.0
+        source_duration = track.get("duration")
+        lyric_duration = track.get("lyrics_duration")
+        try:
+            if source_duration is not None and lyric_duration is not None:
+                difference = float(source_duration) - float(lyric_duration)
+                if 1.5 <= difference <= 20.0:
+                    intro_offset = difference
+                    logger.info(
+                        "Skipping %.2fs of extra intro for %s",
+                        intro_offset,
+                        track.get("title", "unknown"),
+                    )
+        except (TypeError, ValueError):
+            intro_offset = 0.0
+
+        try:
+            before_options = "-nostdin"
+            if intro_offset > 0:
+                before_options += f" -ss {intro_offset:.3f}"
+            source = discord.FFmpegPCMAudio(
+                str(source_path),
+                before_options=before_options,
+                options="-vn",
+            )
+            source = discord.PCMVolumeTransformer(source, volume=float(state["volume"]))
+        except (discord.ClientException, OSError) as exc:
+            logger.warning("Could not create audio source: %s", exc)
+            state["current"] = None
             continue
 
         finished = asyncio.Event()
