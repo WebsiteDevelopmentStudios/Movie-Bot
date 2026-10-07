@@ -1922,9 +1922,13 @@ async def finish_m3u8_host(
 
 
 @movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
-@app_commands.describe(movie="Movie name, or an HTTP/HTTPS .m3u8 URL.")
-async def movie_play(interaction: discord.Interaction, movie: str) -> None:
+@app_commands.describe(
+    movie="Movie name, or an HTTP/HTTPS .m3u8 URL.",
+    name="Display name to use while the M3U8 movie is downloading (optional).",
+)
+async def movie_play(interaction: discord.Interaction, movie: str, name: str | None = None) -> None:
     if is_m3u8_url(movie):
+        display_name = (name or "").strip()[:120] or None
         await interaction.response.defer(ephemeral=True)
 
         async def progress(message: str) -> None:
@@ -1932,6 +1936,11 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
                 await interaction.edit_original_response(content=message)
             except discord.HTTPException:
                 pass
+
+        # Use the supplied name immediately so the Discord message never has to
+        # display a generic M3U8 filename such as index-f2-v1-a1.
+        if display_name:
+            await progress(f"Preparing **{display_name}**...")
 
         success, player_url, downloaded = await stream_m3u8_movie(movie, progress)
 
@@ -1951,7 +1960,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
             )
             return
 
-        movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
+        movie_name = display_name or (downloaded.stem if downloaded is not None else "M3U8 Movie")
         embed = discord.Embed(
             title=f"Now Playing: {movie_name}",
             description=(
