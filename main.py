@@ -2321,3 +2321,17 @@ async def on_app_command_error(
 
 def main() -> None:
     ensure_movies_dir()
+
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    if not token:
+        logger.error("DISCORD_TOKEN is missing from the environment.")
+        return
+
+    try:
+        bot.run(token)
+    except KeyboardInterrupt:
+        logger.info("Movie Bot stopped by user.")
+
+
+if __name__ == "__main__":
+    main()
