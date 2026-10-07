@@ -1125,21 +1125,20 @@ class MovieBot(discord.Client):
         if self.user:
             logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
 
-        # Global command registration can take time to propagate. Mirror the
-        # global commands into connected guilds so they appear immediately.
+        # Remove stale guild-scoped command copies left by the old sync
+        # strategy. Commands are now registered globally only.
         for guild in self.guilds:
             try:
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
+                self.tree.clear_commands(guild=guild)
+                await self.tree.sync(guild=guild)
                 logger.info(
-                    "Synced %d slash command(s) to guild %s (%s).",
-                    len(synced),
+                    "Cleared old guild-scoped commands from %s (%s).",
                     guild.name,
                     guild.id,
                 )
             except discord.HTTPException as exc:
                 logger.warning(
-                    "Could not sync slash commands to guild %s (%s): %s",
+                    "Could not clear old guild commands from %s (%s): %s",
                     guild.name,
                     guild.id,
                     exc,
