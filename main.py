@@ -2568,19 +2568,17 @@ async def sync_commands(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(ephemeral=True)
     try:
-        bot.tree.copy_global_to(guild=interaction.guild)
-        synced = await bot.tree.sync(guild=interaction.guild)
+        synced = await bot.tree.sync()
     except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Could not sync commands to guild %s: %s", interaction.guild.id, exc)
+        logger.warning("Could not sync global commands: %s", exc)
         await interaction.followup.send(
-            "I could not sync the commands. Check that I have permission to use slash commands in this server.",
+            "I could not sync the commands. Please try again later.",
             ephemeral=True,
         )
         return
 
     await interaction.followup.send(
-        f"Synced {len(synced)} slash command(s) to **{interaction.guild.name}**. "
-        "They should appear immediately.",
+        f"Synced {len(synced)} global slash command(s).",
         ephemeral=True,
     )
 
@@ -2603,10 +2601,15 @@ async def on_app_command_error(
         logger.warning("Slash command error: %s", error)
         message = "Something went wrong while processing that command."
 
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except (discord.NotFound, discord.HTTPException) as response_error:
+        # The interaction token can expire while a long-running command is
+        # failing. Do not create a second traceback for the error handler.
+        logger.debug("Could not send command error response: %s", response_error)
 
 
 def main() -> None:
