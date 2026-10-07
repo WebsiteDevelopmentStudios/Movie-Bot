@@ -2384,6 +2384,35 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         await interaction.followup.send("I could not post the movie player in the configured channel.", ephemeral=True)
 
 
+@bot.tree.command(name="sync", description="Sync all slash commands to this server.")
+@app_commands.checks.has_permissions(administrator=True)
+async def sync_commands(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await bot.tree.sync(guild=interaction.guild)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        logger.warning("Could not sync commands to guild %s: %s", interaction.guild.id, exc)
+        await interaction.followup.send(
+            "I could not sync the commands. Check that I have permission to use slash commands in this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"Synced {len(synced)} slash command(s) to **{interaction.guild.name}**. "
+        "They should appear immediately.",
+        ephemeral=True,
+    )
+
+
 bot.tree.add_command(channel_group)
 bot.tree.add_command(movie_group)
 
