@@ -1345,75 +1345,72 @@ async def download_music_audio(track: dict) -> Path | None:
         if isinstance(candidate, dict)
     ]
 
+    # Do not force a YouTube player client. YouTube currently gives some
+    # clients thumbnail/image formats only. Let yt-dlp choose the working
+    # client and available audio formats, with the EJS challenge solver
+    # enabled by yt-dlp[default].
+    download_profiles = [
+        [
+            "--format", "bestaudio/best",
+        ],
+        [
+            "--format", "bestaudio/best",
+            "--extractor-args", "youtube:player_client=web_safari",
+        ],
+        [
+            "--format", "bestaudio/best",
+            "--extractor-args", "youtube:player_client=mweb",
+        ],
+    ]
+
     for attempt, candidate in enumerate(candidates, start=1):
-        token = secrets.token_hex(12)
-        output_template = MUSIC_CACHE_DIR / f"{token}.%(ext)s"
+        for profile_index, profile in enumerate(download_profiles, start=1):
+            token = secrets.token_hex(12)
+            output_template = MUSIC_CACHE_DIR / f"{token}.%(ext)s"
 
-        # Try the preferred native audio format first. If a YouTube client
-        # rejects that format, retry with any playable audio format before
-        # moving on to the next search result.
-        # YouTube can expose only thumbnails/images to some player clients.
-        # Try several clients so a temporary client restriction does not make
-        # every otherwise playable song fail.
-        client_options = [
-            "web",
-            "android_vr",
-            "tv",
-            "mweb",
-            "android",
-        ]
-        format_options = [
-            "bestaudio[ext=m4a]/bestaudio/best",
-            "bestaudio/best",
-            "best",
-        ]
-
-        for client in client_options:
-            for format_selector in format_options:
-                code, _, stderr = await run_yt_dlp([
-                    "--no-playlist",
-                    "--format", format_selector,
-                    "--output", str(output_template),
-                    "--no-part",
-                    "--retries", "5",
-                    "--fragment-retries", "10",
-                    "--retry-sleep", "1",
-                    "--remote-components", "ejs:github",
-                    "--extractor-args", f"youtube:player_client={client}",
-                    "--no-check-certificates",
-                    candidate["url"],
-                ], timeout=15 * 60)
+            code, _, stderr = await run_yt_dlp([
+                "--no-playlist",
+                *profile,
+                "--output", str(output_template),
+                "--no-part",
+                "--retries", "5",
+                "--fragment-retries", "10",
+                "--retry-sleep", "1",
+                "--remote-components", "ejs:github",
+                "--no-check-certificates",
+                candidate["url"],
+            ], timeout=15 * 60)
 
             if code == 0:
                 files = [
                     path for path in MUSIC_CACHE_DIR.glob(f"{token}.*")
                     if path.is_file() and path.suffix.lower() in {
                         ".mp3", ".m4a", ".webm", ".opus", ".wav",
-                        ".aac", ".flac",
+                        ".aac", ".flac", ".mp4",
                     }
                 ]
                 if files:
-                    if attempt > 1:
+                    if attempt > 1 or profile_index > 1:
                         logger.info(
-                            "Primary YouTube source failed; using fallback %s: %s",
-                            attempt,
+                            "Using fallback YouTube source/profile %d for %s",
+                            profile_index,
                             candidate.get("title", "unknown"),
                         )
                     return files[0]
 
             logger.warning(
-                "yt-dlp audio attempt %d failed for %s: %s",
+                "yt-dlp audio attempt %d/profile %d failed for %s: %s",
                 attempt,
+                profile_index,
                 candidate.get("title", "unknown"),
                 stderr[-1500:],
             )
 
-        # Do not leave failed partial files in the cache.
-        for leftover in MUSIC_CACHE_DIR.glob(f"{token}.*"):
-            try:
-                leftover.unlink()
-            except OSError:
-                pass
+            for leftover in MUSIC_CACHE_DIR.glob(f"{token}.*"):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
 
     return None
 
