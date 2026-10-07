@@ -1367,7 +1367,7 @@ def parse_m3u8_segments(playlist_text: str, base_url: str) -> tuple[list[tuple[f
     """Parse a simple VOD media playlist.
 
     Returns (segments, init_url, unsupported_reason). Encrypted and byte-range
-    playlists fall back to FFmpeg because they need special handling.
+    playlists are rejected because this downloader only handles direct segments.
     """
     if "#EXT-X-KEY:" in playlist_text:
         for line in playlist_text.splitlines():
@@ -1439,21 +1439,19 @@ async def download_m3u8_segments(
     hls_dir: Path,
     progress=None,
 ) -> tuple[bool, str]:
-    """Download HLS media segments concurrently and build a local playlist.
-
-    This is substantially faster than FFmpeg's sequential HLS fetching for
-    sources that allow several HTTP requests at once. If the source uses
-    encryption or byte ranges, the caller falls back to FFmpeg.
-    """
+    """Download the complete M3U8 directly with concurrent HTTP requests."""
     timeout = aiohttp.ClientTimeout(
         total=DOWNLOAD_TIMEOUT_SECONDS,
         connect=30,
         sock_read=120,
     )
-    # Some CDNs (including signed media CDNs) reject large bursts of requests.
-    # Eight workers is still much faster than sequential fetching while being
-    # considerably more compatible with protected HLS sources.
-    connector = aiohttp.TCPConnector(limit=16, limit_per_host=8, ttl_dns_cache=300)
+    # 16 total / 8 per host gives good throughput while avoiding the large
+    # request burst that caused the previous CDN fallback behavior.
+    connector = aiohttp.TCPConnector(
+        limit=16,
+        limit_per_host=8,
+        ttl_dns_cache=300,
+    )
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1471,14 +1469,15 @@ async def download_m3u8_segments(
         headers=headers,
     ) as session:
         try:
-            media_url, segments, init_url, reason = await resolve_m3u8_media_playlist(session, url)
+            media_url, segments, init_url, reason = await resolve_m3u8_media_playlist(
+                session, url
+            )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             return False, f"playlist fetch failed: {exc}"
 
-        # Signed CDNs often expect the segment requests to originate from the
-        # playlist URL. Supplying the playlist as Referer improves compatibility
-        # without exposing or changing the signed segment URLs.
-        playlist_origin = f"{urlparse(media_url).scheme}://{urlparse(media_url).netloc}"
+        playlist_origin = (
+            f"{urlparse(media_url).scheme}://{urlparse(media_url).netloc}"
+        )
         session.headers.update({
             "Referer": media_url,
             "Origin": playlist_origin,
@@ -1509,21 +1508,23 @@ async def download_m3u8_segments(
         lock = asyncio.Lock()
         completed_bytes = 0
         started_at = asyncio.get_running_loop().time()
-        forbidden_count = 0
-        fallback_requested = asyncio.Event()
+        last_percent = -1
 
         async def write_playlist(final: bool = False) -> None:
             count = 0
             while count < len(completed) and completed[count]:
                 count += 1
 
-            target_duration = max(1, int(max(duration for duration, _ in segments) + 0.999))
+            target_duration = max(
+                1,
+                int(max(duration for duration, _ in segments) + 0.999),
+            )
             lines = [
                 "#EXTM3U",
                 "#EXT-X-VERSION:3",
                 f"#EXT-X-TARGETDURATION:{target_duration}",
                 "#EXT-X-MEDIA-SEQUENCE:0",
-                "#EXT-X-PLAYLIST-TYPE:EVENT",
+                "#EXT-X-PLAYLIST-TYPE:VOD",
             ]
             if init_url:
                 lines.append('#EXT-X-MAP:URI="init.mp4"')
@@ -1540,14 +1541,33 @@ async def download_m3u8_segments(
             temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
             temp.replace(hls_dir / "playlist.m3u8")
 
+        async def report_progress(force: bool = False) -> None:
+            nonlocal last_percent
+
+            done = sum(completed)
+            percent = int((done * 100) / len(segments)) if segments else 100
+            if not force and percent <= last_percent:
+                return
+
+            elapsed = max(
+                0.1,
+                asyncio.get_running_loop().time() - started_at,
+            )
+            speed_mbps = (completed_bytes * 8 / elapsed) / 1_000_000
+            last_percent = percent
+
+            if progress is not None:
+                await progress(
+                    f"Downloading movie... {percent}% "
+                    f"({done}/{len(segments)} segments, {speed_mbps:.1f} Mbps)"
+                )
+
         async def worker(index: int) -> None:
-            nonlocal completed_bytes, forbidden_count
+            nonlocal completed_bytes
             segment_url = segments[index][1]
             target = hls_dir / segment_names[index]
 
             for attempt in range(4):
-                if fallback_requested.is_set():
-                    return
                 try:
                     async with session.get(segment_url) as response:
                         response.raise_for_status()
@@ -1559,141 +1579,54 @@ async def download_m3u8_segments(
                     async with lock:
                         completed[index] = True
                         await write_playlist()
-
-                    elapsed = max(0.1, asyncio.get_running_loop().time() - started_at)
-                    speed_mbps = (completed_bytes * 8 / elapsed) / 1_000_000
-                    done = sum(completed)
-                    if progress is not None and (done == 1 or done % 4 == 0 or done == len(segments)):
-                        await progress(
-                            f"Downloading movie... {done}/{len(segments)} segments "
-                            f"({speed_mbps:.1f} Mbps)"
-                        )
+                        await report_progress()
                     return
-                except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    if fallback_requested.is_set():
-                        return
-                    target.unlink(missing_ok=True)
-                    if isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403:
-                        async with lock:
-                            forbidden_count += 1
-                            current_forbidden = forbidden_count
-                        logger.warning(
-                            "Segment %d was rejected with HTTP 403 (%d blocked requests).",
-                            index + 1,
-                            current_forbidden,
-                        )
-                        if current_forbidden >= 3:
-                            fallback_requested.set()
-                            raise RuntimeError("Too many HTTP 403 responses; switching to FFmpeg.")
-                        if attempt < 1:
-                            await asyncio.sleep(0.5)
-                            continue
-                        raise RuntimeError(f"segment {index + 1} failed with HTTP 403") from exc
-                    if attempt == 3:
-                        raise RuntimeError(f"segment {index + 1} failed: {exc}") from exc
-                    await asyncio.sleep(1.5 * (attempt + 1))
 
-        workers = [asyncio.create_task(worker(index)) for index in range(len(segments))]
+                except (
+                    aiohttp.ClientResponseError,
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError,
+                    OSError,
+                ) as exc:
+                    target.unlink(missing_ok=True)
+
+                    if isinstance(exc, aiohttp.ClientResponseError):
+                        logger.warning(
+                            "Segment %d failed with HTTP %s "
+                            "(attempt %d/4).",
+                            index + 1,
+                            exc.status,
+                            attempt + 1,
+                        )
+
+                    if attempt == 3:
+                        raise RuntimeError(
+                            f"segment {index + 1} failed after 4 attempts: {exc}"
+                        ) from exc
+
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+        workers = [
+            asyncio.create_task(worker(index))
+            for index in range(len(segments))
+        ]
+
         try:
             await asyncio.gather(*workers)
-            if fallback_requested.is_set():
-                logger.warning(
-                    "M3U8 CDN returned repeated HTTP 403 responses; switching to FFmpeg fallback."
-                )
-                # Workers can still be unwinding on Windows when the gather
-                # returns. Wait for every task before touching their files.
-                await asyncio.gather(*workers, return_exceptions=True)
-                (hls_dir / "playlist.m3u8").unlink(missing_ok=True)
-                (hls_dir / "playlist.m3u8.tmp").unlink(missing_ok=True)
-                for partial in hls_dir.glob("segment-*"):
-                    try:
-                        partial.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                return await download_m3u8_with_ffmpeg(
-                    url, hls_dir, media_url, progress
-                )
             await write_playlist(final=True)
-        except Exception as exc:
-            if fallback_requested.is_set():
-                logger.warning(
-                    "M3U8 CDN returned repeated HTTP 403 responses; switching to FFmpeg fallback."
-                )
-                await asyncio.gather(*workers, return_exceptions=True)
-                (hls_dir / "playlist.m3u8").unlink(missing_ok=True)
-                (hls_dir / "playlist.m3u8.tmp").unlink(missing_ok=True)
-                for partial in hls_dir.glob("segment-*"):
-                    partial.unlink(missing_ok=True)
-            else:
-                logger.warning(
-                    "Parallel M3U8 download failed: %s; falling back to FFmpeg.",
-                    exc,
-                )
-            return await download_m3u8_with_ffmpeg(
-                url,
-                hls_dir,
-                media_url,
-                progress,
-            )
+            await report_progress(force=True)
+        except Exception:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
 
     logger.info(
         "Parallel M3U8 download completed: %d segments.",
         len(segments),
     )
-    return True, media_url
-
-
-async def download_m3u8_with_ffmpeg(
-    url: str,
-    hls_dir: Path,
-    media_url: str | None = None,
-    progress=None,
-) -> tuple[bool, str]:
-    """Fallback HLS downloader for CDNs that reject individual aiohttp requests."""
-    hls_dir.mkdir(parents=True, exist_ok=True)
-    playlist = hls_dir / "playlist.m3u8"
-    playlist.unlink(missing_ok=True)
-    for partial in hls_dir.glob("segment-*"):
-        partial.unlink(missing_ok=True)
-    origin_url = media_url or url
-    parsed = urlparse(origin_url)
-    headers = (
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36\\r\\n"
-        f"Referer: {origin_url}\\r\\n"
-        f"Origin: {parsed.scheme}://{parsed.netloc}\\r\\n"
-    )
-
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-headers", headers,
-        "-i", origin_url,
-        "-c", "copy",
-        "-f", "hls",
-        "-hls_time", "6",
-        "-hls_playlist_type", "event",
-        "-hls_segment_filename", str(hls_dir / "segment-%06d.ts"),
-        str(playlist),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    if progress is not None:
-        await progress("Downloading movie... switching to FFmpeg CDN fallback.")
-
-    try:
-        _, stderr = await process.communicate()
-    except asyncio.CancelledError:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        raise
-
-    if process.returncode != 0 or not playlist.is_file():
-        error = stderr.decode("utf-8", errors="replace").strip()
-        return False, error[-500:] or "FFmpeg HLS download failed."
-
-    return True, origin_url
+    return True, url
 
 
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
@@ -1779,7 +1712,6 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             "downloading": True,
             "persistent_cache": False,
             "source_m3u8_url": url,
-            "playback_ready": False,
         }
 
         # Keep the exact source URL beside the generated playlist so a future
@@ -1794,60 +1726,31 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             finish_m3u8_host(token, download_task, playlist, output)
         )
 
-    # Wait for the first contiguous segment. Parallel workers can be downloading
-    # later segments already, so playback can begin while the rest downloads.
-    for _ in range(300):
-        if playlist.exists() and playlist.stat().st_size > 0:
-            try:
-                playlist_text = playlist.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                playlist_text = ""
+    # Wait for the complete source before posting anything to Discord.
+    # The downloader updates the user's ephemeral interaction with a real
+    # percentage while the 16 concurrent HTTP workers download the segments.
+    try:
+        success, detail = await download_task
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        success, detail = False, str(exc)
 
-            has_segment = any(hls_dir.glob("*.ts")) or any(hls_dir.glob("*.m4s"))
-            if "#EXTINF:" in playlist_text and has_segment:
-                if progress is not None:
-                    await progress("Embedding movie...")
-                async with host_lock:
-                    current = active_host
-                    if current is not None and current["token"] == token:
-                        current["playback_ready"] = True
-                logger.info("M3U8 playback ready: %s", token)
-                return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+    if not success:
+        logger.warning("Parallel M3U8 downloader failed: %s", detail)
+        await clear_hosted_movie(token, reason="parallel M3U8 downloader failed")
+        return False, "The M3U8 download failed. Check the bot console for details.", None
 
-        if download_task.done():
-            try:
-                success, detail = download_task.result()
-            except Exception as exc:
-                success, detail = False, str(exc)
+    async with host_lock:
+        current = active_host
+        if current is not None and current["token"] == token:
+            current["playback_ready"] = True
 
-            if not success:
-                async with host_lock:
-                    current = active_host
-                    playback_ready = (
-                        current is not None
-                        and current["token"] == token
-                        and current.get("playback_ready", False)
-                    )
+    logger.info("M3U8 download complete: %s", token)
+    if progress is not None:
+        await progress("Download complete: 100%. Preparing Discord embed...")
 
-                logger.warning("Parallel M3U8 downloader failed: %s", detail)
-                if not playback_ready:
-                    await clear_hosted_movie(
-                        token,
-                        reason="parallel M3U8 downloader failed",
-                    )
-                    return False, "The M3U8 downloader could not start. Check the bot console for details.", None
-
-                # If playback was already returned to the user, the downloader
-                # can fail later without invalidating the active HLS host.
-                return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
-
-        if _ % 10 == 0:
-            logger.info("Waiting for parallel M3U8 playback data... %.1fs", _ * 0.5)
-
-        await asyncio.sleep(0.5)
-
-    await clear_hosted_movie(token, reason="M3U8 startup timeout")
-    return False, "The M3U8 stream took too long to start. Check the bot console for the downloader error.", None
+    return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
 
 async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: list[str]) -> None:
@@ -2006,40 +1909,8 @@ async def finish_m3u8_host(
             success, detail = False, str(exc)
 
         if not success:
-            logger.error("Parallel M3U8 download failed: %s", detail)
-
-            # Playback may already be live when the source CDN fails. Do not
-            # destroy the active HLS host in that case: viewers can continue
-            # through the segments that were already downloaded. Only tear
-            # down the host when playback never became available.
-            async with host_lock:
-                current = active_host
-                playback_ready = (
-                    current is not None
-                    and current["token"] == token
-                    and current.get("playback_ready", False)
-                )
-
-                if playback_ready:
-                    current["downloading"] = False
-                    current["download_error"] = detail
-                    current["expires_at"] = (
-                        asyncio.get_running_loop().time()
-                        + DISCORD_EMBED_GRACE_SECONDS
-                    )
-                    current["task"] = asyncio.create_task(
-                        expire_hosted_movie(token, DISCORD_EMBED_GRACE_SECONDS)
-                    )
-                    logger.warning(
-                        "M3U8 download failed after playback started; "
-                        "keeping the HLS host alive for existing segments: %s",
-                        token,
-                    )
-                else:
-                    playback_ready = False
-
-            if not playback_ready:
-                await clear_hosted_movie(token, reason="M3U8 download failed")
+            logger.error("M3U8 download failed: %s", detail)
+            await clear_hosted_movie(token, reason="M3U8 download failed")
             return
 
         if not playlist.exists() or playlist.stat().st_size == 0:
