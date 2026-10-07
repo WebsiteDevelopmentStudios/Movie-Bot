@@ -1487,6 +1487,8 @@ async def download_m3u8_segments(
             target = hls_dir / segment_names[index]
 
             for attempt in range(4):
+                if fallback_requested.is_set():
+                    return
                 try:
                     async with session.get(segment_url) as response:
                         response.raise_for_status()
@@ -1509,6 +1511,8 @@ async def download_m3u8_segments(
                         )
                     return
                 except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    if fallback_requested.is_set():
+                        return
                     target.unlink(missing_ok=True)
                     if isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403:
                         async with lock:
@@ -1530,14 +1534,33 @@ async def download_m3u8_segments(
                         raise RuntimeError(f"segment {index + 1} failed: {exc}") from exc
                     await asyncio.sleep(1.5 * (attempt + 1))
 
+        workers = [asyncio.create_task(worker(index)) for index in range(len(segments))]
         try:
-            await asyncio.gather(*(worker(index) for index in range(len(segments))))
+            await asyncio.gather(*workers)
+            if fallback_requested.is_set():
+                logger.warning(
+                    "M3U8 CDN returned repeated HTTP 403 responses; switching to FFmpeg fallback."
+                )
+                # Workers can still be unwinding on Windows when the gather
+                # returns. Wait for every task before touching their files.
+                await asyncio.gather(*workers, return_exceptions=True)
+                (hls_dir / "playlist.m3u8").unlink(missing_ok=True)
+                (hls_dir / "playlist.m3u8.tmp").unlink(missing_ok=True)
+                for partial in hls_dir.glob("segment-*"):
+                    try:
+                        partial.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return await download_m3u8_with_ffmpeg(
+                    url, hls_dir, media_url, progress
+                )
             await write_playlist(final=True)
         except Exception as exc:
             if fallback_requested.is_set():
                 logger.warning(
                     "M3U8 CDN returned repeated HTTP 403 responses; switching to FFmpeg fallback."
                 )
+                await asyncio.gather(*workers, return_exceptions=True)
                 (hls_dir / "playlist.m3u8").unlink(missing_ok=True)
                 (hls_dir / "playlist.m3u8.tmp").unlink(missing_ok=True)
                 for partial in hls_dir.glob("segment-*"):
