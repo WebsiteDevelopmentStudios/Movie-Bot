@@ -238,8 +238,9 @@ class MovieConfirmView(discord.ui.View):
             return
 
         try:
+            media_url = f"{PUBLIC_BASE_URL}/media/{active_host['token']}" if active_host else message
             await channel.send(
-                content=f"▶ **Now Playing:** {self.movie.stem}\n{message}"
+                content=f"▶ **Now Playing:** {self.movie.stem}\n{media_url}"
             )
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
@@ -778,8 +779,9 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
         headers={
             "Content-Type": "video/mp4",
             "Content-Disposition": f'inline; filename="{escape(movie.name)}"',
-            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Cache-Control": "public, max-age=0, must-revalidate",
             "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
         },
     )
 
@@ -2397,6 +2399,9 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         try:
             # Keep the Discord message simple for now. The player/embed
             # presentation can be improved separately later.
+            # M3U8 playback starts immediately through the HLS player. Once
+            # the download is complete, the same URL exposes the direct MP4
+            # preview through its Open Graph metadata.
             await channel.send(
                 content=f"▶ **Now Playing:** {movie_name}\n{player_url}"
             )
