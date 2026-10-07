@@ -1635,3 +1635,903 @@ async def connect_member_voice(interaction: discord.Interaction) -> discord.Voic
     voice_channel = member.voice.channel
     state = get_music_state(interaction.guild.id)
     voice = state.get("voice")
+
+            continue
+
+        finished = asyncio.Event()
+
+        def after_play(error):
+            if error:
+                logger.warning("Voice playback error: %s", error)
+            loop = getattr(bot, "loop", None)
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(finished.set)
+
+        voice.play(source, after=after_play)
+        # Start the lyric clock at playback start. Lyrics were fetched before
+        # voice.play(), so network latency cannot delay the first line.
+        started_at = asyncio.get_running_loop().time() - 0.15
+        lyrics_task = (
+            asyncio.create_task(
+                lyrics_loop(guild_id, voice.channel, track, started_at, lyrics)
+            )
+            if lyrics and state.get("lyrics_enabled", True) else None
+        )
+        state["lyrics_task"] = lyrics_task
+
+        try:
+            await finished.wait()
+        finally:
+            if lyrics_task is not None and state.get("lyrics_task") is lyrics_task:
+                lyrics_task.cancel()
+                try:
+                    await lyrics_task
+                except asyncio.CancelledError:
+                    pass
+                state["lyrics_task"] = None
+
+        state["current"] = None
+
+    state["current"] = None
+
+
+async def ensure_music_player(guild_id: int) -> None:
+    state = get_music_state(guild_id)
+    task = state.get("play_task")
+    if task is None or task.done():
+        state["play_task"] = asyncio.create_task(start_track(guild_id))
+
+
+async def cleanup_music_state(guild_id: int) -> None:
+    state = music_states.get(guild_id)
+    if state is None:
+        return
+
+    lyrics_task = state.get("lyrics_task")
+    if lyrics_task is not None:
+        lyrics_task.cancel()
+
+    play_task = state.get("play_task")
+    if play_task is not None and play_task is not asyncio.current_task():
+        play_task.cancel()
+
+    voice = state.get("voice")
+    if voice is not None and voice.is_connected():
+        try:
+            await voice.disconnect()
+        except (discord.ClientException, discord.HTTPException):
+            pass
+
+    state["voice"] = None
+    state["current"] = None
+    state["queue"].clear()
+    state["play_task"] = None
+    state["lyrics_task"] = None
+
+
+@bot.tree.command(name="join", description="Join your current voice channel.")
+async def voice_join(interaction: discord.Interaction) -> None:
+    voice = await connect_member_voice(interaction)
+    if voice is None:
+        await interaction.response.send_message("Join a voice channel first, then use /join.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Joined **{voice.channel.name}**.", ephemeral=True)
+
+
+@bot.tree.command(name="leave", description="Leave the voice channel and clear the music queue.")
+async def voice_leave(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_connected():
+        await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
+        return
+
+    await cleanup_music_state(interaction.guild.id)
+    await interaction.response.send_message("Left the voice channel and cleared the queue.", ephemeral=True)
+
+
+@bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
+@app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
+async def music_play(interaction: discord.Interaction, song: str) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    voice = await connect_member_voice(interaction)
+    if voice is None:
+        await interaction.response.send_message("Join a voice channel first. I can then play the song there.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        track = await resolve_music_source(song)
+        if track is None:
+            await interaction.followup.send(
+                "I could not find that song. Spotify track links and normal song searches are supported.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.edit_original_response(content=f"Downloading **{track['title']}**...")
+        path = await download_music_audio(track)
+        if path is None:
+            await interaction.followup.send(
+                "I found the song, but could not download an audio source for playback.",
+                ephemeral=True,
+            )
+            return
+
+        track["path"] = path
+        state = get_music_state(interaction.guild.id)
+        was_playing = state.get("current") is not None
+        state["queue"].append(track)
+        position = len(state["queue"])
+
+        await ensure_music_player(interaction.guild.id)
+
+        if was_playing:
+            message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
+        else:
+            message = f"Playing **{track['title']}** by **{track['artist']}**."
+
+        await interaction.followup.send(message, ephemeral=True)
+    except FileNotFoundError:
+        await interaction.followup.send("yt-dlp is not installed. Install the requirements and restart the bot.", ephemeral=True)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("The song download took too long and was cancelled.", ephemeral=True)
+    except Exception as exc:
+        logger.exception("Music play failed: %s", exc)
+        await interaction.followup.send("Something went wrong while preparing that song.", ephemeral=True)
+
+
+@bot.tree.command(name="pause", description="Pause the current song.")
+async def music_pause(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_playing():
+        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        return
+    voice.pause()
+    await interaction.response.send_message("Paused the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="resume", description="Resume the paused song.")
+async def music_resume(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_paused():
+        await interaction.response.send_message("The song is not paused.", ephemeral=True)
+        return
+    voice.resume()
+    await interaction.response.send_message("Resumed the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="lyrics", description="Toggle synchronized lyrics on or off.")
+@app_commands.describe(enabled="Turn synchronized lyrics on or off. Leave empty to toggle.")
+async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = None) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    if enabled is None:
+        enabled = not state.get("lyrics_enabled", True)
+    state["lyrics_enabled"] = bool(enabled)
+    status = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(f"Synchronized lyrics are now **{status}**.", ephemeral=True)
+
+
+@bot.tree.command(name="skip", description="Skip the currently playing song.")
+async def music_skip(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_playing():
+        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        return
+
+    voice.stop()
+    await interaction.response.send_message("Skipped the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="queue", description="Show the current music queue.")
+async def music_queue(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    current = state.get("current")
+    queue = state.get("queue", [])
+    lines = []
+
+    if current is not None:
+        lines.append(f"**Now playing:** {current['title']} — {current['artist']}")
+    if queue:
+        lines.append("")
+        lines.extend(
+            f"**{index}.** {track['title']} — {track['artist']}"
+            for index, track in enumerate(queue, 1)
+        )
+    if not lines:
+        lines = ["The music queue is empty."]
+
+    await interaction.response.send_message("\n".join(lines[:51]), ephemeral=True)
+
+
+@bot.tree.command(name="volume", description="Set the music volume.")
+@app_commands.describe(level="Volume from 0 to 100.")
+async def music_volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    state["volume"] = int(level) / 100
+
+    voice = state.get("voice")
+    if voice is not None and isinstance(voice.source, discord.PCMVolumeTransformer):
+        voice.source.volume = state["volume"]
+
+    await interaction.response.send_message(f"Volume set to **{level}%**.", ephemeral=True)
+
+
+@bot.tree.command(name="stop", description="Stop music and clear the queue.")
+async def music_stop(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    state["queue"].clear()
+    voice = state.get("voice")
+    if voice is not None and voice.is_playing():
+        voice.stop()
+    await interaction.response.send_message("Stopped playback and cleared the queue.", ephemeral=True)
+
+channel_group = app_commands.Group(
+    name="channel",
+    description="Configure the movie channel.",
+)
+movie_group = app_commands.Group(
+    name="movie",
+    description="Browse and send available movies.",
+)
+
+
+@channel_group.command(name="link", description="Choose the channel where movies will be sent.")
+@app_commands.checks.has_permissions(administrator=True)
+async def channel_link(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        "Choose the Discord text channel where movies should be sent:",
+        view=ChannelLinkView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@movie_group.command(name="list", description="Privately list all available movies.")
+async def movie_list(interaction: discord.Interaction) -> None:
+    movies = get_movie_files()
+
+    if not movies:
+        await interaction.response.send_message(
+            "No movies are currently available.",
+            ephemeral=True,
+        )
+        return
+
+    view = MovieListView(movies, interaction.user.id)
+    await interaction.response.send_message(
+        embed=movie_embed(movies, 0, view.per_page),
+        view=view,
+        ephemeral=True,
+    )
+
+
+def is_m3u8_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return False
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+
+    path = parsed.path.lower()
+    return path.endswith(".m3u8") or ".m3u8" in path
+
+
+def safe_download_name(url: str) -> str:
+    parsed = urlparse(url)
+    raw_name = Path(parsed.path).stem or "movie"
+    raw_name = re.sub(r"[^A-Za-z0-9._ -]+", "", raw_name).strip(" .")
+    raw_name = raw_name[:80] or "movie"
+
+    candidate = MOVIES_DIR / f"{raw_name}.mp4"
+    number = 2
+    while candidate.exists():
+        candidate = MOVIES_DIR / f"{raw_name} ({number}).mp4"
+        number += 1
+    return candidate.name
+
+
+async def probe_m3u8_duration(url: str) -> float | None:
+    """Try to calculate total duration directly from a VOD M3U8 playlist."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/140 Safari/537.36",
+        "Accept": "*/*",
+    }
+
+    async def fetch_playlist(session, playlist_url: str) -> tuple[str, str] | None:
+        try:
+            async with session.get(
+                playlist_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                if response.status != 200:
+                    return None
+                return await response.text(), str(response.url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            first = await fetch_playlist(session, url)
+            if first is None:
+                return None
+            text, final_url = first
+
+            # Master playlist: use the first variant and inspect that media playlist.
+            if "#EXT-X-STREAM-INF" in text:
+                variant = None
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        variant = line
+                        break
+                if variant:
+                    variant_url = __import__("urllib.parse", fromlist=["urljoin"]).urljoin(
+                        final_url, variant
+                    )
+                    second = await fetch_playlist(session, variant_url)
+                    if second is None:
+                        return None
+                    text, final_url = second
+
+            values = re.findall(r"#EXTINF:([0-9]+(?:\.[0-9]+)?),", text)
+            if not values:
+                return None
+            total = sum(float(value) for value in values)
+            return total if total > 0 else None
+    except Exception:
+        return None
+
+
+async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
+    """Download the complete M3U8 movie, show progress, then prepare two-part hosting."""
+    global active_host
+    ensure_movies_dir()
+    if not is_m3u8_url(url):
+        return False, "That is not a valid HTTP/HTTPS M3U8 URL.", None
+    if progress is not None:
+        await progress("Downloading movie... 0%")
+    if not PUBLIC_BASE_URL:
+        if progress is not None:
+            await progress("Connecting movie player...")
+        await bot.ensure_cloudflare_tunnel()
+    if not PUBLIC_BASE_URL:
+        return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot.", None
+
+    filename = safe_download_name(url)
+    output = MOVIES_DIR / filename
+
+    # ffprobe can fail on signed CDN URLs even when FFmpeg can play them.
+    # Parse the VOD playlist as a second way to obtain an accurate duration.
+    duration = await probe_m3u8_duration(url)
+
+    async with host_lock:
+        if active_host is not None:
+            return False, "Another movie is currently being hosted. Please wait until it finishes.", None
+
+        token = secrets.token_urlsafe(32)
+        HLS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        hls_dir = HLS_CACHE_DIR / token
+        hls_dir.mkdir(parents=True, exist_ok=False)
+        playlist = hls_dir / "playlist.m3u8"
+
+        parsed_url = urlparse(url)
+        origin = f"{parsed_url.scheme}://{parsed_url.netloc}/"
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+        request_headers = (
+            f"User-Agent: {user_agent}\r\n"
+            f"Referer: {origin}\r\n"
+            "Accept: */*\r\n"
+            "Connection: keep-alive\r\n"
+        )
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                "-allowed_extensions", "ALL", "-extension_picky", "0",
+                "-user_agent", user_agent,
+                "-referer", origin,
+                "-headers", request_headers,
+                "-http_persistent", "1",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-rw_timeout", "30000000",
+                "-i", url,
+                "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+                "-start_number", "0", "-hls_time", "2", "-hls_list_size", "0",
+                "-hls_playlist_type", "vod",
+                "-hls_flags", "independent_segments+temp_file",
+                "-hls_segment_type", "mpegts", "-f", "hls", str(playlist),
+                "-progress", "pipe:1", "-nostats",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            hls_dir.rmdir()
+            return False, "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.", None
+        except OSError as exc:
+            logger.exception("Could not start FFmpeg for M3U8 download: %s", exc)
+            hls_dir.rmdir()
+            return False, "I could not start the M3U8 download.", None
+
+        ffmpeg_stderr_lines: list[str] = []
+        ffmpeg_stderr_task = asyncio.create_task(_collect_ffmpeg_stderr(process, ffmpeg_stderr_lines))
+
+        async def monitor_download() -> None:
+            last_percent = None
+            if process.stdout is None:
+                return
+            try:
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    value = line.decode("utf-8", errors="replace").strip()
+                    if not value.startswith("out_time_ms="):
+                        continue
+                    try:
+                        media_time = int(value.split("=", 1)[1]) / 1_000_000
+                    except ValueError:
+                        continue
+
+                    if duration:
+                        percent = max(0, min(99, int((media_time / duration) * 100)))
+                        display = f"{percent}%"
+                    else:
+                        # Signed/odd CDN playlists sometimes hide duration from
+                        # ffprobe. Still show real progress instead of 0% forever.
+                        display = f"{int(media_time // 60)}m {int(media_time % 60):02d}s"
+
+                    if display != last_percent:
+                        last_percent = display
+                        if progress is not None:
+                            await progress(f"Downloading movie... {display}")
+            except asyncio.CancelledError:
+                raise
+            except (OSError, RuntimeError):
+                pass
+
+        progress_task = asyncio.create_task(monitor_download())
+        active_host = {
+            "token": token, "movie": output, "hls_dir": hls_dir,
+            "ffmpeg_process": process, "ffmpeg_stderr_lines": ffmpeg_stderr_lines,
+            "ffmpeg_stderr_task": ffmpeg_stderr_task, "progress_task": progress_task,
+            "expires_at": float("inf"), "task": None, "downloading": True,
+            "duration": duration,
+        }
+        active_host["task"] = asyncio.create_task(
+            finish_m3u8_host(token, process, playlist, output, progress)
+        )
+
+    # Do not wait for the whole movie here. As soon as FFmpeg has created a
+    # usable local HLS playlist, return the player URL and let the background
+    # task finish the download/remux. This makes playback start while downloading.
+    for _ in range(120):
+        if playlist.exists() and playlist.stat().st_size > 0:
+            if progress is not None:
+                await progress("Movie stream ready. You can watch it now.")
+            logger.info("M3U8 playback is ready: %s", playlist)
+            return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+
+        if process.returncode is not None:
+            error_text = "\n".join(ffmpeg_stderr_lines[-50:])
+            logger.error(
+                "FFmpeg M3U8 download failed before playback became ready: %s",
+                error_text[-5000:] or "(no stderr output)",
+            )
+            await clear_hosted_movie(token, reason="M3U8 download failed before playback")
+            return False, "FFmpeg could not start playback for this M3U8 movie. Check the bot console.", None
+
+        await asyncio.sleep(0.5)
+
+    await clear_hosted_movie(token, reason="M3U8 playback did not start")
+    return False, "The M3U8 stream did not become playable in time.", None
+
+
+async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: list[str]) -> None:
+    if process.stderr is None:
+        return
+    try:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            value = line.decode("utf-8", errors="replace").rstrip()
+            if value:
+                lines.append(value)
+                if len(lines) > 100:
+                    del lines[:-100]
+    except asyncio.CancelledError:
+        raise
+
+
+async def split_movie_into_parts(source: Path, parts_dir: Path) -> tuple[Path, Path] | None:
+    """Create two fragmented MP4 files for site-side sequential playback."""
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(source),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await probe.communicate()
+        if probe.returncode != 0:
+            logger.warning("Could not determine movie duration: %s",
+                           stderr.decode("utf-8", errors="replace")[-2000:])
+            return None
+        duration = float(stdout.decode().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+    if duration <= 2:
+        return None
+
+    halfway = duration / 2
+    first = parts_dir / "part1.mp4"
+    second = parts_dir / "part2.mp4"
+    common = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-map", "0:v:0?", "-map", "0:a:0?",
+        "-c", "copy",
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+    ]
+
+    try:
+        p1 = await asyncio.create_subprocess_exec(
+            *common, "-t", str(halfway), str(first),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, e1 = await p1.communicate()
+        if p1.returncode != 0 or not first.exists() or first.stat().st_size == 0:
+            logger.warning("Movie part 1 creation failed: %s",
+                           e1.decode("utf-8", errors="replace")[-3000:])
+            first.unlink(missing_ok=True)
+            return None
+
+        p2 = await asyncio.create_subprocess_exec(
+            *common, "-ss", str(halfway), str(second),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, e2 = await p2.communicate()
+        if p2.returncode != 0 or not second.exists() or second.stat().st_size == 0:
+            logger.warning("Movie part 2 creation failed: %s",
+                           e2.decode("utf-8", errors="replace")[-3000:])
+            first.unlink(missing_ok=True)
+            second.unlink(missing_ok=True)
+            return None
+
+        logger.info("Created two site-hosted movie parts.")
+        return first, second
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("Movie part creation failed: %s", exc)
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+        return None
+
+
+async def finish_m3u8_host(
+    token: str,
+    process: asyncio.subprocess.Process,
+    playlist: Path,
+    output: Path,
+    progress=None,
+) -> None:
+    try:
+        await process.wait()
+
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            stderr_task = current.get("ffmpeg_stderr_task")
+            stderr_lines = current.get("ffmpeg_stderr_lines", [])
+
+        if stderr_task is not None:
+            await stderr_task
+
+        error_text = "\n".join(stderr_lines[-100:])
+        if process.returncode != 0 or not playlist.exists() or playlist.stat().st_size == 0:
+            logger.error(
+                "FFmpeg finished M3U8 download with code %s: %s",
+                process.returncode,
+                error_text[-5000:] or "(no stderr output)",
+            )
+            await clear_hosted_movie(token, reason="M3U8 download failed")
+            return
+
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            current["downloading"] = False
+
+        if progress is not None:
+            try:
+                await progress("Downloading movie... 100%")
+                await progress("Preparing movie...")
+            except discord.HTTPException:
+                pass
+
+        # Convert the cached HLS segments into the normal local MP4 without
+        # contacting the original M3U8 URL again.
+        remux_temp = output.with_name(f".{output.name}.part")
+        try:
+            remux = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-allowed_extensions", "ALL",
+                "-i", str(playlist),
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart",
+                str(remux_temp),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, remux_stderr = await remux.communicate()
+            if remux.returncode != 0 or not remux_temp.exists() or remux_temp.stat().st_size == 0:
+                logger.warning(
+                    "Could not save completed M3U8 movie as MP4: %s",
+                    remux_stderr.decode("utf-8", errors="replace")[-5000:],
+                )
+                remux_temp.unlink(missing_ok=True)
+            else:
+                remux_temp.replace(output)
+        except (FileNotFoundError, OSError) as exc:
+            logger.warning("Could not remux completed M3U8 movie: %s", exc)
+            remux_temp.unlink(missing_ok=True)
+
+        parts_dir = HLS_CACHE_DIR / token / "parts"
+        parts = await split_movie_into_parts(output, parts_dir) if output.exists() else None
+
+        async with host_lock:
+            current = active_host
+            if current is not None and current["token"] == token and parts is not None:
+                current["parts_dir"] = parts_dir
+                current["parts"] = parts
+
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
+
+        duration = float(current.get("duration", 0) or 0)
+        async with host_lock:
+            current = active_host
+            if current is not None and current["token"] == token:
+                current["expires_at"] = asyncio.get_running_loop().time() + duration + HOST_EXPIRY_BUFFER_SECONDS
+                current["expiry_task"] = asyncio.create_task(expire_hosted_movie(token, duration))
+        if progress is not None:
+            try:
+                await progress("Movie downloaded and ready.")
+            except discord.HTTPException:
+                pass
+        logger.info("M3U8 movie is fully prepared for playback: %s", output.name)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("M3U8 streaming task failed: %s", exc)
+        await clear_hosted_movie(token, reason="M3U8 streaming task failed")
+
+
+@movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
+@app_commands.describe(movie="Movie name, or an HTTP/HTTPS .m3u8 URL.")
+async def movie_play(interaction: discord.Interaction, movie: str) -> None:
+    if is_m3u8_url(movie):
+        await interaction.response.defer(ephemeral=True)
+
+        async def progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message)
+            except discord.HTTPException:
+                pass
+
+        success, player_url, downloaded = await stream_m3u8_movie(movie, progress)
+
+        if not success or player_url is None:
+            await interaction.followup.send(
+                "I could not start that M3U8 movie.",
+                ephemeral=True,
+            )
+            return
+
+        channel = await get_movie_channel()
+        if channel is None:
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.followup.send(
+                "The movie stream started, but the configured movie channel is unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
+        try:
+            # Keep the Discord message simple for now. The player/embed
+            # presentation can be improved separately later.
+            # M3U8 playback starts immediately through the HLS player. Once
+            # the download is complete, the same URL exposes the direct MP4
+            # preview through its Open Graph metadata.
+            await channel.send(
+                content=f"▶ **Now Playing:** {movie_name}\n{player_url}"
+            )
+            await interaction.followup.send(
+                f"Now streaming {movie_name} in {channel.mention}.",
+                ephemeral=True,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.followup.send(
+                "The movie stream started, but I could not post the movie player.",
+                ephemeral=True,
+            )
+        return
+
+
+    if not get_movie_files():
+        await interaction.response.send_message(
+            "No movies are currently available.",
+            ephemeral=True,
+        )
+        return
+
+    selected = find_movie(movie)
+    if selected is None:
+        await interaction.response.send_message(
+            "That movie is not available. Use /movie list or provide an HTTP/HTTPS .m3u8 URL.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async def progress(message: str) -> None:
+        try:
+            await interaction.edit_original_response(content=message)
+        except discord.HTTPException:
+            pass
+
+    await progress("Embedding movie...")
+    success, message = await host_movie(selected, progress)
+    if not success:
+        await interaction.followup.send(message, ephemeral=True)
+        return
+
+    channel = await get_movie_channel()
+    if channel is None:
+        await clear_hosted_movie(active_host["token"] if active_host else "")
+        await interaction.followup.send("The configured movie channel is unavailable.", ephemeral=True)
+        return
+
+    try:
+        # Plain URL for now. Discord's native media preview can be revisited
+        # later without changing the hosting/player architecture.
+        await channel.send(
+            content=f"▶ **Now Playing:** {selected.stem}\n{message}"
+        )
+        await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException):
+        await clear_hosted_movie(active_host["token"] if active_host else "")
+        await interaction.followup.send("I could not post the movie player in the configured channel.", ephemeral=True)
+
+
+@bot.tree.command(name="sync", description="Sync all slash commands to this server.")
+@app_commands.checks.has_permissions(administrator=True)
+async def sync_commands(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await bot.tree.sync(guild=interaction.guild)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        logger.warning("Could not sync commands to guild %s: %s", interaction.guild.id, exc)
+        await interaction.followup.send(
+            "I could not sync the commands. Check that I have permission to use slash commands in this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"Synced {len(synced)} slash command(s) to **{interaction.guild.name}**. "
+        "They should appear immediately.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(channel_group)
+bot.tree.add_command(movie_group)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need administrator permissions to use that command."
+    elif isinstance(error, app_commands.CommandInvokeError):
+        logger.error("Command error: %r", error.original)
+        message = "Something went wrong while processing that command."
+    else:
+        logger.warning("Slash command error: %s", error)
+        message = "Something went wrong while processing that command."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+def main() -> None:
+    ensure_movies_dir()
+
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise SystemExit(
+            "DISCORD_TOKEN is missing. Create a .env file with DISCORD_TOKEN=your_bot_token_here."
+        )
+
+    try:
+        bot.run(token)
+    except discord.LoginFailure:
+        raise SystemExit("Discord rejected the bot token. Check your DISCORD_TOKEN.") from None
+
+
+if __name__ == "__main__":
+    main()
