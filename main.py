@@ -1087,6 +1087,16 @@ class MovieBot(discord.Client):
         self.movie_web_runner = await start_movie_web_server()
 
         try:
+            # Remove the temporary guild-scoped copies created by an earlier
+            # sync strategy. The bot now uses global application commands only.
+            for guild in self.guilds:
+                try:
+                    self.tree.clear_commands(guild=guild)
+                    await self.tree.sync(guild=guild)
+                    logger.info("Cleared old guild-scoped commands from %s.", guild.name)
+                except discord.HTTPException as exc:
+                    logger.warning("Could not clear old guild commands from %s: %s", guild.name, exc)
+
             synced = await self.tree.sync()
             logger.info("Synced %d global slash command(s).", len(synced))
         except discord.HTTPException as exc:
