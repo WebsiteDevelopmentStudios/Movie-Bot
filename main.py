@@ -1332,8 +1332,20 @@ async def download_m3u8_segments(
         connect=30,
         sock_read=120,
     )
-    connector = aiohttp.TCPConnector(limit=24, limit_per_host=16, ttl_dns_cache=300)
-    headers = {"User-Agent": "Movie-Bot/1.0"}
+    # Some CDNs (including signed media CDNs) reject large bursts of requests.
+    # Eight workers is still much faster than sequential fetching while being
+    # considerably more compatible with protected HLS sources.
+    connector = aiohttp.TCPConnector(limit=16, limit_per_host=8, ttl_dns_cache=300)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -1344,6 +1356,15 @@ async def download_m3u8_segments(
             media_url, segments, init_url, reason = await resolve_m3u8_media_playlist(session, url)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             return False, f"playlist fetch failed: {exc}"
+
+        # Signed CDNs often expect the segment requests to originate from the
+        # playlist URL. Supplying the playlist as Referer improves compatibility
+        # without exposing or changing the signed segment URLs.
+        playlist_origin = f"{urlparse(media_url).scheme}://{urlparse(media_url).netloc}"
+        session.headers.update({
+            "Referer": media_url,
+            "Origin": playlist_origin,
+        })
 
         if reason:
             return False, reason
@@ -1426,8 +1447,14 @@ async def download_m3u8_segments(
                             f"({speed_mbps:.1f} Mbps)"
                         )
                     return
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                     target.unlink(missing_ok=True)
+                    if isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403:
+                        logger.warning(
+                            "Segment %d was rejected with HTTP 403; "
+                            "retrying with CDN-compatible headers.",
+                            index + 1,
+                        )
                     if attempt == 3:
                         raise RuntimeError(f"segment {index + 1} failed: {exc}") from exc
                     await asyncio.sleep(1.5 * (attempt + 1))
