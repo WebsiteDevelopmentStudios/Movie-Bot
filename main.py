@@ -1908,11 +1908,23 @@ async def start_track(guild_id: int) -> None:
         source_path = track.get("path")
         stream_url = str(track.get("stream_url") or "").strip()
 
-        if not stream_url and (source_path is None or not source_path.exists()):
-            # Older queued entries may only have a local path. New entries use
-            # direct network playback, which avoids waiting for the complete
-            # song to download before Discord starts receiving audio.
+        if not stream_url:
+            # Resolve the remote source at playback time so signed media URLs
+            # are fresh even when the track spent time waiting in the queue.
             stream_url = await resolve_music_stream_url(track)
+
+        if not stream_url and (source_path is None or not source_path.exists()):
+            # Direct streaming failed. Fall back to the existing downloader.
+            try:
+                source_path = await download_music_audio(track)
+                if source_path is not None:
+                    track["path"] = source_path
+            except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
+                logger.warning(
+                    "Fallback music download failed for %s: %s",
+                    track.get("title", "unknown"),
+                    exc,
+                )
 
         if not stream_url and (source_path is None or not source_path.exists()):
             state["current"] = None
@@ -1956,13 +1968,16 @@ async def start_track(guild_id: int) -> None:
                 # reconnect flags are important for long songs and transient
                 # network interruptions.
                 stream_input = stream_url
-                before_options = (
+                reconnect_options = (
                     "-reconnect 1 "
                     "-reconnect_streamed 1 "
                     "-reconnect_at_eof 1 "
                     "-reconnect_delay_max 5 "
                     "-nostdin"
                 )
+                if intro_offset > 0:
+                    reconnect_options += f" -ss {intro_offset:.3f}"
+                before_options = reconnect_options
                 source = discord.FFmpegPCMAudio(
                     stream_input,
                     before_options=before_options,
@@ -2104,28 +2119,15 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
             )
             return
 
-        await interaction.edit_original_response(content=f"Preparing **{track['title']}**...")
-        stream_url = await resolve_music_stream_url(track)
+        await interaction.edit_original_response(
+            content=f"Queueing **{track['title']}** for direct playback..."
+        )
 
-        if stream_url:
-            # Store the direct stream URL in the queue entry. Playback can
-            # begin as soon as Discord connects instead of waiting for the
-            # complete song to be downloaded.
-            track["stream_url"] = stream_url
-        else:
-            # Keep the existing downloader as a compatibility fallback for
-            # sources where a direct stream URL cannot be resolved.
-            await interaction.edit_original_response(
-                content=f"Preparing a fallback audio file for **{track['title']}**..."
-            )
-            path = await download_music_audio(track)
-            if path is None:
-                await interaction.followup.send(
-                    "I found the song, but could not resolve a playable audio source.",
-                    ephemeral=True,
-                )
-                return
-            track["path"] = path
+        # Do not resolve an expiring media URL while the song is waiting in
+        # the queue. Resolve it immediately before playback instead, just as
+        # a Lavalink player resolves/loads the source when it is about to play.
+        # The old local downloader remains available as a fallback inside
+        # start_track().
         state = get_music_state(interaction.guild.id)
         was_playing = (
             state.get("current") is not None
