@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from html import escape
 
+import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
