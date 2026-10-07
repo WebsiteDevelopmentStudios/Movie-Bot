@@ -1779,6 +1779,7 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             "downloading": True,
             "persistent_cache": False,
             "source_m3u8_url": url,
+            "playback_ready": False,
         }
 
         # Keep the exact source URL beside the generated playlist so a future
@@ -1806,6 +1807,10 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             if "#EXTINF:" in playlist_text and has_segment:
                 if progress is not None:
                     await progress("Embedding movie...")
+                async with host_lock:
+                    current = active_host
+                    if current is not None and current["token"] == token:
+                        current["playback_ready"] = True
                 logger.info("M3U8 playback ready: %s", token)
                 return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
@@ -1816,9 +1821,25 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
                 success, detail = False, str(exc)
 
             if not success:
+                async with host_lock:
+                    current = active_host
+                    playback_ready = (
+                        current is not None
+                        and current["token"] == token
+                        and current.get("playback_ready", False)
+                    )
+
                 logger.warning("Parallel M3U8 downloader failed: %s", detail)
-                await clear_hosted_movie(token, reason="parallel M3U8 downloader failed")
-                return False, "The M3U8 downloader could not start. Check the bot console for details.", None
+                if not playback_ready:
+                    await clear_hosted_movie(
+                        token,
+                        reason="parallel M3U8 downloader failed",
+                    )
+                    return False, "The M3U8 downloader could not start. Check the bot console for details.", None
+
+                # If playback was already returned to the user, the downloader
+                # can fail later without invalidating the active HLS host.
+                return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
         if _ % 10 == 0:
             logger.info("Waiting for parallel M3U8 playback data... %.1fs", _ * 0.5)
@@ -1986,7 +2007,39 @@ async def finish_m3u8_host(
 
         if not success:
             logger.error("Parallel M3U8 download failed: %s", detail)
-            await clear_hosted_movie(token, reason="M3U8 download failed")
+
+            # Playback may already be live when the source CDN fails. Do not
+            # destroy the active HLS host in that case: viewers can continue
+            # through the segments that were already downloaded. Only tear
+            # down the host when playback never became available.
+            async with host_lock:
+                current = active_host
+                playback_ready = (
+                    current is not None
+                    and current["token"] == token
+                    and current.get("playback_ready", False)
+                )
+
+                if playback_ready:
+                    current["downloading"] = False
+                    current["download_error"] = detail
+                    current["expires_at"] = (
+                        asyncio.get_running_loop().time()
+                        + DISCORD_EMBED_GRACE_SECONDS
+                    )
+                    current["task"] = asyncio.create_task(
+                        expire_hosted_movie(token, DISCORD_EMBED_GRACE_SECONDS)
+                    )
+                    logger.warning(
+                        "M3U8 download failed after playback started; "
+                        "keeping the HLS host alive for existing segments: %s",
+                        token,
+                    )
+                else:
+                    playback_ready = False
+
+            if not playback_ready:
+                await clear_hosted_movie(token, reason="M3U8 download failed")
             return
 
         if not playlist.exists() or playlist.stat().st_size == 0:
