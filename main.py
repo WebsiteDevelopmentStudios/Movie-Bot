@@ -1352,25 +1352,37 @@ async def download_music_audio(track: dict) -> Path | None:
         # Try the preferred native audio format first. If a YouTube client
         # rejects that format, retry with any playable audio format before
         # moving on to the next search result.
+        # YouTube can expose only thumbnails/images to some player clients.
+        # Try several clients so a temporary client restriction does not make
+        # every otherwise playable song fail.
+        client_options = [
+            "web",
+            "android_vr",
+            "tv",
+            "mweb",
+            "android",
+        ]
         format_options = [
             "bestaudio[ext=m4a]/bestaudio/best",
             "bestaudio/best",
+            "best",
         ]
 
-        for format_selector in format_options:
-            code, _, stderr = await run_yt_dlp([
-                "--no-playlist",
-                "--format", format_selector,
-                "--output", str(output_template),
-                "--no-part",
-                "--retries", "5",
-                "--fragment-retries", "10",
-                "--retry-sleep", "1",
-                "--remote-components", "ejs:github",
-                "--extractor-args", "youtube:player_client=web",
-                "--no-check-certificates",
-                candidate["url"],
-            ], timeout=15 * 60)
+        for client in client_options:
+            for format_selector in format_options:
+                code, _, stderr = await run_yt_dlp([
+                    "--no-playlist",
+                    "--format", format_selector,
+                    "--output", str(output_template),
+                    "--no-part",
+                    "--retries", "5",
+                    "--fragment-retries", "10",
+                    "--retry-sleep", "1",
+                    "--remote-components", "ejs:github",
+                    "--extractor-args", f"youtube:player_client={client}",
+                    "--no-check-certificates",
+                    candidate["url"],
+                ], timeout=15 * 60)
 
             if code == 0:
                 files = [
