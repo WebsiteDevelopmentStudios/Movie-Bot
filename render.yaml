@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: movie-bot
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python cloud_backend.py
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: WAKE_SECRET
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: MOVIE_HOST
+        value: "127.0.0.1"
+      - key: MOVIE_PORT
+        value: "8080"
