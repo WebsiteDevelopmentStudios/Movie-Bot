@@ -1958,7 +1958,9 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             "expires_at": float("inf"), "task": None, "downloading": True,
             "duration": duration,
         }
-        active_host["task"] = asyncio.create_task(finish_m3u8_host(token, process, playlist, output))
+        active_host["task"] = asyncio.create_task(
+            finish_m3u8_host(token, process, playlist, output, progress)
+        )
 
     # Do not wait for the whole movie here. As soon as FFmpeg has created a
     # usable local HLS playlist, return the player URL and let the background
@@ -1968,7 +1970,7 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             if progress is not None:
                 await progress("Movie stream ready. You can watch it now.")
             logger.info("M3U8 playback is ready: %s", playlist)
-            return True, f"{PUBLIC_BASE_URL}/movie/{token}", None
+            return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
         if process.returncode is not None:
             error_text = "\n".join(ffmpeg_stderr_lines[-50:])
@@ -2076,6 +2078,7 @@ async def finish_m3u8_host(
     process: asyncio.subprocess.Process,
     playlist: Path,
     output: Path,
+    progress=None,
 ) -> None:
     try:
         await process.wait()
@@ -2105,6 +2108,13 @@ async def finish_m3u8_host(
             if current is None or current["token"] != token:
                 return
             current["downloading"] = False
+
+        if progress is not None:
+            try:
+                await progress("Downloading movie... 100%")
+                await progress("Preparing movie...")
+            except discord.HTTPException:
+                pass
 
         # Convert the cached HLS segments into the normal local MP4 without
         # contacting the original M3U8 URL again.
@@ -2156,6 +2166,11 @@ async def finish_m3u8_host(
             if current is not None and current["token"] == token:
                 current["expires_at"] = asyncio.get_running_loop().time() + duration + HOST_EXPIRY_BUFFER_SECONDS
                 current["expiry_task"] = asyncio.create_task(expire_hosted_movie(token, duration))
+        if progress is not None:
+            try:
+                await progress("Movie downloaded and ready.")
+            except discord.HTTPException:
+                pass
         logger.info("M3U8 movie is fully prepared for playback: %s", output.name)
     except asyncio.CancelledError:
         raise
@@ -2211,16 +2226,13 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         )
 
         try:
-            direct_media_url = (
-                f"{PUBLIC_BASE_URL}/media/{active_host['token']}"
-                if active_host is not None
-                else player_url
-            )
+            # The web-player URL is valid immediately. Do not post the
+            # /media URL until the MP4 exists, because Discord can cache an
+            # early 404 and keep showing a broken preview.
             await channel.send(
                 content=(
                     f"▶ **Now Playing:** {movie_name}\n"
-                    f"{direct_media_url}\n\n"
-                    f"Web player: {player_url}"
+                    f"{player_url}"
                 ),
                 embed=embed,
                 suppress_embeds=False,
