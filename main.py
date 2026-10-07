@@ -5,7 +5,7 @@ import os
 import re
 import secrets
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from html import escape
 
 import discord
@@ -397,6 +397,7 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
 
         current = active_host
         task = current.get("task")
+        download_task = current.get("download_task")
         ffmpeg_process = current.get("ffmpeg_process")
         stderr_task = current.get("ffmpeg_stderr_task")
         hls_dir = current.get("hls_dir")
@@ -404,6 +405,8 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
 
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+        if download_task is not None and download_task is not asyncio.current_task():
+            download_task.cancel()
         if stderr_task is not None and stderr_task is not asyncio.current_task():
             stderr_task.cancel()
 
@@ -1234,8 +1237,215 @@ def safe_download_name(url: str) -> str:
     return candidate.name
 
 
+async def fetch_m3u8_text(session: aiohttp.ClientSession, url: str) -> tuple[str, str]:
+    async with session.get(url, allow_redirects=True) as response:
+        response.raise_for_status()
+        text = await response.text(errors="replace")
+        return text, str(response.url)
+
+
+def parse_m3u8_segments(playlist_text: str, base_url: str) -> tuple[list[tuple[float, str]], str | None, str | None]:
+    """Parse a simple VOD media playlist.
+
+    Returns (segments, init_url, unsupported_reason). Encrypted and byte-range
+    playlists fall back to FFmpeg because they need special handling.
+    """
+    if "#EXT-X-KEY:" in playlist_text:
+        for line in playlist_text.splitlines():
+            if line.startswith("#EXT-X-KEY:") and "METHOD=NONE" not in line.upper():
+                return [], None, "encrypted HLS"
+    if "#EXT-X-BYTERANGE:" in playlist_text:
+        return [], None, "byte-range HLS"
+
+    segments: list[tuple[float, str]] = []
+    init_url = None
+    pending_duration = None
+
+    lines = [line.strip() for line in playlist_text.splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("#EXT-X-MAP:"):
+            match = re.search(r'URI="([^"]+)"', line)
+            if match:
+                init_url = urljoin(base_url, match.group(1))
+        elif line.startswith("#EXTINF:"):
+            try:
+                pending_duration = float(line.split(":", 1)[1].split(",", 1)[0])
+            except ValueError:
+                pending_duration = 2.0
+        elif not line.startswith("#") and pending_duration is not None:
+            segments.append((pending_duration, urljoin(base_url, line)))
+            pending_duration = None
+
+    if not segments:
+        return [], init_url, "no media segments found"
+
+    return segments, init_url, None
+
+
+async def resolve_m3u8_media_playlist(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> tuple[str, list[tuple[float, str]], str | None, str | None]:
+    """Resolve a master playlist to the highest-bandwidth media playlist."""
+    text, final_url = await fetch_m3u8_text(session, url)
+
+    if "#EXT-X-STREAM-INF:" not in text:
+        segments, init_url, reason = parse_m3u8_segments(text, final_url)
+        return final_url, segments, init_url, reason
+
+    variants: list[tuple[int, str]] = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines[:-1]):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        next_line = lines[index + 1]
+        if next_line.startswith("#"):
+            continue
+        bandwidth_match = re.search(r"(?:AVERAGE-BANDWIDTH|BANDWIDTH)=(\d+)", line)
+        bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
+        variants.append((bandwidth, urljoin(final_url, next_line)))
+
+    if not variants:
+        return final_url, [], None, "master playlist has no variants"
+
+    variants.sort(key=lambda item: item[0], reverse=True)
+    media_url = variants[0][1]
+    media_text, media_final_url = await fetch_m3u8_text(session, media_url)
+    segments, init_url, reason = parse_m3u8_segments(media_text, media_final_url)
+    return media_final_url, segments, init_url, reason
+
+
+async def download_m3u8_segments(
+    url: str,
+    hls_dir: Path,
+    progress=None,
+) -> tuple[bool, str]:
+    """Download HLS media segments concurrently and build a local playlist.
+
+    This is substantially faster than FFmpeg's sequential HLS fetching for
+    sources that allow several HTTP requests at once. If the source uses
+    encryption or byte ranges, the caller falls back to FFmpeg.
+    """
+    timeout = aiohttp.ClientTimeout(
+        total=DOWNLOAD_TIMEOUT_SECONDS,
+        connect=30,
+        sock_read=120,
+    )
+    connector = aiohttp.TCPConnector(limit=24, limit_per_host=16, ttl_dns_cache=300)
+    headers = {"User-Agent": "Movie-Bot/1.0"}
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers=headers,
+    ) as session:
+        try:
+            media_url, segments, init_url, reason = await resolve_m3u8_media_playlist(session, url)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            return False, f"playlist fetch failed: {exc}"
+
+        if reason:
+            return False, reason
+
+        hls_dir.mkdir(parents=True, exist_ok=True)
+        segment_extension = ".m4s" if init_url else ".ts"
+        segment_names = [
+            f"segment-{index:06d}{segment_extension}"
+            for index in range(len(segments))
+        ]
+
+        if init_url:
+            init_path = hls_dir / "init.mp4"
+            try:
+                async with session.get(init_url) as response:
+                    response.raise_for_status()
+                    with init_path.open("wb") as file:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            file.write(chunk)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                return False, f"initialization segment download failed: {exc}"
+
+        completed = [False] * len(segments)
+        lock = asyncio.Lock()
+        completed_bytes = 0
+        started_at = asyncio.get_running_loop().time()
+
+        async def write_playlist(final: bool = False) -> None:
+            count = 0
+            while count < len(completed) and completed[count]:
+                count += 1
+
+            target_duration = max(1, int(max(duration for duration, _ in segments) + 0.999))
+            lines = [
+                "#EXTM3U",
+                "#EXT-X-VERSION:3",
+                f"#EXT-X-TARGETDURATION:{target_duration}",
+                "#EXT-X-MEDIA-SEQUENCE:0",
+                "#EXT-X-PLAYLIST-TYPE:EVENT",
+            ]
+            if init_url:
+                lines.append('#EXT-X-MAP:URI="init.mp4"')
+
+            for index in range(count):
+                duration, _ = segments[index]
+                lines.append(f"#EXTINF:{duration:.6f},")
+                lines.append(segment_names[index])
+
+            if final and count == len(segments):
+                lines.append("#EXT-X-ENDLIST")
+
+            temp = hls_dir / "playlist.m3u8.tmp"
+            temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            temp.replace(hls_dir / "playlist.m3u8")
+
+        async def worker(index: int) -> None:
+            nonlocal completed_bytes
+            segment_url = segments[index][1]
+            target = hls_dir / segment_names[index]
+
+            for attempt in range(4):
+                try:
+                    async with session.get(segment_url) as response:
+                        response.raise_for_status()
+                        with target.open("wb") as file:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                file.write(chunk)
+                                completed_bytes += len(chunk)
+
+                    async with lock:
+                        completed[index] = True
+                        await write_playlist()
+
+                    elapsed = max(0.1, asyncio.get_running_loop().time() - started_at)
+                    speed_mbps = (completed_bytes * 8 / elapsed) / 1_000_000
+                    done = sum(completed)
+                    if progress is not None and (done == 1 or done % 4 == 0 or done == len(segments)):
+                        await progress(
+                            f"Downloading movie... {done}/{len(segments)} segments "
+                            f"({speed_mbps:.1f} Mbps)"
+                        )
+                    return
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    target.unlink(missing_ok=True)
+                    if attempt == 3:
+                        raise RuntimeError(f"segment {index + 1} failed: {exc}") from exc
+                    await asyncio.sleep(1.5 * (attempt + 1))
+
+        try:
+            await asyncio.gather(*(worker(index) for index in range(len(segments))))
+            await write_playlist(final=True)
+        except Exception as exc:
+            return False, str(exc)
+
+    logger.info(
+        "Parallel M3U8 download completed: %d segments.",
+        len(segments),
+    )
+    return True, media_url
+
+
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
-    """Start an HLS player as soon as FFmpeg has produced playable data."""
+    """Download M3U8 segments in parallel while exposing a growing HLS playlist."""
     global active_host
 
     ensure_movies_dir()
@@ -1267,62 +1477,29 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         hls_dir.mkdir(parents=True, exist_ok=False)
         playlist = hls_dir / "playlist.m3u8"
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "warning",
-                "-y",
-                "-protocol_whitelist", "http,https,tcp,tls,crypto",
-                "-allowed_extensions", "ALL",
-                "-extension_picky", "0",
-                "-http_persistent", "1",
-                "-i", url,
-                "-map", "0:v:0?",
-                "-map", "0:a:0?",
-                "-c", "copy",
-                "-start_number", "0",
-                "-hls_time", "2",
-                "-hls_list_size", "0",
-                "-hls_playlist_type", "event",
-                "-hls_flags", "independent_segments+temp_file",
-                "-hls_segment_type", "mpegts",
-                "-f", "hls",
-                str(playlist),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            hls_dir.rmdir()
-            return False, "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.", None
-        except OSError as exc:
-            logger.exception("Could not start FFmpeg for M3U8 stream: %s", exc)
-            hls_dir.rmdir()
-            return False, "I could not start the M3U8 stream.", None
-
-        ffmpeg_stderr_lines: list[str] = []
-        ffmpeg_stderr_task = asyncio.create_task(
-            _collect_ffmpeg_stderr(process, ffmpeg_stderr_lines)
-        )
-
         active_host = {
             "token": token,
             "movie": output,
             "hls_dir": hls_dir,
-            "ffmpeg_process": process,
-            "ffmpeg_stderr_lines": ffmpeg_stderr_lines,
-            "ffmpeg_stderr_task": ffmpeg_stderr_task,
+            "ffmpeg_process": None,
+            "ffmpeg_stderr_lines": [],
+            "ffmpeg_stderr_task": None,
             "expires_at": float("inf"),
             "task": None,
+            "download_task": None,
             "downloading": True,
         }
 
+        download_task = asyncio.create_task(
+            download_m3u8_segments(url, hls_dir, progress)
+        )
+        active_host["download_task"] = download_task
         active_host["task"] = asyncio.create_task(
-            finish_m3u8_host(token, process, playlist, output)
+            finish_m3u8_host(token, download_task, playlist, output)
         )
 
-    # Do not require a completed VOD playlist. A growing EVENT playlist is
-    # enough as soon as it contains at least one segment.
+    # Wait for the first contiguous segment. Parallel workers can be downloading
+    # later segments already, so playback can begin while the rest downloads.
     for _ in range(300):
         if playlist.exists() and playlist.stat().st_size > 0:
             try:
@@ -1337,24 +1514,24 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
                 logger.info("M3U8 playback ready: %s", token)
                 return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
-        if process.returncode is not None:
-            error_text = "\n".join(ffmpeg_stderr_lines[-50:])
-            logger.error(
-                "FFmpeg exited before M3U8 playback became ready (code %s): %s",
-                process.returncode,
-                error_text[-5000:] or "(no stderr output)",
-            )
-            await clear_hosted_movie(token, reason="FFmpeg exited before playback started")
-            return False, "FFmpeg could not start playback. Check the bot console for the FFmpeg error.", None
+        if download_task.done():
+            try:
+                success, detail = download_task.result()
+            except Exception as exc:
+                success, detail = False, str(exc)
+
+            if not success:
+                logger.warning("Parallel M3U8 downloader failed: %s", detail)
+                await clear_hosted_movie(token, reason="parallel M3U8 downloader failed")
+                return False, "The M3U8 downloader could not start. Check the bot console for details.", None
 
         if _ % 10 == 0:
-            logger.info("Waiting for M3U8 playback data... %.1fs", _ * 0.5)
+            logger.info("Waiting for parallel M3U8 playback data... %.1fs", _ * 0.5)
 
         await asyncio.sleep(0.5)
 
-    logger.error("M3U8 playback did not produce playable HLS data within 150 seconds: %s", url)
     await clear_hosted_movie(token, reason="M3U8 startup timeout")
-    return False, "The M3U8 stream took too long to start. Check the bot console for the FFmpeg error.", None
+    return False, "The M3U8 stream took too long to start. Check the bot console for the downloader error.", None
 
 
 async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: list[str]) -> None:
@@ -1445,39 +1622,32 @@ async def split_movie_into_parts(source: Path, parts_dir: Path) -> tuple[Path, P
 
 async def finish_m3u8_host(
     token: str,
-    process: asyncio.subprocess.Process,
+    download_task: asyncio.Task,
     playlist: Path,
     output: Path,
 ) -> None:
     try:
-        await process.wait()
+        try:
+            success, detail = await download_task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            success, detail = False, str(exc)
 
-        async with host_lock:
-            current = active_host
-            if current is None or current["token"] != token:
-                return
-            stderr_task = current.get("ffmpeg_stderr_task")
-            stderr_lines = current.get("ffmpeg_stderr_lines", [])
-
-        if stderr_task is not None:
-            await stderr_task
-
-        error_text = "\n".join(stderr_lines[-100:])
-        if process.returncode != 0 or not playlist.exists() or playlist.stat().st_size == 0:
-            logger.error(
-                "FFmpeg finished M3U8 download with code %s: %s",
-                process.returncode,
-                error_text[-5000:] or "(no stderr output)",
-            )
+        if not success:
+            logger.error("Parallel M3U8 download failed: %s", detail)
             await clear_hosted_movie(token, reason="M3U8 download failed")
             return
 
-        # Keep the host marked as downloading until the completed MP4 has
-        # actually been written. Otherwise /media/<token> can briefly return
-        # "Movie is not ready yet" during the remux/split phase.
+        if not playlist.exists() or playlist.stat().st_size == 0:
+            await clear_hosted_movie(token, reason="M3U8 playlist missing after download")
+            return
 
-        # Convert the cached HLS segments into the normal local MP4 without
-        # contacting the original M3U8 URL again.
+        # Convert the locally cached segments into one MP4. No second network
+        # download is performed here.
+        if output.exists():
+            output.unlink(missing_ok=True)
+
         remux_temp = output.with_name(f".{output.name}.part")
         try:
             remux = await asyncio.create_subprocess_exec(
@@ -1499,11 +1669,14 @@ async def finish_m3u8_host(
                     remux_stderr.decode("utf-8", errors="replace")[-5000:],
                 )
                 remux_temp.unlink(missing_ok=True)
-            else:
-                remux_temp.replace(output)
+                await clear_hosted_movie(token, reason="M3U8 MP4 remux failed")
+                return
+            remux_temp.replace(output)
         except (FileNotFoundError, OSError) as exc:
             logger.warning("Could not remux completed M3U8 movie: %s", exc)
             remux_temp.unlink(missing_ok=True)
+            await clear_hosted_movie(token, reason="M3U8 MP4 remux failed")
+            return
 
         parts_dir = HLS_CACHE_DIR / token / "parts"
         parts = await split_movie_into_parts(output, parts_dir) if output.exists() else None
@@ -1523,13 +1696,6 @@ async def finish_m3u8_host(
             message_id = current.get("discord_message_id")
             channel_id = current.get("discord_channel_id")
 
-        # Do not let the host expire before Discord gets the direct MP4 URL.
-        # Discord caches previews aggressively, so we delete the temporary player
-        # message and send a fresh message whose URL ends in .mp4.
-        #
-        # If Discord is temporarily unavailable, keep the movie hosted and retry.
-        # The important part is that cleanup NEVER happens before this step has had
-        # a chance to post the direct URL.
         preview_posted = False
         if output.exists():
             retry_deadline = asyncio.get_running_loop().time() + 10 * 60
@@ -1557,7 +1723,7 @@ async def finish_m3u8_host(
                                 )
 
                         await channel.send(
-                            content=f"▶ **Now Playing:** {output.stem}\\n{direct_media_url}",
+                            content=f"▶ **Now Playing:** {output.stem}\n{direct_media_url}",
                             suppress_embeds=False,
                         )
                         preview_posted = True
