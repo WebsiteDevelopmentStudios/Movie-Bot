@@ -402,6 +402,7 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
         ffmpeg_process = current.get("ffmpeg_process")
         stderr_task = current.get("ffmpeg_stderr_task")
         hls_dir = current.get("hls_dir")
+        keep_cache = current.get("persistent_cache", False)
         active_host = None
 
         if task is not None and task is not asyncio.current_task():
@@ -419,7 +420,7 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
             ffmpeg_process.kill()
             await ffmpeg_process.wait()
 
-    if hls_dir is not None:
+    if hls_dir is not None and not keep_cache:
         try:
             for path in hls_dir.rglob("*"):
                 if path.is_file():
@@ -1283,6 +1284,64 @@ def is_m3u8_url(value: str) -> bool:
     return path.endswith(".m3u8") or ".m3u8" in path
 
 
+def m3u8_cache_source_path(hls_dir: Path) -> Path:
+    return hls_dir / ".source-url"
+
+
+def m3u8_cache_complete_path(hls_dir: Path) -> Path:
+    return hls_dir / ".complete"
+
+
+def find_cached_m3u8(url: str) -> Path | None:
+    """Find a fully downloaded HLS cache for the exact source URL."""
+    if not HLS_CACHE_DIR.is_dir():
+        return None
+
+    for candidate in HLS_CACHE_DIR.iterdir():
+        if not candidate.is_dir():
+            continue
+        source_file = m3u8_cache_source_path(candidate)
+        complete_file = m3u8_cache_complete_path(candidate)
+        playlist = candidate / "playlist.m3u8"
+        if not source_file.is_file() or not complete_file.is_file() or not playlist.is_file():
+            continue
+        try:
+            cached_url = source_file.read_text(encoding="utf-8").strip()
+            if cached_url == url.strip() and playlist.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+
+    return None
+
+
+def cache_folder_name(movie_name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "", movie_name).strip(" .")
+    safe_name = safe_name[:100] or "movie"
+    candidate = HLS_CACHE_DIR / safe_name
+    number = 2
+    while candidate.exists():
+        candidate = HLS_CACHE_DIR / f"{safe_name} ({number})"
+        number += 1
+    return candidate.name
+
+
+async def mark_m3u8_cache_complete(
+    hls_dir: Path,
+    source_url: str,
+    movie_name: str,
+) -> Path:
+    """Persist a completed HLS cache under the movie's human-readable name."""
+    m3u8_cache_source_path(hls_dir).write_text(source_url.strip(), encoding="utf-8")
+    m3u8_cache_complete_path(hls_dir).write_text("complete\n", encoding="utf-8")
+
+    target = HLS_CACHE_DIR / cache_folder_name(movie_name)
+    if hls_dir.resolve() != target.resolve():
+        hls_dir.replace(target)
+        return target
+    return hls_dir
+
+
 def safe_download_name(url: str) -> str:
     parsed = urlparse(url)
     raw_name = Path(parsed.path).stem or "movie"
@@ -1657,6 +1716,43 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
     if not PUBLIC_BASE_URL:
         return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot."
 
+    cached_hls_dir = find_cached_m3u8(url)
+    if cached_hls_dir is not None:
+        cached_name = cached_hls_dir.name
+        output = MOVIES_DIR / f"{cached_name}.mp4"
+        logger.info("Reusing completed M3U8 cache: %s", cached_hls_dir)
+        if progress is not None:
+            await progress(f"Using cached movie **{cached_name}**...")
+
+        async with host_lock:
+            if active_host is not None:
+                return False, "Another movie is currently being hosted. Please wait until it finishes.", None
+
+            token = secrets.token_urlsafe(32)
+            active_host = {
+                "token": token,
+                "movie": output,
+                "hls_dir": cached_hls_dir,
+                "ffmpeg_process": None,
+                "ffmpeg_stderr_lines": [],
+                "ffmpeg_stderr_task": None,
+                "expires_at": float("inf"),
+                "task": None,
+                "download_task": None,
+                "downloading": True,
+                "persistent_cache": True,
+            }
+            cached_task = asyncio.create_task(asyncio.sleep(0, result=(True, "cached")))
+            active_host["download_task"] = cached_task
+            playlist = cached_hls_dir / "playlist.m3u8"
+            active_host["task"] = asyncio.create_task(
+                finish_m3u8_host(token, cached_task, playlist, output)
+            )
+
+        if progress is not None:
+            await progress("Embedding cached movie...")
+        return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+
     filename = safe_download_name(url)
     output = MOVIES_DIR / filename
 
@@ -1681,7 +1777,13 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
             "task": None,
             "download_task": None,
             "downloading": True,
+            "persistent_cache": False,
+            "source_m3u8_url": url,
         }
+
+        # Keep the exact source URL beside the generated playlist so a future
+        # /movie play of the same M3U8 can reuse this cache.
+        m3u8_cache_source_path(hls_dir).write_text(url.strip(), encoding="utf-8")
 
         download_task = asyncio.create_task(
             download_m3u8_segments(url, hls_dir, progress)
@@ -1936,7 +2038,29 @@ async def finish_m3u8_host(
             await clear_hosted_movie(token, reason="M3U8 MP4 remux failed")
             return
 
-        parts_dir = HLS_CACHE_DIR / token / "parts"
+        async with host_lock:
+            current = active_host
+            source_url = current.get("source_m3u8_url") if current is not None else None
+            current_hls_dir = current.get("hls_dir") if current is not None else None
+        if source_url and current_hls_dir is not None and not current.get("persistent_cache", False):
+            try:
+                renamed_cache = await mark_m3u8_cache_complete(
+                    current_hls_dir,
+                    source_url,
+                    output.stem,
+                )
+                async with host_lock:
+                    current = active_host
+                    if current is not None and current["token"] == token:
+                        current["hls_dir"] = renamed_cache
+                        current["persistent_cache"] = True
+            except OSError as exc:
+                logger.warning("Could not preserve completed M3U8 cache: %s", exc)
+
+        async with host_lock:
+            current = active_host
+            cache_dir = current.get("hls_dir") if current is not None else None
+        parts_dir = (cache_dir / "parts") if cache_dir is not None else (HLS_CACHE_DIR / token / "parts")
         parts = await split_movie_into_parts(output, parts_dir) if output.exists() else None
 
         async with host_lock:
@@ -2197,18 +2321,3 @@ async def on_app_command_error(
 
 def main() -> None:
     ensure_movies_dir()
-
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    if not token:
-        raise SystemExit(
-            "DISCORD_TOKEN is missing. Create a .env file with DISCORD_TOKEN=your_bot_token_here."
-        )
-
-    try:
-        bot.run(token)
-    except discord.LoginFailure:
-        raise SystemExit("Discord rejected the bot token. Check your DISCORD_TOKEN.") from None
-
-
-if __name__ == "__main__":
-    main()
