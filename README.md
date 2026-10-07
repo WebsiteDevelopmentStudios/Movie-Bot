@@ -19,6 +19,9 @@ The bot can send manually stored movies and can download a user-provided HTTP/HT
 - Expiring web video/audio player for large files
 - Only one movie is hosted at a time; the player expires automatically when the movie ends
 - Graceful Discord upload and permission errors
+- Voice music playback with /play, /skip, /queue, /join, /leave, and /volume
+- Spotify track-link resolution and song search through yt-dlp
+- Synchronized lyrics lookup with one lyric line sent at a time in supported voice-channel chat
 
 ## Requirements
 
@@ -26,6 +29,9 @@ The bot can send manually stored movies and can download a user-provided HTTP/HT
 - A Discord bot application/token
 - The bot must be able to view and send messages in the configured movie channel
 - The bot needs Send Messages and Attach Files permissions in that channel
+- FFmpeg installed and available in PATH for voice playback
+- PyNaCl for Discord voice support
+- yt-dlp for music source lookup and audio extraction
 
 ## Installation
 
@@ -61,6 +67,27 @@ Never commit .env or your bot token to GitHub.
 From the repository directory:
 
     python main.py
+
+## Voice music
+
+The bot also includes a voice music player. The available commands are:
+
+    /join
+    /play <song>
+    /queue
+    /skip
+    /volume <level>
+    /leave
+
+Run /join while you are in a voice channel, or use /play while you are already in one. /play accepts a Spotify track URL such as https://open.spotify.com/track/... as well as a normal song search.
+
+Spotify does not provide Discord bots with a direct playable audio stream. For Spotify links, the bot reads the track metadata from Spotify and resolves a playable audio source separately with yt-dlp. It does not log into a user's Spotify account or request their Spotify password.
+
+When synced lyrics are available, the bot follows their timestamps and sends one lyric line at a time to the voice channel's chat when the installed discord.py version exposes voice-channel chat messaging. If Discord.py cannot send messages to that voice-channel chat, music playback continues normally.
+
+The queue command shows the current track and queued tracks. /skip advances to the next track. /volume accepts 0-100 and changes the current player volume. /leave stops playback, clears the queue, and disconnects the bot.
+
+Music audio is cached locally in .music_cache/ while the bot is running. The cache is ignored by Git.
 
 The bot syncs its slash commands when it starts. It also starts a Cloudflare Quick Tunnel automatically so the movie web player can be reached from the internet without owning a domain or configuring DNS.
 
