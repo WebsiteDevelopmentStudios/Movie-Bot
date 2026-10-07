@@ -84,7 +84,9 @@ async def discord_interaction(request: web.Request) -> web.Response:
 
     try:
         interaction = BridgedInteraction(data=payload, state=movie_bot.bot._connection)
-        await movie_bot.bot.tree._from_interaction(interaction)
+        result = movie_bot.bot.tree._from_interaction(interaction)
+        if result is not None:
+            await result
     except Exception:
         movie_bot.logger.exception("Failed to dispatch bridged Discord interaction")
         return web.json_response({"error": "interaction dispatch failed"}, status=500)
