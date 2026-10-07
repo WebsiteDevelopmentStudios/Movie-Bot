@@ -996,7 +996,8 @@ async def stop_cloudflare_quick_tunnel() -> None:
     if process is not None and process.returncode is None:
         process.terminate()
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)        except asyncio.TimeoutError:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
             process.kill()
             await process.wait()
 
