@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 from html import escape
@@ -1128,6 +1129,520 @@ class MovieBot(discord.Client):
 
 
 bot = MovieBot()
+
+
+# -------------------------
+# Voice / music playback
+# -------------------------
+
+MUSIC_CACHE_DIR = BASE_DIR / ".music_cache"
+SPOTIFY_OEMBED_URL = "https://open.spotify.com/oembed"
+LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
+
+music_states: dict[int, dict] = {}
+
+
+def get_music_state(guild_id: int) -> dict:
+    state = music_states.get(guild_id)
+    if state is None:
+        state = {
+            "queue": [],
+            "voice": None,
+            "current": None,
+            "volume": 1.0,
+            "play_task": None,
+            "lyrics_task": None,
+        }
+        music_states[guild_id] = state
+    return state
+
+
+def spotify_track_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc.lower() in {"open.spotify.com", "spotify.link"}
+        and "/track/" in parsed.path.lower()
+    )
+
+
+async def fetch_json(session, url: str, **kwargs):
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), **kwargs) as response:
+            if response.status != 200:
+                return None
+            return await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return None
+
+
+async def resolve_spotify_track(value: str) -> dict | None:
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(session, SPOTIFY_OEMBED_URL, params={"url": value.strip()})
+
+    if not isinstance(data, dict):
+        return None
+
+    title = str(data.get("title", "")).strip()
+    artist = str(data.get("author_name", "")).strip()
+    if not title:
+        return None
+
+    return {
+        "title": title,
+        "artist": artist or "Unknown Artist",
+        "search": f"{artist} - {title}".strip(" -"),
+        "spotify_url": value.strip(),
+    }
+
+
+async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
+    executable = shutil.which("yt-dlp")
+    if executable is None:
+        raise FileNotFoundError("yt-dlp")
+
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        raise
+
+    return process.returncode, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+
+
+async def resolve_music_source(query: str) -> dict | None:
+    spotify_info = await resolve_spotify_track(query) if spotify_track_url(query) else None
+    search_query = spotify_info["search"] if spotify_info else query.strip()
+    if not search_query:
+        return None
+
+    code, stdout, stderr = await run_yt_dlp([
+        "--dump-single-json",
+        "--no-playlist",
+        "--skip-download",
+        "--default-search", "ytsearch1",
+        search_query,
+    ], timeout=60)
+
+    if code != 0:
+        logger.warning("yt-dlp search failed: %s", stderr[-2000:])
+        return None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    entries = data.get("entries")
+    if isinstance(entries, list) and entries:
+        data = entries[0]
+
+    webpage_url = str(data.get("webpage_url") or data.get("original_url") or "").strip()
+    title = str(data.get("title") or (spotify_info or {}).get("title") or "").strip()
+    artist = str(
+        (spotify_info or {}).get("artist")
+        or data.get("artist")
+        or data.get("uploader")
+        or "Unknown Artist"
+    ).strip()
+
+    if not webpage_url or not title:
+        return None
+
+    return {
+        "title": title,
+        "artist": artist,
+        "url": webpage_url,
+        "duration": data.get("duration"),
+        "spotify_url": (spotify_info or {}).get("spotify_url"),
+    }
+
+
+async def download_music_audio(track: dict) -> Path | None:
+    MUSIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(12)
+    output_template = MUSIC_CACHE_DIR / f"{token}.%(ext)s"
+
+    code, _, stderr = await run_yt_dlp([
+        "--no-playlist",
+        "--format", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--output", str(output_template),
+        "--no-part",
+        track["url"],
+    ], timeout=15 * 60)
+
+    if code != 0:
+        logger.warning("yt-dlp audio download failed: %s", stderr[-3000:])
+        return None
+
+    candidates = sorted(MUSIC_CACHE_DIR.glob(f"{token}.*"))
+    return next(
+        (
+            path for path in candidates
+            if path.is_file() and path.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".wav"}
+        ),
+        None,
+    )
+
+
+async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
+    artist = track.get("artist", "")
+    title = track.get("title", "")
+    if not title:
+        return []
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(
+            session,
+            LRCLIB_SEARCH_URL,
+            params={"q": f"{artist} {title}"},
+        )
+
+    if not isinstance(data, list):
+        return []
+
+    best = next(
+        (
+            item for item in data
+            if isinstance(item, dict) and str(item.get("syncedLyrics") or "").strip()
+        ),
+        None,
+    )
+    if best is None:
+        return []
+
+    timestamp_re = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+    lyrics: list[tuple[float, str]] = []
+
+    for raw_line in str(best.get("syncedLyrics") or "").splitlines():
+        matches = list(timestamp_re.finditer(raw_line))
+        text = timestamp_re.sub("", raw_line).strip()
+        if not text:
+            continue
+        for match in matches:
+            try:
+                timestamp = int(match.group(1)) * 60 + float(match.group(2))
+                lyrics.append((timestamp, text))
+            except ValueError:
+                continue
+
+    lyrics.sort(key=lambda item: item[0])
+    return lyrics
+
+
+async def send_voice_chat_message(voice_channel: discord.VoiceChannel, content: str):
+    sender = getattr(voice_channel, "send", None)
+    if callable(sender):
+        try:
+            return await sender(content)
+        except (discord.Forbidden, discord.HTTPException):
+            return None
+    return None
+
+
+async def lyrics_loop(guild_id: int, voice_channel: discord.VoiceChannel, track: dict, started_at: float) -> None:
+    lyrics = await fetch_lyrics(track)
+    if not lyrics:
+        return
+
+    state = get_music_state(guild_id)
+    for timestamp, line in lyrics:
+        delay = max(0.0, started_at + timestamp - asyncio.get_running_loop().time())
+        if delay:
+            await asyncio.sleep(delay)
+
+        current = music_states.get(guild_id)
+        if current is not state or current.get("current") is not track:
+            return
+
+        await send_voice_chat_message(voice_channel, f"**{line}**")
+
+
+async def connect_member_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
+    if interaction.guild is None:
+        return None
+
+    member = interaction.user
+    if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel is None:
+        return None
+
+    voice_channel = member.voice.channel
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+
+    if voice is not None and voice.is_connected():
+        if voice.channel.id != voice_channel.id:
+            await voice.move_to(voice_channel)
+        return voice
+
+    try:
+        voice = await voice_channel.connect()
+    except (discord.ClientException, discord.Forbidden, discord.HTTPException):
+        return None
+
+    state["voice"] = voice
+    return voice
+
+
+async def start_track(guild_id: int) -> None:
+    state = get_music_state(guild_id)
+
+    while state["queue"]:
+        voice = state.get("voice")
+        if voice is None or not voice.is_connected():
+            state["current"] = None
+            return
+
+        track = state["queue"].pop(0)
+        state["current"] = track
+        source_path = track.get("path")
+
+        if source_path is None or not source_path.exists():
+            state["current"] = None
+            continue
+
+        try:
+            source = discord.FFmpegPCMAudio(
+                str(source_path),
+                before_options="-nostdin",
+                options="-vn",
+            )
+            source = discord.PCMVolumeTransformer(source, volume=float(state["volume"]))
+        except (discord.ClientException, OSError) as exc:
+            logger.warning("Could not create audio source: %s", exc)
+            state["current"] = None
+            continue
+
+        finished = asyncio.Event()
+
+        def after_play(error):
+            if error:
+                logger.warning("Voice playback error: %s", error)
+            loop = getattr(bot, "loop", None)
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(finished.set)
+
+        voice.play(source, after=after_play)
+        started_at = asyncio.get_running_loop().time()
+        lyrics_task = asyncio.create_task(lyrics_loop(guild_id, voice.channel, track, started_at))
+        state["lyrics_task"] = lyrics_task
+
+        try:
+            await finished.wait()
+        finally:
+            if state.get("lyrics_task") is lyrics_task:
+                lyrics_task.cancel()
+                try:
+                    await lyrics_task
+                except asyncio.CancelledError:
+                    pass
+                state["lyrics_task"] = None
+
+        state["current"] = None
+
+    state["current"] = None
+
+
+async def ensure_music_player(guild_id: int) -> None:
+    state = get_music_state(guild_id)
+    task = state.get("play_task")
+    if task is None or task.done():
+        state["play_task"] = asyncio.create_task(start_track(guild_id))
+
+
+async def cleanup_music_state(guild_id: int) -> None:
+    state = music_states.get(guild_id)
+    if state is None:
+        return
+
+    lyrics_task = state.get("lyrics_task")
+    if lyrics_task is not None:
+        lyrics_task.cancel()
+
+    play_task = state.get("play_task")
+    if play_task is not None and play_task is not asyncio.current_task():
+        play_task.cancel()
+
+    voice = state.get("voice")
+    if voice is not None and voice.is_connected():
+        try:
+            await voice.disconnect()
+        except (discord.ClientException, discord.HTTPException):
+            pass
+
+    state["voice"] = None
+    state["current"] = None
+    state["queue"].clear()
+    state["play_task"] = None
+    state["lyrics_task"] = None
+
+
+@bot.tree.command(name="join", description="Join your current voice channel.")
+async def voice_join(interaction: discord.Interaction) -> None:
+    voice = await connect_member_voice(interaction)
+    if voice is None:
+        await interaction.response.send_message("Join a voice channel first, then use /join.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Joined **{voice.channel.name}**.", ephemeral=True)
+
+
+@bot.tree.command(name="leave", description="Leave the voice channel and clear the music queue.")
+async def voice_leave(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_connected():
+        await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
+        return
+
+    await cleanup_music_state(interaction.guild.id)
+    await interaction.response.send_message("Left the voice channel and cleared the queue.", ephemeral=True)
+
+
+@bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
+@app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
+async def music_play(interaction: discord.Interaction, song: str) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    voice = await connect_member_voice(interaction)
+    if voice is None:
+        await interaction.response.send_message("Join a voice channel first. I can then play the song there.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        track = await resolve_music_source(song)
+        if track is None:
+            await interaction.followup.send(
+                "I could not find that song. Spotify track links and normal song searches are supported.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.edit_original_response(content=f"Downloading **{track['title']}**...")
+        path = await download_music_audio(track)
+        if path is None:
+            await interaction.followup.send(
+                "I found the song, but could not download an audio source for playback.",
+                ephemeral=True,
+            )
+            return
+
+        track["path"] = path
+        state = get_music_state(interaction.guild.id)
+        was_playing = state.get("current") is not None
+        state["queue"].append(track)
+        position = len(state["queue"])
+
+        await ensure_music_player(interaction.guild.id)
+
+        if was_playing:
+            message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
+        else:
+            message = f"Playing **{track['title']}** by **{track['artist']}**."
+
+        await interaction.followup.send(message, ephemeral=True)
+    except FileNotFoundError:
+        await interaction.followup.send("yt-dlp is not installed. Install the requirements and restart the bot.", ephemeral=True)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("The song download took too long and was cancelled.", ephemeral=True)
+    except Exception as exc:
+        logger.exception("Music play failed: %s", exc)
+        await interaction.followup.send("Something went wrong while preparing that song.", ephemeral=True)
+
+
+@bot.tree.command(name="skip", description="Skip the currently playing song.")
+async def music_skip(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_playing():
+        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        return
+
+    voice.stop()
+    await interaction.response.send_message("Skipped the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="queue", description="Show the current music queue.")
+async def music_queue(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    current = state.get("current")
+    queue = state.get("queue", [])
+    lines = []
+
+    if current is not None:
+        lines.append(f"**Now playing:** {current['title']} — {current['artist']}")
+    if queue:
+        lines.append("")
+        lines.extend(
+            f"**{index}.** {track['title']} — {track['artist']}"
+            for index, track in enumerate(queue, 1)
+        )
+    if not lines:
+        lines = ["The music queue is empty."]
+
+    await interaction.response.send_message("\n".join(lines[:51]), ephemeral=True)
+
+
+@bot.tree.command(name="volume", description="Set the music volume.")
+@app_commands.describe(level="Volume from 0 to 100.")
+async def music_volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    state["volume"] = int(level) / 100
+
+    voice = state.get("voice")
+    if voice is not None and isinstance(voice.source, discord.PCMVolumeTransformer):
+        voice.source.volume = state["volume"]
+
+    await interaction.response.send_message(f"Volume set to **{level}%**.", ephemeral=True)
+
+
+@bot.tree.command(name="stop", description="Stop music and clear the queue.")
+async def music_stop(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    state["queue"].clear()
+    voice = state.get("voice")
+    if voice is not None and voice.is_playing():
+        voice.stop()
+    await interaction.response.send_message("Stopped playback and cleared the queue.", ephemeral=True)
 
 channel_group = app_commands.Group(
     name="channel",
