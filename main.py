@@ -1155,6 +1155,7 @@ def get_music_state(guild_id: int) -> dict:
             "volume": 1.0,
             "play_task": None,
             "lyrics_task": None,
+            "lyrics_enabled": True,
         }
         music_states[guild_id] = state
     return state
@@ -1438,22 +1439,26 @@ async def send_voice_chat_message(voice_channel: discord.VoiceChannel, content: 
         return None
 
 
-async def lyrics_loop(guild_id: int, voice_channel: discord.VoiceChannel, track: dict, started_at: float) -> None:
-    lyrics = await fetch_lyrics(track)
-    if not lyrics:
-        return
-
-    state = get_music_state(guild_id)
+async def lyrics_loop(guild_id: int, voice_channel: discord.VoiceChannel, track: dict, started_at: float, lyrics: list[tuple[float, str]]) -> None:
+    loop = asyncio.get_running_loop()
     for timestamp, line in lyrics:
-        delay = max(0.0, started_at + timestamp - asyncio.get_running_loop().time())
-        if delay:
-            await asyncio.sleep(delay)
+        wait_for = started_at + timestamp - loop.time()
+        if wait_for > 0:
+            try:
+                await asyncio.sleep(wait_for)
+            except asyncio.CancelledError:
+                raise
 
         current = music_states.get(guild_id)
-        if current is not state or current.get("current") is not track:
+        if current is None or current.get("current") is not track:
             return
+        if not current.get("lyrics_enabled", True):
+            continue
 
-        await send_voice_chat_message(voice_channel, f"**{line}**")
+        try:
+            await send_voice_chat_message(voice_channel, f"**{line}**")
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+            return
 
 
 async def connect_member_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
@@ -1529,12 +1534,14 @@ async def start_track(guild_id: int) -> None:
                 loop.call_soon_threadsafe(finished.set)
 
         voice.play(source, after=after_play)
-        # A tiny scheduling allowance compensates for the voice client's initial
-        # audio buffering without noticeably advancing the lyrics.
+        # Start the lyric clock at playback start. Lyrics were fetched before
+        # voice.play(), so network latency cannot delay the first line.
         started_at = asyncio.get_running_loop().time() - 0.15
         lyrics_task = (
-            asyncio.create_task(lyrics_loop(guild_id, voice.channel, track, started_at))
-            if lyrics else None
+            asyncio.create_task(
+                lyrics_loop(guild_id, voice.channel, track, started_at, lyrics)
+            )
+            if lyrics and state.get("lyrics_enabled", True) else None
         )
         state["lyrics_task"] = lyrics_task
 
@@ -1666,6 +1673,48 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
     except Exception as exc:
         logger.exception("Music play failed: %s", exc)
         await interaction.followup.send("Something went wrong while preparing that song.", ephemeral=True)
+
+
+@bot.tree.command(name="pause", description="Pause the current song.")
+async def music_pause(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_playing():
+        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        return
+    voice.pause()
+    await interaction.response.send_message("Paused the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="resume", description="Resume the paused song.")
+async def music_resume(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    voice = state.get("voice")
+    if voice is None or not voice.is_paused():
+        await interaction.response.send_message("The song is not paused.", ephemeral=True)
+        return
+    voice.resume()
+    await interaction.response.send_message("Resumed the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="lyrics", description="Toggle synchronized lyrics on or off.")
+@app_commands.describe(enabled="Turn synchronized lyrics on or off. Leave empty to toggle.")
+async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = None) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    if enabled is None:
+        enabled = not state.get("lyrics_enabled", True)
+    state["lyrics_enabled"] = bool(enabled)
+    status = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(f"Synchronized lyrics are now **{status}**.", ephemeral=True)
 
 
 @bot.tree.command(name="skip", description="Skip the currently playing song.")
