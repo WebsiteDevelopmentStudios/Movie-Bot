@@ -1522,13 +1522,72 @@ async def download_m3u8_segments(
             await asyncio.gather(*(worker(index) for index in range(len(segments))))
             await write_playlist(final=True)
         except Exception as exc:
-            return False, str(exc)
+            logger.warning(
+                "Parallel M3U8 download failed: %s; falling back to FFmpeg.",
+                exc,
+            )
+            return await download_m3u8_with_ffmpeg(
+                url,
+                hls_dir,
+                media_url,
+                progress,
+            )
 
     logger.info(
         "Parallel M3U8 download completed: %d segments.",
         len(segments),
     )
     return True, media_url
+
+
+async def download_m3u8_with_ffmpeg(
+    url: str,
+    hls_dir: Path,
+    media_url: str | None = None,
+    progress=None,
+) -> tuple[bool, str]:
+    """Fallback HLS downloader for CDNs that reject individual aiohttp requests."""
+    hls_dir.mkdir(parents=True, exist_ok=True)
+    playlist = hls_dir / "playlist.m3u8"
+    origin_url = media_url or url
+    parsed = urlparse(origin_url)
+    headers = (
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36\\r\\n"
+        f"Referer: {origin_url}\\r\\n"
+        f"Origin: {parsed.scheme}://{parsed.netloc}\\r\\n"
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-headers", headers,
+        "-i", url,
+        "-c", "copy",
+        "-f", "hls",
+        "-hls_time", "6",
+        "-hls_playlist_type", "event",
+        "-hls_segment_filename", str(hls_dir / "segment-%06d.ts"),
+        str(playlist),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    if progress is not None:
+        await progress("Downloading movie... switching to FFmpeg CDN fallback.")
+
+    try:
+        _, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+
+    if process.returncode != 0 or not playlist.is_file():
+        error = stderr.decode("utf-8", errors="replace").strip()
+        return False, error[-500:] or "FFmpeg HLS download failed."
+
+    return True, origin_url
 
 
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
