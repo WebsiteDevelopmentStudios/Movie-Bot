@@ -699,19 +699,6 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} - Movie Bot</title>
-<meta property="og:title" content="Watch {title}">
-<meta property="og:description" content="Watch {title} directly in your browser.">
-<meta property="og:type" content="video.other">
-<meta property="og:url" content="{PUBLIC_BASE_URL}/movie/{token}">
-<meta property="og:video" content="{PUBLIC_BASE_URL}/media/{token}">
-<meta property="og:video:secure_url" content="{PUBLIC_BASE_URL}/media/{token}">
-<meta property="og:video:type" content="video/mp4">
-<meta property="og:video:url" content="{PUBLIC_BASE_URL}/media/{token}">
-<meta property="og:video:duration" content="0">
-<meta property="og:video:width" content="1280">
-<meta property="og:video:height" content="720">
-<meta name="twitter:card" content="player">
-<meta name="twitter:title" content="Watch {title}">
 <style>
 body {{
     margin: 0;
@@ -721,23 +708,43 @@ body {{
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }}
 main {{
-    width: min(1200px, calc(100% - 32px));
+    width: min(1100px, calc(100% - 24px));
     margin: 0 auto;
-    padding: 28px 0;
+    padding: 16px 0 24px;
 }}
 h1 {{
-    margin: 0 0 18px;
-    font-size: clamp(24px, 4vw, 38px);
+    margin: 0 0 12px;
+    font-size: clamp(20px, 3vw, 30px);
 }}
 .player {{
     background: #000;
     border-radius: 14px;
     overflow: hidden;
-    box-shadow: 0 18px 50px rgba(0,0,0,.35);
+}}
+.actions {{
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}}
+.button {{
+    display: inline-block;
+    padding: 9px 14px;
+    border-radius: 6px;
+    background: #5865f2;
+    color: #fff;
+    text-decoration: none;
+    border: 0;
+    font: inherit;
+    cursor: pointer;
+}}
+.button:disabled {{
+    opacity: .5;
+    cursor: not-allowed;
 }}
 #status {{
-    margin-top: 14px;
+    margin-top: 9px;
     color: #aaa;
+    font-size: 14px;
 }}
 </style>
 </head>
@@ -745,8 +752,38 @@ h1 {{
 <main>
 <h1>{title}</h1>
 <div class="player">{player}</div>
+<div class="actions">
+    <button id="download" class="button" disabled>Download Movie</button>
+</div>
 <div id="status">Loading movie stream...</div>
 </main>
+<script>
+const downloadButton = document.getElementById("download");
+const downloadUrl = "/media/{token}?download=1";
+
+async function updateDownloadButton() {{
+    try {{
+        const response = await fetch("/status/{token}", {{cache: "no-store"}});
+        if (!response.ok) throw new Error("status unavailable");
+        const data = await response.json();
+
+        if (data.ready) {{
+            downloadButton.disabled = false;
+            downloadButton.onclick = () => {{
+                window.location.href = downloadUrl;
+            }};
+            return;
+        }}
+
+        downloadButton.disabled = true;
+    }} catch (error) {{
+        downloadButton.disabled = true;
+    }}
+}}
+
+updateDownloadButton();
+setInterval(updateDownloadButton, 5000);
+</script>
 </body>
 </html>"""
     return web.Response(
@@ -783,15 +820,36 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
 
     # aiohttp's FileResponse handles byte ranges, which Discord and browsers
     # need when probing/streaming large MP4 files.
+    wants_download = request.query.get("download") == "1"
     return web.FileResponse(
         path=resolved,
         headers={
             "Content-Type": "video/mp4",
-            "Content-Disposition": f'inline; filename="{escape(movie.name)}"',
+            "Content-Disposition": (
+                f'attachment; filename="{escape(movie.name)}"'
+                if wants_download
+                else f'inline; filename="{escape(movie.name)}"'
+            ),
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Accept-Ranges": "bytes",
         },
     )
+
+async def hosted_status_handler(request: web.Request) -> web.StreamResponse:
+    token = request.match_info.get("token", "")
+    async with host_lock:
+        current = active_host
+        if current is None or not secrets.compare_digest(current["token"], token):
+            return web.json_response({"ready": False}, status=404)
+
+        movie = current["movie"]
+        ready = (
+            not current.get("downloading", False)
+            and movie.suffix.lower() == ".mp4"
+            and movie.is_file()
+        )
+
+    return web.json_response({"ready": ready})
 
 async def hosted_part_handler(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token", "")
@@ -1050,6 +1108,7 @@ async def hosted_cdn_handler(request: web.Request) -> web.StreamResponse:
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
+    app.router.add_get("/status/{token}", hosted_status_handler)
     app.router.add_get("/media/{token}", hosted_media_handler)
     app.router.add_get("/cdn/{token}.mp4", hosted_cdn_handler)
     app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
