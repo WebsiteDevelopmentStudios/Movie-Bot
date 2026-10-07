@@ -2119,9 +2119,25 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
             )
             return
 
-        await interaction.edit_original_response(
-            content=f"Queueing **{track['title']}** for direct playback..."
-        )
+        # Use the already-deferred interaction only for a quick status
+        # update. If Discord invalidates the interaction webhook, do not let
+        # that turn a successfully resolved song into a command error.
+        try:
+            await interaction.edit_original_response(
+                content=f"Queueing **{track['title']}** for direct playback..."
+            )
+        except discord.NotFound as exc:
+            logger.warning(
+                "Could not update /play interaction after resolving %s: %r",
+                track.get("title", "unknown"),
+                exc,
+            )
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Could not update /play interaction after resolving %s: %s",
+                track.get("title", "unknown"),
+                exc,
+            )
 
         # Do not resolve an expiring media URL while the song is waiting in
         # the queue. Resolve it immediately before playback instead, just as
@@ -2140,10 +2156,26 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
 
         if was_playing:
             message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
+
         else:
             message = f"Playing **{track['title']}** by **{track['artist']}**."
 
-        await interaction.followup.send(message, ephemeral=True)
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+        except discord.NotFound as exc:
+            # The music task should continue even if Discord has already
+            # invalidated the interaction webhook.
+            logger.warning(
+                "Could not send /play confirmation for %s: %r",
+                track.get("title", "unknown"),
+                exc,
+            )
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Could not send /play confirmation for %s: %s",
+                track.get("title", "unknown"),
+                exc,
+            )
     except FileNotFoundError:
         await interaction.followup.send("yt-dlp is not installed. Install the requirements and restart the bot.", ephemeral=True)
     except asyncio.TimeoutError:
