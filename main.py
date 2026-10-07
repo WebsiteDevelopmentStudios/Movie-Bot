@@ -1237,6 +1237,7 @@ async def resolve_music_source(query: str) -> dict | None:
         "--flat-playlist",
         "--skip-download",
         "--default-search", "ytsearch5",
+        "--remote-components", "ejs:github",
         search_query,
     ], timeout=60)
 
@@ -1324,8 +1325,9 @@ async def download_music_audio(track: dict) -> Path | None:
         "--output", str(output_template),
         "--no-part",
         "--retries", "3",
-        "--fragment-retries", "3",
-        "--extractor-args", "youtube:player_client=android,web",
+        "--fragment-retries", "5",
+        "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=web",
         track["url"],
     ], timeout=15 * 60)
 
