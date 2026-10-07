@@ -14,6 +14,7 @@ import discord
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
+from discord.http import handle_message_parameters
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1348,13 +1349,17 @@ async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
 
 
 async def send_voice_chat_message(voice_channel: discord.VoiceChannel, content: str):
-    sender = getattr(voice_channel, "send", None)
-    if callable(sender):
-        try:
-            return await sender(content)
-        except (discord.Forbidden, discord.HTTPException):
-            return None
-    return None
+    # discord.py does not currently expose VoiceChannel.send() consistently,
+    # but Discord's message API supports messages in voice channels. Use the
+    # same message-parameter builder as discord.py's Messageable implementation.
+    try:
+        with handle_message_parameters(
+            content=content,
+            allowed_mentions=discord.AllowedMentions.none(),
+        ) as params:
+            return await bot.http.send_message(voice_channel.id, params=params)
+    except (discord.Forbidden, discord.HTTPException, TypeError, ValueError):
+        return None
 
 
 async def lyrics_loop(guild_id: int, voice_channel: discord.VoiceChannel, track: dict, started_at: float) -> None:
