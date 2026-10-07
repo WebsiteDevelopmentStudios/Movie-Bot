@@ -1230,13 +1230,13 @@ async def resolve_music_source(query: str) -> dict | None:
     if not search_query:
         return None
 
-    # Search several candidates. The first YouTube result is not always
-    # playable, while a nearby official/Topic upload often is.
+    # Search several candidates so one unavailable/restricted YouTube upload
+    # does not make the entire song fail.
     code, stdout, stderr = await run_yt_dlp([
         "--dump-single-json",
         "--flat-playlist",
         "--skip-download",
-        "--default-search", "ytsearch5",
+        "--default-search", "ytsearch8",
         "--remote-components", "ejs:github",
         search_query,
     ], timeout=60)
@@ -1260,24 +1260,42 @@ async def resolve_music_source(query: str) -> dict | None:
     requested_title = str((spotify_info or {}).get("title") or "").casefold()
     requested_artist = str((spotify_info or {}).get("artist") or "").casefold()
 
+    def normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    title_key = normalize(requested_title)
+    artist_key = normalize(requested_artist)
+
     def score(entry: dict) -> int:
-        title = str(entry.get("title") or "").casefold()
-        uploader = str(entry.get("uploader") or entry.get("channel") or "").casefold()
+        title = str(entry.get("title") or "")
+        title_key_actual = normalize(title)
+        uploader = str(entry.get("uploader") or entry.get("channel") or "")
+        uploader_key = normalize(uploader)
         value = 0
-        if requested_title and requested_title in title:
-            value += 10
-        if requested_artist and requested_artist in title:
+
+        if title_key and title_key == title_key_actual:
+            value += 30
+        elif title_key and title_key in title_key_actual:
+            value += 15
+
+        if artist_key and artist_key in title_key_actual:
+            value += 15
+        if artist_key and artist_key in uploader_key:
             value += 8
-        if requested_artist and requested_artist in uploader:
-            value += 5
-        if any(word in title for word in ("official", "topic", "audio")):
+
+        if any(word in title.casefold() for word in ("official audio", "official", "topic", "audio")):
+            value += 4
+        if any(word in title.casefold() for word in ("live", "remix", "cover", "8d", "nightcore", "slowed", "sped up")):
+            value -= 8
+        if entry.get("duration") is not None:
             value += 2
-        if any(word in title for word in ("live", "remix", "cover", "8d")):
-            value -= 3
         return value
 
     entries = [entry for entry in entries if isinstance(entry, dict)]
     entries.sort(key=score, reverse=True)
+
+    candidates = []
+    seen_urls = set()
 
     for entry in entries:
         webpage_url = str(
@@ -1286,8 +1304,9 @@ async def resolve_music_source(query: str) -> dict | None:
             or entry.get("original_url")
             or ""
         ).strip()
-        if not webpage_url:
+        if not webpage_url or webpage_url in seen_urls:
             continue
+        seen_urls.add(webpage_url)
 
         title = str(entry.get("title") or (spotify_info or {}).get("title") or "").strip()
         artist = str(
@@ -1300,51 +1319,91 @@ async def resolve_music_source(query: str) -> dict | None:
         if not title:
             continue
 
-        return {
+        candidates.append({
             "title": title,
             "artist": artist,
             "url": webpage_url,
             "duration": entry.get("duration"),
             "spotify_url": (spotify_info or {}).get("spotify_url"),
-        }
+        })
 
-    return None
+    if not candidates:
+        return None
+
+    # Keep the best candidate as the main track, but retain alternatives for
+    # the downloader to try if YouTube rejects a particular upload.
+    primary = candidates[0]
+    primary["alternatives"] = candidates[1:8]
+    return primary
 
 
 async def download_music_audio(track: dict) -> Path | None:
     MUSIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_hex(12)
-    output_template = MUSIC_CACHE_DIR / f"{token}.%(ext)s"
 
-    # Keep the source audio in its native format. This avoids an extra
-    # post-processing conversion step that can make otherwise playable songs
-    # fail. FFmpeg can decode m4a/webm/opus/wav directly.
-    code, _, stderr = await run_yt_dlp([
-        "--no-playlist",
-        "--format", "bestaudio[ext=m4a]/bestaudio/best",
-        "--output", str(output_template),
-        "--no-part",
-        "--retries", "3",
-        "--fragment-retries", "5",
-        "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=web",
-        track["url"],
-    ], timeout=15 * 60)
+    candidates = [track] + [
+        candidate for candidate in track.get("alternatives", [])
+        if isinstance(candidate, dict)
+    ]
 
-    if code != 0:
-        logger.warning("yt-dlp audio download failed: %s", stderr[-3000:])
-        return None
+    for attempt, candidate in enumerate(candidates, start=1):
+        token = secrets.token_hex(12)
+        output_template = MUSIC_CACHE_DIR / f"{token}.%(ext)s"
 
-    candidates = sorted(MUSIC_CACHE_DIR.glob(f"{token}.*"))
-    return next(
-        (
-            path for path in candidates
-            if path.is_file() and path.suffix.lower() in {
-                ".mp3", ".m4a", ".webm", ".opus", ".wav", ".aac", ".flac"
-            }
-        ),
-        None,
-    )
+        # Try the preferred native audio format first. If a YouTube client
+        # rejects that format, retry with any playable audio format before
+        # moving on to the next search result.
+        format_options = [
+            "bestaudio[ext=m4a]/bestaudio/best",
+            "bestaudio/best",
+        ]
+
+        for format_selector in format_options:
+            code, _, stderr = await run_yt_dlp([
+                "--no-playlist",
+                "--format", format_selector,
+                "--output", str(output_template),
+                "--no-part",
+                "--retries", "5",
+                "--fragment-retries", "10",
+                "--retry-sleep", "1",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player_client=web",
+                "--no-check-certificates",
+                candidate["url"],
+            ], timeout=15 * 60)
+
+            if code == 0:
+                files = [
+                    path for path in MUSIC_CACHE_DIR.glob(f"{token}.*")
+                    if path.is_file() and path.suffix.lower() in {
+                        ".mp3", ".m4a", ".webm", ".opus", ".wav",
+                        ".aac", ".flac",
+                    }
+                ]
+                if files:
+                    if attempt > 1:
+                        logger.info(
+                            "Primary YouTube source failed; using fallback %s: %s",
+                            attempt,
+                            candidate.get("title", "unknown"),
+                        )
+                    return files[0]
+
+            logger.warning(
+                "yt-dlp audio attempt %d failed for %s: %s",
+                attempt,
+                candidate.get("title", "unknown"),
+                stderr[-1500:],
+            )
+
+        # Do not leave failed partial files in the cache.
+        for leftover in MUSIC_CACHE_DIR.glob(f"{token}.*"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+
+    return None
 
 
 async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
