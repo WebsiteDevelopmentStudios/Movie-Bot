@@ -396,6 +396,7 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
         ffmpeg_process = current.get("ffmpeg_process")
         stderr_task = current.get("ffmpeg_stderr_task")
         progress_task = current.get("progress_task")
+        expiry_task = current.get("expiry_task")
         hls_dir = current.get("hls_dir")
         active_host = None
 
@@ -405,6 +406,8 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
             stderr_task.cancel()
         if progress_task is not None and progress_task is not asyncio.current_task():
             progress_task.cancel()
+        if expiry_task is not None and expiry_task is not asyncio.current_task():
+            expiry_task.cancel()
 
     if ffmpeg_process is not None and ffmpeg_process.returncode is None:
         ffmpeg_process.terminate()
@@ -1529,10 +1532,17 @@ async def finish_m3u8_host(
             current = active_host
             if current is None or current["token"] != token:
                 return
-            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
+            duration = float(current.get("duration", 0) or 0)
+            current["expires_at"] = (
+                asyncio.get_running_loop().time()
+                + duration
+                + HOST_EXPIRY_BUFFER_SECONDS
+            )
+            current["expiry_task"] = asyncio.create_task(
+                expire_hosted_movie(token, duration)
+            )
 
-        await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
-        await clear_hosted_movie(token, reason="completed movie expired")
+        logger.info("M3U8 movie is fully downloaded and prepared for playback: %s", output.name)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
