@@ -1202,12 +1202,12 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
-    executable = shutil.which("yt-dlp")
-    if executable is None:
-        raise FileNotFoundError("yt-dlp")
-
+    # Run yt-dlp through the exact Python interpreter hosting the bot.
+    # This works even when the pip-installed yt-dlp executable is not on PATH.
     process = await asyncio.create_subprocess_exec(
-        executable,
+        sys.executable,
+        "-m",
+        "yt_dlp",
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
