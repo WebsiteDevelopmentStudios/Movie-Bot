@@ -31,7 +31,7 @@ WAKE_SECRET = os.getenv("WAKE_SECRET", "").strip()
 
 
 class BridgeInteractionResponse:
-    """Route discord.py command responses to the already-deferred Worker response."""
+    """Route discord.py response calls to the already-deferred Worker response."""
 
     def __init__(self, interaction: discord.Interaction):
         self.interaction = interaction
@@ -58,6 +58,18 @@ class BridgeInteractionResponse:
         raise RuntimeError("Autocomplete is not supported through the interaction bridge yet.")
 
 
+class BridgedInteraction(discord.Interaction):
+    """discord.Interaction with a writable-looking response backed by our bridge."""
+
+    def __init__(self, data: dict[str, Any], state: Any):
+        super().__init__(data=data, state=state)
+        self._bridge_response = BridgeInteractionResponse(self)
+
+    @property
+    def response(self) -> BridgeInteractionResponse:
+        return self._bridge_response
+
+
 async def discord_interaction(request: web.Request) -> web.Response:
     if WAKE_SECRET and request.headers.get("X-Movie-Bot-Secret", "") != WAKE_SECRET:
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -71,8 +83,7 @@ async def discord_interaction(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid Discord interaction"}, status=400)
 
     try:
-        interaction = discord.Interaction(data=payload, state=movie_bot.bot._connection)
-        interaction.response = BridgeInteractionResponse(interaction)
+        interaction = BridgedInteraction(data=payload, state=movie_bot.bot._connection)
         await movie_bot.bot.tree._from_interaction(interaction)
     except Exception:
         movie_bot.logger.exception("Failed to dispatch bridged Discord interaction")
