@@ -1,0 +1,9 @@
+name = "movie-bot-discord-gateway"
+main = "src/index.js"
+compatibility_date = "2026-10-06"
+workers_dev = true
+
+# Set these as Worker secrets in Cloudflare:
+# DISCORD_PUBLIC_KEY
+# BOT_INTERACTION_URL
+# WAKE_SECRET
