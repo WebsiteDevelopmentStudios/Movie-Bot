@@ -1088,9 +1088,10 @@ class MovieBot(discord.Client):
 
         try:
             synced = await self.tree.sync()
-            logger.info("Synced %d slash command(s).", len(synced))
+            logger.info("Synced %d global slash command(s).", len(synced))
         except discord.HTTPException as exc:
             logger.error("Failed to sync slash commands: %s", exc)
+
 
     async def ensure_cloudflare_tunnel(self) -> bool:
         if PUBLIC_BASE_URL:
