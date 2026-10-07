@@ -24,7 +24,9 @@ M3U8_SUFFIX = ".m3u8"
 DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
 HOST_EXPIRY_BUFFER_SECONDS = 30
 # Keep the completed MP4 alive long enough for Discord to fetch and cache its native video preview.
-DISCORD_EMBED_GRACE_SECONDS = 5 * 60
+# This is intentionally generous because large M3U8 remuxes and Discord's media crawler
+# can take a while before the direct .mp4 URL is fetched.
+DISCORD_EMBED_GRACE_SECONDS = 30 * 60
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
@@ -1521,31 +1523,66 @@ async def finish_m3u8_host(
             message_id = current.get("discord_message_id")
             channel_id = current.get("discord_channel_id")
 
-        # Discord caches URL previews aggressively. The first message contains
-        # the HTML player URL because the MP4 does not exist yet. Once the
-        # download is complete, replace that message with a fresh Discord
-        # message containing ONLY the direct .mp4 URL. This gives Discord's
-        # media crawler a fresh URL that resolves directly to video/mp4.
-        if message_id and channel_id and output.exists():
-            try:
-                channel = bot.get_channel(channel_id)
-                if channel is None:
-                    fetched = await bot.fetch_channel(channel_id)
-                    channel = fetched if isinstance(fetched, discord.TextChannel) else None
-                if channel is not None:
-                    old_message = await channel.fetch_message(message_id)
-                    direct_media_url = f"{PUBLIC_BASE_URL}/cdn/{token}.mp4"
-                    try:
-                        await old_message.delete()
-                    except discord.HTTPException:
-                        pass
-                    await channel.send(
-                        content=f"▶ **Now Playing:** {output.stem}\\n{direct_media_url}",
-                        suppress_embeds=False,
+        # Do not let the host expire before Discord gets the direct MP4 URL.
+        # Discord caches previews aggressively, so we delete the temporary player
+        # message and send a fresh message whose URL ends in .mp4.
+        #
+        # If Discord is temporarily unavailable, keep the movie hosted and retry.
+        # The important part is that cleanup NEVER happens before this step has had
+        # a chance to post the direct URL.
+        preview_posted = False
+        if output.exists():
+            retry_deadline = asyncio.get_running_loop().time() + 10 * 60
+            while asyncio.get_running_loop().time() < retry_deadline:
+                try:
+                    channel = bot.get_channel(channel_id) if channel_id else None
+                    if channel is None and channel_id:
+                        fetched = await bot.fetch_channel(channel_id)
+                        channel = fetched if isinstance(fetched, discord.TextChannel) else None
+
+                    if channel is not None:
+                        direct_media_url = f"{PUBLIC_BASE_URL}/cdn/{token}.mp4"
+
+                        if message_id:
+                            try:
+                                old_message = await channel.fetch_message(message_id)
+                                await old_message.delete()
+                            except discord.NotFound:
+                                pass
+                            except discord.HTTPException as exc:
+                                logger.warning(
+                                    "Could not delete temporary movie player message for %s: %s",
+                                    token,
+                                    exc,
+                                )
+
+                        await channel.send(
+                            content=f"▶ **Now Playing:** {output.stem}\\n{direct_media_url}",
+                            suppress_embeds=False,
+                        )
+                        preview_posted = True
+                        logger.info(
+                            "Posted fresh direct MP4 URL for Discord media preview: %s",
+                            token,
+                        )
+                        break
+
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning(
+                        "Could not post direct Discord movie preview for %s; "
+                        "keeping host alive and retrying: %s",
+                        token,
+                        exc,
                     )
-                    logger.info("Posted fresh direct MP4 URL for Discord media preview: %s", token)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                logger.warning("Could not post direct Discord movie preview for %s: %s", token, exc)
+
+                await asyncio.sleep(10)
+
+        if not preview_posted:
+            logger.warning(
+                "Discord direct MP4 preview was not posted after retries; "
+                "keeping movie host alive for the full grace period: %s",
+                token,
+            )
 
         await asyncio.sleep(DISCORD_EMBED_GRACE_SECONDS)
         await clear_hosted_movie(token, reason="completed movie expired")
