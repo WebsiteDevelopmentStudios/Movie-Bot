@@ -5,10 +5,9 @@ import os
 import re
 import secrets
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from html import escape
 
-import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -24,10 +23,6 @@ SUPPORTED_EXTENSIONS = {".mp4", ".mp3"}
 M3U8_SUFFIX = ".m3u8"
 DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
 HOST_EXPIRY_BUFFER_SECONDS = 30
-# Keep the completed MP4 alive long enough for Discord to fetch and cache its native video preview.
-# This is intentionally generous because large M3U8 remuxes and Discord's media crawler
-# can take a while before the direct .mp4 URL is fetched.
-DISCORD_EMBED_GRACE_SECONDS = 30 * 60
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
@@ -398,19 +393,18 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
 
         current = active_host
         task = current.get("task")
-        download_task = current.get("download_task")
         ffmpeg_process = current.get("ffmpeg_process")
         stderr_task = current.get("ffmpeg_stderr_task")
+        progress_task = current.get("progress_task")
         hls_dir = current.get("hls_dir")
-        keep_cache = current.get("persistent_cache", False)
         active_host = None
 
         if task is not None and task is not asyncio.current_task():
             task.cancel()
-        if download_task is not None and download_task is not asyncio.current_task():
-            download_task.cancel()
         if stderr_task is not None and stderr_task is not asyncio.current_task():
             stderr_task.cancel()
+        if progress_task is not None and progress_task is not asyncio.current_task():
+            progress_task.cancel()
 
     if ffmpeg_process is not None and ffmpeg_process.returncode is None:
         ffmpeg_process.terminate()
@@ -420,7 +414,7 @@ async def clear_hosted_movie(token: str, reason: str = "host expired") -> None:
             ffmpeg_process.kill()
             await ffmpeg_process.wait()
 
-    if hls_dir is not None and not keep_cache:
+    if hls_dir is not None:
         try:
             for path in hls_dir.rglob("*"):
                 if path.is_file():
@@ -577,13 +571,14 @@ async def _get_active_host(token: str):
             ):
                 return None
 
-            # The HLS cache is the source of truth while an M3U8 movie is
-            # being prepared. Do not reject the host just because the final
-            # MP4 has not been written yet; the browser player can use HLS.
-            if not resolved_movie.is_file() and not current.get("downloading"):
-                # A completed host must have its final media file available.
-                # (The normal local-file host also requires this.)
-                return None
+            # An M3U8 movie is playable before its MP4 file is complete.
+            # During that phase the HLS cache is the source of truth.
+            if not resolved_movie.is_file():
+                if not current.get("downloading"):
+                    return None
+                ffmpeg_process = current.get("ffmpeg_process")
+                if ffmpeg_process is None or ffmpeg_process.returncode is not None:
+                    return None
         except OSError:
             return None
 
@@ -700,6 +695,19 @@ async def hosted_movie_handler(request: web.Request) -> web.StreamResponse:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} - Movie Bot</title>
+<meta property="og:title" content="Watch {title}">
+<meta property="og:description" content="Watch {title} directly in your browser.">
+<meta property="og:type" content="video.other">
+<meta property="og:url" content="{PUBLIC_BASE_URL}/movie/{token}">
+<meta property="og:video" content="{PUBLIC_BASE_URL}/media/{token}">
+<meta property="og:video:secure_url" content="{PUBLIC_BASE_URL}/media/{token}">
+<meta property="og:video:type" content="video/mp4">
+<meta property="og:video:url" content="{PUBLIC_BASE_URL}/media/{token}">
+<meta property="og:video:duration" content="0">
+<meta property="og:video:width" content="1280">
+<meta property="og:video:height" content="720">
+<meta name="twitter:card" content="player">
+<meta name="twitter:title" content="Watch {title}">
 <style>
 body {{
     margin: 0;
@@ -709,43 +717,23 @@ body {{
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }}
 main {{
-    width: min(1100px, calc(100% - 24px));
+    width: min(1200px, calc(100% - 32px));
     margin: 0 auto;
-    padding: 16px 0 24px;
+    padding: 28px 0;
 }}
 h1 {{
-    margin: 0 0 12px;
-    font-size: clamp(20px, 3vw, 30px);
+    margin: 0 0 18px;
+    font-size: clamp(24px, 4vw, 38px);
 }}
 .player {{
     background: #000;
     border-radius: 14px;
     overflow: hidden;
-}}
-.actions {{
-    display: flex;
-    gap: 8px;
-    margin-top: 10px;
-}}
-.button {{
-    display: inline-block;
-    padding: 9px 14px;
-    border-radius: 6px;
-    background: #5865f2;
-    color: #fff;
-    text-decoration: none;
-    border: 0;
-    font: inherit;
-    cursor: pointer;
-}}
-.button:disabled {{
-    opacity: .5;
-    cursor: not-allowed;
+    box-shadow: 0 18px 50px rgba(0,0,0,.35);
 }}
 #status {{
-    margin-top: 9px;
+    margin-top: 14px;
     color: #aaa;
-    font-size: 14px;
 }}
 </style>
 </head>
@@ -753,38 +741,8 @@ h1 {{
 <main>
 <h1>{title}</h1>
 <div class="player">{player}</div>
-<div class="actions">
-    <button id="download" class="button" disabled>Download Movie</button>
-</div>
 <div id="status">Loading movie stream...</div>
 </main>
-<script>
-const downloadButton = document.getElementById("download");
-const downloadUrl = "/media/{token}?download=1";
-
-async function updateDownloadButton() {{
-    try {{
-        const response = await fetch("/status/{token}", {{cache: "no-store"}});
-        if (!response.ok) throw new Error("status unavailable");
-        const data = await response.json();
-
-        if (data.ready) {{
-            downloadButton.disabled = false;
-            downloadButton.onclick = () => {{
-                window.location.href = downloadUrl;
-            }};
-            return;
-        }}
-
-        downloadButton.disabled = true;
-    }} catch (error) {{
-        downloadButton.disabled = true;
-    }}
-}}
-
-updateDownloadButton();
-setInterval(updateDownloadButton, 5000);
-</script>
 </body>
 </html>"""
     return web.Response(
@@ -807,50 +765,22 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
 
     try:
         resolved = movie.resolve()
-        if resolved.parent != MOVIES_DIR.resolve():
-            return web.Response(status=404, text="Movie is unavailable.")
-        if not resolved.is_file():
-            # An active M3U8 host may not have its final MP4 yet. Always send
-            # it to the HLS player instead of exposing a misleading readiness
-            # error.
-            raise web.HTTPFound(location=f"/movie/{token}")
-    except web.HTTPException:
-        raise
+        if resolved.parent != MOVIES_DIR.resolve() or not resolved.is_file():
+            return web.Response(status=404, text="Movie is not ready yet.")
     except OSError:
-        raise web.HTTPFound(location=f"/movie/{token}")
+        return web.Response(status=404, text="Movie is not ready yet.")
 
     # aiohttp's FileResponse handles byte ranges, which Discord and browsers
     # need when probing/streaming large MP4 files.
-    wants_download = request.query.get("download") == "1"
     return web.FileResponse(
         path=resolved,
         headers={
             "Content-Type": "video/mp4",
-            "Content-Disposition": (
-                f'attachment; filename="{escape(movie.name)}"'
-                if wants_download
-                else f'inline; filename="{escape(movie.name)}"'
-            ),
+            "Content-Disposition": f'inline; filename="{escape(movie.name)}"',
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Accept-Ranges": "bytes",
         },
     )
-
-async def hosted_status_handler(request: web.Request) -> web.StreamResponse:
-    token = request.match_info.get("token", "")
-    async with host_lock:
-        current = active_host
-        if current is None or not secrets.compare_digest(current["token"], token):
-            return web.json_response({"ready": False}, status=404)
-
-        movie = current["movie"]
-        ready = (
-            not current.get("downloading", False)
-            and movie.suffix.lower() == ".mp4"
-            and movie.is_file()
-        )
-
-    return web.json_response({"ready": ready})
 
 async def hosted_part_handler(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token", "")
@@ -1072,46 +1002,10 @@ async def stop_cloudflare_quick_tunnel() -> None:
     PUBLIC_BASE_URL = ""
 
 
-async def hosted_cdn_handler(request: web.Request) -> web.StreamResponse:
-    """Serve completed MP4s from a direct .mp4 URL for Discord media detection."""
-    token = request.match_info["token"]
-    if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token):
-        raise web.HTTPNotFound()
-
-    async with host_lock:
-        current = active_host
-        if current is None or not secrets.compare_digest(current["token"], token):
-            raise web.HTTPNotFound()
-        movie = current["movie"]
-        downloading = current.get("downloading", False)
-
-    if downloading or not movie.exists() or not movie.is_file():
-        raise web.HTTPNotFound()
-
-    try:
-        resolved = movie.resolve()
-        if resolved.parent != MOVIES_DIR.resolve() or resolved.suffix.lower() != ".mp4":
-            raise web.HTTPNotFound()
-    except OSError:
-        raise web.HTTPNotFound()
-
-    return web.FileResponse(
-        resolved,
-        headers={
-            "Content-Type": "video/mp4",
-            "Content-Disposition": "inline",
-            "Cache-Control": "public, max-age=30",
-            "Accept-Ranges": "bytes",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
-
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
-    app.router.add_get("/status/{token}", hosted_status_handler)
     app.router.add_get("/media/{token}", hosted_media_handler)
-    app.router.add_get("/cdn/{token}.mp4", hosted_cdn_handler)
     app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
     app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
     runner = web.AppRunner(app)
@@ -1284,64 +1178,6 @@ def is_m3u8_url(value: str) -> bool:
     return path.endswith(".m3u8") or ".m3u8" in path
 
 
-def m3u8_cache_source_path(hls_dir: Path) -> Path:
-    return hls_dir / ".source-url"
-
-
-def m3u8_cache_complete_path(hls_dir: Path) -> Path:
-    return hls_dir / ".complete"
-
-
-def find_cached_m3u8(url: str) -> Path | None:
-    """Find a fully downloaded HLS cache for the exact source URL."""
-    if not HLS_CACHE_DIR.is_dir():
-        return None
-
-    for candidate in HLS_CACHE_DIR.iterdir():
-        if not candidate.is_dir():
-            continue
-        source_file = m3u8_cache_source_path(candidate)
-        complete_file = m3u8_cache_complete_path(candidate)
-        playlist = candidate / "playlist.m3u8"
-        if not source_file.is_file() or not complete_file.is_file() or not playlist.is_file():
-            continue
-        try:
-            cached_url = source_file.read_text(encoding="utf-8").strip()
-            if cached_url == url.strip() and playlist.stat().st_size > 0:
-                return candidate
-        except OSError:
-            continue
-
-    return None
-
-
-def cache_folder_name(movie_name: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "", movie_name).strip(" .")
-    safe_name = safe_name[:100] or "movie"
-    candidate = HLS_CACHE_DIR / safe_name
-    number = 2
-    while candidate.exists():
-        candidate = HLS_CACHE_DIR / f"{safe_name} ({number})"
-        number += 1
-    return candidate.name
-
-
-async def mark_m3u8_cache_complete(
-    hls_dir: Path,
-    source_url: str,
-    movie_name: str,
-) -> Path:
-    """Persist a completed HLS cache under the movie's human-readable name."""
-    m3u8_cache_source_path(hls_dir).write_text(source_url.strip(), encoding="utf-8")
-    m3u8_cache_complete_path(hls_dir).write_text("complete\n", encoding="utf-8")
-
-    target = HLS_CACHE_DIR / cache_folder_name(movie_name)
-    if hls_dir.resolve() != target.resolve():
-        hls_dir.replace(target)
-        return target
-    return hls_dir
-
-
 def safe_download_name(url: str) -> str:
     parsed = urlparse(url)
     raw_name = Path(parsed.path).stem or "movie"
@@ -1356,281 +1192,8 @@ def safe_download_name(url: str) -> str:
     return candidate.name
 
 
-async def fetch_m3u8_text(session: aiohttp.ClientSession, url: str) -> tuple[str, str]:
-    async with session.get(url, allow_redirects=True) as response:
-        response.raise_for_status()
-        text = await response.text(errors="replace")
-        return text, str(response.url)
-
-
-def parse_m3u8_segments(playlist_text: str, base_url: str) -> tuple[list[tuple[float, str]], str | None, str | None]:
-    """Parse a simple VOD media playlist.
-
-    Returns (segments, init_url, unsupported_reason). Encrypted and byte-range
-    playlists are rejected because this downloader only handles direct segments.
-    """
-    if "#EXT-X-KEY:" in playlist_text:
-        for line in playlist_text.splitlines():
-            if line.startswith("#EXT-X-KEY:") and "METHOD=NONE" not in line.upper():
-                return [], None, "encrypted HLS"
-    if "#EXT-X-BYTERANGE:" in playlist_text:
-        return [], None, "byte-range HLS"
-
-    segments: list[tuple[float, str]] = []
-    init_url = None
-    pending_duration = None
-
-    lines = [line.strip() for line in playlist_text.splitlines() if line.strip()]
-    for line in lines:
-        if line.startswith("#EXT-X-MAP:"):
-            match = re.search(r'URI="([^"]+)"', line)
-            if match:
-                init_url = urljoin(base_url, match.group(1))
-        elif line.startswith("#EXTINF:"):
-            try:
-                pending_duration = float(line.split(":", 1)[1].split(",", 1)[0])
-            except ValueError:
-                pending_duration = 2.0
-        elif not line.startswith("#") and pending_duration is not None:
-            segments.append((pending_duration, urljoin(base_url, line)))
-            pending_duration = None
-
-    if not segments:
-        return [], init_url, "no media segments found"
-
-    return segments, init_url, None
-
-
-async def resolve_m3u8_media_playlist(
-    session: aiohttp.ClientSession,
-    url: str,
-) -> tuple[str, list[tuple[float, str]], str | None, str | None]:
-    """Resolve a master playlist to the highest-bandwidth media playlist."""
-    text, final_url = await fetch_m3u8_text(session, url)
-
-    if "#EXT-X-STREAM-INF:" not in text:
-        segments, init_url, reason = parse_m3u8_segments(text, final_url)
-        return final_url, segments, init_url, reason
-
-    variants: list[tuple[int, str]] = []
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for index, line in enumerate(lines[:-1]):
-        if not line.startswith("#EXT-X-STREAM-INF:"):
-            continue
-        next_line = lines[index + 1]
-        if next_line.startswith("#"):
-            continue
-        bandwidth_match = re.search(r"(?:AVERAGE-BANDWIDTH|BANDWIDTH)=(\d+)", line)
-        bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
-        variants.append((bandwidth, urljoin(final_url, next_line)))
-
-    if not variants:
-        return final_url, [], None, "master playlist has no variants"
-
-    variants.sort(key=lambda item: item[0], reverse=True)
-    media_url = variants[0][1]
-    media_text, media_final_url = await fetch_m3u8_text(session, media_url)
-    segments, init_url, reason = parse_m3u8_segments(media_text, media_final_url)
-    return media_final_url, segments, init_url, reason
-
-
-async def download_m3u8_segments(
-    url: str,
-    hls_dir: Path,
-    progress=None,
-) -> tuple[bool, str]:
-    """Download the complete M3U8 directly with concurrent HTTP requests."""
-    timeout = aiohttp.ClientTimeout(
-        total=DOWNLOAD_TIMEOUT_SECONDS,
-        connect=30,
-        sock_read=120,
-    )
-    # 16 total / 8 per host gives good throughput while avoiding the large
-    # request burst that caused the previous CDN fallback behavior.
-    connector = aiohttp.TCPConnector(
-        limit=16,
-        limit_per_host=8,
-        ttl_dns_cache=300,
-    )
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    }
-
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-        headers=headers,
-    ) as session:
-        try:
-            media_url, segments, init_url, reason = await resolve_m3u8_media_playlist(
-                session, url
-            )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            return False, f"playlist fetch failed: {exc}"
-
-        playlist_origin = (
-            f"{urlparse(media_url).scheme}://{urlparse(media_url).netloc}"
-        )
-        session.headers.update({
-            "Referer": media_url,
-            "Origin": playlist_origin,
-        })
-
-        if reason:
-            return False, reason
-
-        hls_dir.mkdir(parents=True, exist_ok=True)
-        segment_extension = ".m4s" if init_url else ".ts"
-        segment_names = [
-            f"segment-{index:06d}{segment_extension}"
-            for index in range(len(segments))
-        ]
-
-        if init_url:
-            init_path = hls_dir / "init.mp4"
-            try:
-                async with session.get(init_url) as response:
-                    response.raise_for_status()
-                    with init_path.open("wb") as file:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            file.write(chunk)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                return False, f"initialization segment download failed: {exc}"
-
-        completed = [False] * len(segments)
-        lock = asyncio.Lock()
-        completed_bytes = 0
-        started_at = asyncio.get_running_loop().time()
-        last_percent = -1
-
-        async def write_playlist(final: bool = False) -> None:
-            count = 0
-            while count < len(completed) and completed[count]:
-                count += 1
-
-            target_duration = max(
-                1,
-                int(max(duration for duration, _ in segments) + 0.999),
-            )
-            lines = [
-                "#EXTM3U",
-                "#EXT-X-VERSION:3",
-                f"#EXT-X-TARGETDURATION:{target_duration}",
-                "#EXT-X-MEDIA-SEQUENCE:0",
-                "#EXT-X-PLAYLIST-TYPE:VOD",
-            ]
-            if init_url:
-                lines.append('#EXT-X-MAP:URI="init.mp4"')
-
-            for index in range(count):
-                duration, _ = segments[index]
-                lines.append(f"#EXTINF:{duration:.6f},")
-                lines.append(segment_names[index])
-
-            if final and count == len(segments):
-                lines.append("#EXT-X-ENDLIST")
-
-            temp = hls_dir / "playlist.m3u8.tmp"
-            temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            temp.replace(hls_dir / "playlist.m3u8")
-
-        async def report_progress(force: bool = False) -> None:
-            nonlocal last_percent
-
-            done = sum(completed)
-            percent = int((done * 100) / len(segments)) if segments else 100
-            if not force and percent <= last_percent:
-                return
-
-            elapsed = max(
-                0.1,
-                asyncio.get_running_loop().time() - started_at,
-            )
-            speed_mbps = (completed_bytes * 8 / elapsed) / 1_000_000
-            last_percent = percent
-
-            if progress is not None:
-                await progress(
-                    f"Downloading movie... {percent}% "
-                    f"({done}/{len(segments)} segments, {speed_mbps:.1f} Mbps)"
-                )
-
-        async def worker(index: int) -> None:
-            nonlocal completed_bytes
-            segment_url = segments[index][1]
-            target = hls_dir / segment_names[index]
-
-            for attempt in range(4):
-                try:
-                    async with session.get(segment_url) as response:
-                        response.raise_for_status()
-                        with target.open("wb") as file:
-                            async for chunk in response.content.iter_chunked(1024 * 1024):
-                                file.write(chunk)
-                                completed_bytes += len(chunk)
-
-                    async with lock:
-                        completed[index] = True
-                        await write_playlist()
-                        await report_progress()
-                    return
-
-                except (
-                    aiohttp.ClientResponseError,
-                    aiohttp.ClientError,
-                    asyncio.TimeoutError,
-                    OSError,
-                ) as exc:
-                    target.unlink(missing_ok=True)
-
-                    if isinstance(exc, aiohttp.ClientResponseError):
-                        logger.warning(
-                            "Segment %d failed with HTTP %s "
-                            "(attempt %d/4).",
-                            index + 1,
-                            exc.status,
-                            attempt + 1,
-                        )
-
-                    if attempt == 3:
-                        raise RuntimeError(
-                            f"segment {index + 1} failed after 4 attempts: {exc}"
-                        ) from exc
-
-                    await asyncio.sleep(0.5 * (attempt + 1))
-
-        workers = [
-            asyncio.create_task(worker(index))
-            for index in range(len(segments))
-        ]
-
-        try:
-            await asyncio.gather(*workers)
-            await write_playlist(final=True)
-            await report_progress(force=True)
-        except Exception:
-            for task in workers:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-            raise
-
-    logger.info(
-        "Parallel M3U8 download completed: %d segments.",
-        len(segments),
-    )
-    return True, url
-
-
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
-    """Download M3U8 segments in parallel while exposing a growing HLS playlist."""
+    """Download an M3U8 movie to HLS, report progress, then expose it for playback."""
     global active_host
 
     ensure_movies_dir()
@@ -1639,7 +1202,7 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         return False, "That is not a valid HTTP/HTTPS M3U8 URL.", None
 
     if progress is not None:
-        await progress("Downloading movie...")
+        await progress("Downloading movie... 0%")
 
     if not PUBLIC_BASE_URL:
         if progress is not None:
@@ -1647,44 +1210,13 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         await bot.ensure_cloudflare_tunnel()
 
     if not PUBLIC_BASE_URL:
-        return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot."
+        return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot.", None
 
-    cached_hls_dir = find_cached_m3u8(url)
-    if cached_hls_dir is not None:
-        cached_name = cached_hls_dir.name
-        output = MOVIES_DIR / f"{cached_name}.mp4"
-        logger.info("Reusing completed M3U8 cache: %s", cached_hls_dir)
-        if progress is not None:
-            await progress(f"Using cached movie **{cached_name}**...")
-
-        async with host_lock:
-            if active_host is not None:
-                return False, "Another movie is currently being hosted. Please wait until it finishes.", None
-
-            token = secrets.token_urlsafe(32)
-            active_host = {
-                "token": token,
-                "movie": output,
-                "hls_dir": cached_hls_dir,
-                "ffmpeg_process": None,
-                "ffmpeg_stderr_lines": [],
-                "ffmpeg_stderr_task": None,
-                "expires_at": float("inf"),
-                "task": None,
-                "download_task": None,
-                "downloading": True,
-                "persistent_cache": True,
-            }
-            cached_task = asyncio.create_task(asyncio.sleep(0, result=(True, "cached")))
-            active_host["download_task"] = cached_task
-            playlist = cached_hls_dir / "playlist.m3u8"
-            active_host["task"] = asyncio.create_task(
-                finish_m3u8_host(token, cached_task, playlist, output)
-            )
-
-        if progress is not None:
-            await progress("Embedding cached movie...")
-        return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+    # Ask ffprobe for the total duration so the progress shown to the user is
+    # based on media time rather than the number of HLS segments.
+    duration = await get_media_duration(url)
+    if duration is None:
+        return False, "I could not determine the M3U8 movie length. The source may not provide a readable duration.", None
 
     filename = safe_download_name(url)
     output = MOVIES_DIR / filename
@@ -1699,57 +1231,138 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         hls_dir.mkdir(parents=True, exist_ok=False)
         playlist = hls_dir / "playlist.m3u8"
 
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-y",
+                "-protocol_whitelist", "http,https,tcp,tls,crypto",
+                "-allowed_extensions", "ALL",
+                "-extension_picky", "0",
+                "-http_persistent", "1",
+                "-i", url,
+                "-map", "0:v:0?",
+                "-map", "0:a:0?",
+                "-c", "copy",
+                "-start_number", "0",
+                "-hls_time", "2",
+                "-hls_list_size", "0",
+                "-hls_playlist_type", "vod",
+                "-hls_flags", "independent_segments+temp_file",
+                "-hls_segment_type", "mpegts",
+                "-f", "hls",
+                str(playlist),
+                "-progress", "pipe:1",
+                "-nostats",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            hls_dir.rmdir()
+            return False, "FFmpeg is not installed or is not in PATH. Install FFmpeg and restart the bot.", None
+        except OSError as exc:
+            logger.exception("Could not start FFmpeg for M3U8 download: %s", exc)
+            hls_dir.rmdir()
+            return False, "I could not start the M3U8 download.", None
+
+        ffmpeg_stderr_lines: list[str] = []
+        ffmpeg_stderr_task = asyncio.create_task(
+            _collect_ffmpeg_stderr(process, ffmpeg_stderr_lines)
+        )
+
+        async def monitor_download() -> None:
+            last_percent = -1
+            if process.stdout is None:
+                return
+            try:
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    value = line.decode("utf-8", errors="replace").strip()
+                    if not value.startswith("out_time_ms="):
+                        continue
+                    try:
+                        media_time = int(value.split("=", 1)[1]) / 1_000_000
+                    except ValueError:
+                        continue
+                    percent = max(0, min(99, int((media_time / duration) * 100)))
+                    if percent != last_percent:
+                        last_percent = percent
+                        if progress is not None:
+                            await progress(f"Downloading movie... {percent}%")
+            except asyncio.CancelledError:
+                raise
+            except (OSError, RuntimeError):
+                pass
+
+        progress_task = asyncio.create_task(monitor_download())
+
         active_host = {
             "token": token,
             "movie": output,
             "hls_dir": hls_dir,
-            "ffmpeg_process": None,
-            "ffmpeg_stderr_lines": [],
-            "ffmpeg_stderr_task": None,
+            "ffmpeg_process": process,
+            "ffmpeg_stderr_lines": ffmpeg_stderr_lines,
+            "ffmpeg_stderr_task": ffmpeg_stderr_task,
+            "progress_task": progress_task,
             "expires_at": float("inf"),
             "task": None,
-            "download_task": None,
             "downloading": True,
-            "persistent_cache": False,
-            "source_m3u8_url": url,
+            "duration": duration,
         }
 
-        # Keep the exact source URL beside the generated playlist so a future
-        # /movie play of the same M3U8 can reuse this cache.
-        m3u8_cache_source_path(hls_dir).write_text(url.strip(), encoding="utf-8")
-
-        download_task = asyncio.create_task(
-            download_m3u8_segments(url, hls_dir, progress)
-        )
-        active_host["download_task"] = download_task
         active_host["task"] = asyncio.create_task(
-            finish_m3u8_host(token, download_task, playlist, output)
+            finish_m3u8_host(token, process, playlist, output)
         )
 
-    # Wait for the complete source before posting anything to Discord.
-    # The downloader updates the user's ephemeral interaction with a real
-    # percentage while the 16 concurrent HTTP workers download the segments.
-    try:
-        success, detail = await download_task
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        success, detail = False, str(exc)
+    # The Discord embed is intentionally not posted until FFmpeg has finished
+    # downloading the complete movie. This avoids exposing a link to a
+    # half-finished movie.
+    while process.returncode is None:
+        await asyncio.sleep(0.5)
 
-    if not success:
-        logger.warning("Parallel M3U8 downloader failed: %s", detail)
-        await clear_hosted_movie(token, reason="parallel M3U8 downloader failed")
-        return False, "The M3U8 download failed. Check the bot console for details.", None
+    await process.wait()
+    await progress_task
 
-    async with host_lock:
-        current = active_host
-        if current is not None and current["token"] == token:
-            current["playback_ready"] = True
+    if process.returncode != 0:
+        error_text = "\n".join(ffmpeg_stderr_lines[-50:])
+        logger.error(
+            "FFmpeg M3U8 download failed with code %s: %s",
+            process.returncode,
+            error_text[-5000:] or "(no stderr output)",
+        )
+        await clear_hosted_movie(token, reason="M3U8 download failed")
+        return False, "FFmpeg could not finish downloading the M3U8 movie. Check the bot console for the FFmpeg error.", None
 
-    logger.info("M3U8 download complete: %s", token)
+    if not playlist.exists() or playlist.stat().st_size == 0:
+        await clear_hosted_movie(token, reason="M3U8 playlist was not created")
+        return False, "The M3U8 download finished, but no playable movie data was created.", None
+
     if progress is not None:
-        await progress("Download complete: 100%. Preparing Discord embed...")
+        await progress("Downloading movie... 100%")
+        await progress("Preparing Discord embed...")
 
+    # Wait for the post-download task to remux and split the movie. The task
+    # also keeps the two-part hosting data associated with this movie.
+    finish_task = active_host.get("task") if active_host is not None else None
+    if finish_task is not None and finish_task is not asyncio.current_task():
+        try:
+            await finish_task
+        except asyncio.CancelledError:
+            pass
+
+    if active_host is None or active_host.get("token") != token:
+        return False, "The movie host ended before the movie could be prepared.", None
+
+    if not output.exists() or output.stat().st_size == 0:
+        return False, "The movie downloaded, but could not be prepared for playback.", None
+
+    if progress is not None:
+        await progress("Embedding movie...")
+
+    logger.info("M3U8 movie download complete: %s", output.name)
     return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
 
 
@@ -1768,61 +1381,6 @@ async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: lis
                     del lines[:-100]
     except asyncio.CancelledError:
         raise
-
-
-async def get_movie_metadata_title(movie: Path) -> str | None:
-    """Read a useful title from media metadata, if the source provides one."""
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-show_entries", "format_tags=title",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(movie),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
-    except (FileNotFoundError, OSError, asyncio.TimeoutError):
-        return None
-
-    if process.returncode != 0:
-        return None
-
-    title = stdout.decode("utf-8", errors="replace").strip()
-    title = re.sub(r"\\s+", " ", title).strip(" .")
-    if not title:
-        return None
-
-    # Avoid replacing a useful filename with a generic player/stream name.
-    generic = {"index", "movie", "video", "stream", "playlist"}
-    if title.casefold() in generic:
-        return None
-    return title[:120]
-
-
-async def rename_movie_from_metadata(movie: Path) -> Path:
-    title = await get_movie_metadata_title(movie)
-    if not title:
-        return movie
-
-    safe_title = re.sub(r"[^A-Za-z0-9._ -]+", "", title).strip(" .")
-    safe_title = safe_title[:100].strip(" .")
-    if not safe_title or safe_title.casefold() == movie.stem.casefold():
-        return movie
-
-    candidate = MOVIES_DIR / f"{safe_title}{movie.suffix.lower()}"
-    number = 2
-    while candidate.exists() and candidate.resolve() != movie.resolve():
-        candidate = MOVIES_DIR / f"{safe_title} ({number}){movie.suffix.lower()}"
-        number += 1
-
-    try:
-        movie.replace(candidate)
-        logger.info("Using media metadata title for movie name: %s", candidate.stem)
-        return candidate
-    except OSError as exc:
-        logger.warning("Could not rename movie from metadata: %s", exc)
-        return movie
 
 
 async def split_movie_into_parts(source: Path, parts_dir: Path) -> tuple[Path, Path] | None:
@@ -1896,32 +1454,41 @@ async def split_movie_into_parts(source: Path, parts_dir: Path) -> tuple[Path, P
 
 async def finish_m3u8_host(
     token: str,
-    download_task: asyncio.Task,
+    process: asyncio.subprocess.Process,
     playlist: Path,
     output: Path,
 ) -> None:
     try:
-        try:
-            success, detail = await download_task
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            success, detail = False, str(exc)
+        await process.wait()
 
-        if not success:
-            logger.error("M3U8 download failed: %s", detail)
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            stderr_task = current.get("ffmpeg_stderr_task")
+            stderr_lines = current.get("ffmpeg_stderr_lines", [])
+
+        if stderr_task is not None:
+            await stderr_task
+
+        error_text = "\n".join(stderr_lines[-100:])
+        if process.returncode != 0 or not playlist.exists() or playlist.stat().st_size == 0:
+            logger.error(
+                "FFmpeg finished M3U8 download with code %s: %s",
+                process.returncode,
+                error_text[-5000:] or "(no stderr output)",
+            )
             await clear_hosted_movie(token, reason="M3U8 download failed")
             return
 
-        if not playlist.exists() or playlist.stat().st_size == 0:
-            await clear_hosted_movie(token, reason="M3U8 playlist missing after download")
-            return
+        async with host_lock:
+            current = active_host
+            if current is None or current["token"] != token:
+                return
+            current["downloading"] = False
 
-        # Convert the locally cached segments into one MP4. No second network
-        # download is performed here.
-        if output.exists():
-            output.unlink(missing_ok=True)
-
+        # Convert the cached HLS segments into the normal local MP4 without
+        # contacting the original M3U8 URL again.
         remux_temp = output.with_name(f".{output.name}.part")
         try:
             remux = await asyncio.create_subprocess_exec(
@@ -1943,48 +1510,13 @@ async def finish_m3u8_host(
                     remux_stderr.decode("utf-8", errors="replace")[-5000:],
                 )
                 remux_temp.unlink(missing_ok=True)
-                await clear_hosted_movie(token, reason="M3U8 MP4 remux failed")
-                return
-            remux_temp.replace(output)
-
-            # Some M3U8 URLs use generic names such as index-f2-v1-a1.
-            # Prefer the actual title embedded in the media when available.
-            renamed_output = await rename_movie_from_metadata(output)
-            if renamed_output != output:
-                output = renamed_output
-                async with host_lock:
-                    current = active_host
-                    if current is not None and current["token"] == token:
-                        current["movie"] = output
+            else:
+                remux_temp.replace(output)
         except (FileNotFoundError, OSError) as exc:
             logger.warning("Could not remux completed M3U8 movie: %s", exc)
             remux_temp.unlink(missing_ok=True)
-            await clear_hosted_movie(token, reason="M3U8 MP4 remux failed")
-            return
 
-        async with host_lock:
-            current = active_host
-            source_url = current.get("source_m3u8_url") if current is not None else None
-            current_hls_dir = current.get("hls_dir") if current is not None else None
-        if source_url and current_hls_dir is not None and not current.get("persistent_cache", False):
-            try:
-                renamed_cache = await mark_m3u8_cache_complete(
-                    current_hls_dir,
-                    source_url,
-                    output.stem,
-                )
-                async with host_lock:
-                    current = active_host
-                    if current is not None and current["token"] == token:
-                        current["hls_dir"] = renamed_cache
-                        current["persistent_cache"] = True
-            except OSError as exc:
-                logger.warning("Could not preserve completed M3U8 cache: %s", exc)
-
-        async with host_lock:
-            current = active_host
-            cache_dir = current.get("hls_dir") if current is not None else None
-        parts_dir = (cache_dir / "parts") if cache_dir is not None else (HLS_CACHE_DIR / token / "parts")
+        parts_dir = HLS_CACHE_DIR / token / "parts"
         parts = await split_movie_into_parts(output, parts_dir) if output.exists() else None
 
         async with host_lock:
@@ -1997,76 +1529,9 @@ async def finish_m3u8_host(
             current = active_host
             if current is None or current["token"] != token:
                 return
-            current["downloading"] = False
-            current["expires_at"] = asyncio.get_running_loop().time() + DISCORD_EMBED_GRACE_SECONDS
-            message_id = current.get("discord_message_id")
-            channel_id = current.get("discord_channel_id")
+            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
 
-        preview_posted = False
-        if output.exists():
-            retry_deadline = asyncio.get_running_loop().time() + 10 * 60
-            while asyncio.get_running_loop().time() < retry_deadline:
-                try:
-                    channel = bot.get_channel(channel_id) if channel_id else None
-                    if channel is None and channel_id:
-                        fetched = await bot.fetch_channel(channel_id)
-                        channel = fetched if isinstance(fetched, discord.TextChannel) else None
-
-                    if channel is not None:
-                        direct_media_url = f"{PUBLIC_BASE_URL}/cdn/{token}.mp4"
-
-                        final_embed = discord.Embed(
-                            title=f"Now Playing: {output.stem}",
-                            description=f"[▶ Watch Movie]({direct_media_url})",
-                            color=discord.Color.blurple(),
-                        )
-
-                        if message_id:
-                            try:
-                                old_message = await channel.fetch_message(message_id)
-                                await old_message.edit(
-                                    content=f"▶ **Now Playing:** {output.stem}",
-                                    embed=final_embed,
-                                    suppress_embeds=False,
-                                )
-                            except discord.NotFound:
-                                await channel.send(
-                                    content=f"▶ **Now Playing:** {output.stem}",
-                                    embed=final_embed,
-                                    suppress_embeds=False,
-                                )
-                        else:
-                            await channel.send(
-                                content=f"▶ **Now Playing:** {output.stem}",
-                                embed=final_embed,
-                                suppress_embeds=False,
-                            )
-
-                        preview_posted = True
-                        logger.info(
-                            "Updated movie embed with final title and direct MP4 URL: %s",
-                            token,
-                        )
-                        break
-
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                    logger.warning(
-                        "Could not post direct Discord movie preview for %s; "
-                        "keeping host alive and retrying: %s",
-                        token,
-                        exc,
-                    )
-
-                await asyncio.sleep(10)
-
-        if not preview_posted:
-            logger.warning(
-                "Discord direct MP4 preview was not posted after retries; "
-                "keeping movie host alive for the full grace period: %s",
-                token,
-            )
-
-        await asyncio.sleep(DISCORD_EMBED_GRACE_SECONDS)
+        await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
         await clear_hosted_movie(token, reason="completed movie expired")
     except asyncio.CancelledError:
         raise
@@ -2076,13 +1541,9 @@ async def finish_m3u8_host(
 
 
 @movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
-@app_commands.describe(
-    movie="Movie name, or an HTTP/HTTPS .m3u8 URL.",
-    name="Display name to use while the M3U8 movie is downloading (optional).",
-)
-async def movie_play(interaction: discord.Interaction, movie: str, name: str | None = None) -> None:
+@app_commands.describe(movie="Movie name, or an HTTP/HTTPS .m3u8 URL.")
+async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     if is_m3u8_url(movie):
-        display_name = (name or "").strip()[:120] or None
         await interaction.response.defer(ephemeral=True)
 
         async def progress(message: str) -> None:
@@ -2090,172 +1551,3 @@ async def movie_play(interaction: discord.Interaction, movie: str, name: str | N
                 await interaction.edit_original_response(content=message)
             except discord.HTTPException:
                 pass
-
-        # Use the supplied name immediately so the Discord message never has to
-        # display a generic M3U8 filename such as index-f2-v1-a1.
-        if display_name:
-            await progress(f"Preparing **{display_name}**...")
-
-        success, player_url, downloaded = await stream_m3u8_movie(movie, progress)
-
-        if not success or player_url is None:
-            await interaction.followup.send(
-                "I could not start that M3U8 movie.",
-                ephemeral=True,
-            )
-            return
-
-        channel = await get_movie_channel()
-        if channel is None:
-            await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send(
-                "The movie stream started, but the configured movie channel is unavailable.",
-                ephemeral=True,
-            )
-            return
-
-        movie_name = display_name or (downloaded.stem if downloaded is not None else "M3U8 Movie")
-        embed = discord.Embed(
-            title=f"Now Playing: {movie_name}",
-            description=(
-                "Your movie is ready to watch.\n\n"
-                f"[▶ Watch Movie]({player_url})"
-            ),
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(name="Format", value="MP4", inline=True)
-        embed.add_field(name="Playback", value="Streaming", inline=True)
-        embed.set_footer(
-            text="The embed player will be sent after the movie is done downloading. "
-                 "The link expires automatically when the movie finishes."
-        )
-
-        try:
-            posted_message = await channel.send(
-                content=(
-                    f"▶ **Now Playing:** {movie_name}\n"
-                    f"{player_url}"
-                ),
-                embed=embed,
-                suppress_embeds=False,
-            )
-            async with host_lock:
-                current = active_host
-                if current is not None:
-                    current["discord_message_id"] = posted_message.id
-                    current["discord_channel_id"] = channel.id
-            await interaction.followup.send(
-                f"Now streaming {movie_name} in {channel.mention}.",
-                ephemeral=True,
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send(
-                "The movie stream started, but I could not post the movie player.",
-                ephemeral=True,
-            )
-        return
-
-
-    if not get_movie_files():
-        await interaction.response.send_message(
-            "No movies are currently available.",
-            ephemeral=True,
-        )
-        return
-
-    selected = find_movie(movie)
-    if selected is None:
-        await interaction.response.send_message(
-            "That movie is not available. Use /movie list or provide an HTTP/HTTPS .m3u8 URL.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    async def progress(message: str) -> None:
-        try:
-            await interaction.edit_original_response(content=message)
-        except discord.HTTPException:
-            pass
-
-    await progress("Embedding movie...")
-    success, message = await host_movie(selected, progress)
-    if not success:
-        await interaction.followup.send(message, ephemeral=True)
-        return
-
-    channel = await get_movie_channel()
-    if channel is None:
-        await clear_hosted_movie(active_host["token"] if active_host else "")
-        await interaction.followup.send("The configured movie channel is unavailable.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"Now Playing: {selected.stem}",
-        description=(
-            "Your movie is ready to watch.\n\n"
-            f"[▶ Watch Movie]({message})"
-        ),
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(
-        name="Format",
-        value=selected.suffix.lower().lstrip(".").upper(),
-        inline=True,
-    )
-    embed.add_field(name="Playback", value="Streaming", inline=True)
-    embed.set_footer(text="This movie link expires automatically when the movie ends.")
-    try:
-        await channel.send(
-            content=f"▶ **Now Playing:** {selected.stem}\n{message}",
-            embed=embed,
-            suppress_embeds=False,
-        )
-        await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
-    except (discord.Forbidden, discord.HTTPException):
-        await clear_hosted_movie(active_host["token"] if active_host else "")
-        await interaction.followup.send("I could not post the movie player in the configured channel.", ephemeral=True)
-
-
-bot.tree.add_command(channel_group)
-bot.tree.add_command(movie_group)
-
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-) -> None:
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "You need administrator permissions to use that command."
-    elif isinstance(error, app_commands.CommandInvokeError):
-        logger.error("Command error: %r", error.original)
-        message = "Something went wrong while processing that command."
-    else:
-        logger.warning("Slash command error: %s", error)
-        message = "Something went wrong while processing that command."
-
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
-
-
-def main() -> None:
-    ensure_movies_dir()
-
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    if not token:
-        logger.error("DISCORD_TOKEN is missing from the environment.")
-        return
-
-    try:
-        bot.run(token)
-    except KeyboardInterrupt:
-        logger.info("Movie Bot stopped by user.")
-
-
-if __name__ == "__main__":
-    main()
