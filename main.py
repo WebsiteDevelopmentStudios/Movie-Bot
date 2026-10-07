@@ -1787,6 +1787,113 @@ async def connect_member_voice(interaction: discord.Interaction) -> discord.Voic
     return voice
 
 
+async def resolve_music_stream_url(track: dict) -> str | None:
+    """
+    Resolve a playable audio URL without downloading the entire song first.
+
+    This follows the same basic architecture as Lavalink-based music bots:
+    resolve the track, hand the voice player a network audio source, and let
+    FFmpeg continuously pull the audio. A local downloaded file remains the
+    final fallback for sources that cannot be streamed directly.
+    """
+    video_id = str(track.get("video_id") or "").strip()
+    webpage_url = str(
+        track.get("webpage_url")
+        or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
+    ).strip()
+
+    if not webpage_url:
+        return None
+
+    # Prefer yt-dlp for the actual media URL. Piped is still useful for
+    # searching, but its public instances are not reliable enough to be the
+    # primary playback transport.
+    try:
+        code, stdout, stderr = await run_yt_dlp(
+            [
+                "--no-playlist",
+                "--no-warnings",
+                "--skip-download",
+                "--get-url",
+                "--format", "bestaudio[ext=m4a]/bestaudio/best",
+                "--extractor-args", "youtube:player_client=web",
+                webpage_url,
+            ],
+            timeout=90,
+        )
+        if code == 0:
+            urls = [
+                line.strip()
+                for line in stdout.splitlines()
+                if line.strip().startswith(("http://", "https://"))
+            ]
+            if urls:
+                return urls[-1]
+        logger.warning(
+            "Could not resolve direct audio URL for %s: %s",
+            track.get("title", "unknown"),
+            stderr[-1500:],
+        )
+    except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
+        logger.warning("Direct audio URL lookup failed: %s", exc)
+
+    # If this was resolved by Piped, try its audio proxy as a second direct
+    # stream. FFmpeg can consume this URL without creating a local music file.
+    api_base = str(track.get("api_base") or "").rstrip("/")
+    if api_base and video_id:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{api_base}/streams/{video_id}",
+                    headers={"User-Agent": "Movie-Bot/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        streams = data.get("audioStreams") if isinstance(data, dict) else None
+                        if isinstance(streams, list):
+                            def stream_score(item: dict) -> tuple[int, int]:
+                                fmt = str(item.get("format") or "").casefold()
+                                codec = str(item.get("codec") or "").casefold()
+                                try:
+                                    bitrate = int(item.get("bitrate") or 0)
+                                except (TypeError, ValueError):
+                                    bitrate = 0
+                                score = 0
+                                if fmt in {"m4a", "mp4"}:
+                                    score += 30
+                                elif fmt in {"opus", "webm"}:
+                                    score += 20
+                                if "aac" in codec:
+                                    score += 10
+                                return score, bitrate
+
+                            streams = sorted(
+                                (
+                                    item for item in streams
+                                    if isinstance(item, dict)
+                                    and str(
+                                        item.get("proxyUrl")
+                                        or item.get("proxy_url")
+                                        or item.get("url")
+                                        or ""
+                                    ).strip()
+                                ),
+                                key=stream_score,
+                                reverse=True,
+                            )
+                            if streams:
+                                return str(
+                                    streams[0].get("proxyUrl")
+                                    or streams[0].get("proxy_url")
+                                    or streams[0].get("url")
+                                ).strip()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            logger.warning("Piped direct audio lookup failed: %s", exc)
+
+    return None
+
+
 async def start_track(guild_id: int) -> None:
     state = get_music_state(guild_id)
 
@@ -1799,8 +1906,15 @@ async def start_track(guild_id: int) -> None:
         track = state["queue"].pop(0)
         state["current"] = track
         source_path = track.get("path")
+        stream_url = str(track.get("stream_url") or "").strip()
 
-        if source_path is None or not source_path.exists():
+        if not stream_url and (source_path is None or not source_path.exists()):
+            # Older queued entries may only have a local path. New entries use
+            # direct network playback, which avoids waiting for the complete
+            # song to download before Discord starts receiving audio.
+            stream_url = await resolve_music_stream_url(track)
+
+        if not stream_url and (source_path is None or not source_path.exists()):
             state["current"] = None
             continue
 
@@ -1836,11 +1950,30 @@ async def start_track(guild_id: int) -> None:
             before_options = "-nostdin"
             if intro_offset > 0:
                 before_options += f" -ss {intro_offset:.3f}"
-            source = discord.FFmpegPCMAudio(
-                str(source_path),
-                before_options=before_options,
-                options="-vn",
-            )
+            if stream_url:
+                # Keep FFmpeg connected to the remote source instead of
+                # importing/downloading the entire track first. These
+                # reconnect flags are important for long songs and transient
+                # network interruptions.
+                stream_input = stream_url
+                before_options = (
+                    "-reconnect 1 "
+                    "-reconnect_streamed 1 "
+                    "-reconnect_at_eof 1 "
+                    "-reconnect_delay_max 5 "
+                    "-nostdin"
+                )
+                source = discord.FFmpegPCMAudio(
+                    stream_input,
+                    before_options=before_options,
+                    options="-vn -loglevel warning",
+                )
+            else:
+                source = discord.FFmpegPCMAudio(
+                    str(source_path),
+                    before_options=before_options,
+                    options="-vn",
+                )
             source = discord.PCMVolumeTransformer(source, volume=float(state["volume"]))
         except (discord.ClientException, OSError) as exc:
             logger.warning("Could not create audio source: %s", exc)
@@ -1971,18 +2104,33 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
             )
             return
 
-        await interaction.edit_original_response(content=f"Downloading **{track['title']}**...")
-        path = await download_music_audio(track)
-        if path is None:
-            await interaction.followup.send(
-                "I found the song, but could not download an audio source for playback.",
-                ephemeral=True,
-            )
-            return
+        await interaction.edit_original_response(content=f"Preparing **{track['title']}**...")
+        stream_url = await resolve_music_stream_url(track)
 
-        track["path"] = path
+        if stream_url:
+            # Store the direct stream URL in the queue entry. Playback can
+            # begin as soon as Discord connects instead of waiting for the
+            # complete song to be downloaded.
+            track["stream_url"] = stream_url
+        else:
+            # Keep the existing downloader as a compatibility fallback for
+            # sources where a direct stream URL cannot be resolved.
+            await interaction.edit_original_response(
+                content=f"Preparing a fallback audio file for **{track['title']}**..."
+            )
+            path = await download_music_audio(track)
+            if path is None:
+                await interaction.followup.send(
+                    "I found the song, but could not resolve a playable audio source.",
+                    ephemeral=True,
+                )
+                return
+            track["path"] = path
         state = get_music_state(interaction.guild.id)
-        was_playing = state.get("current") is not None
+        was_playing = (
+            state.get("current") is not None
+            or bool(state.get("play_task") and not state["play_task"].done())
+        )
         state["queue"].append(track)
         position = len(state["queue"])
 
