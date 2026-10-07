@@ -7,7 +7,7 @@ import re
 import secrets
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from html import escape
 
 import aiohttp
@@ -1229,11 +1229,13 @@ async def resolve_music_source(query: str) -> dict | None:
     if not search_query:
         return None
 
+    # Search several candidates. The first YouTube result is not always
+    # playable, while a nearby official/Topic upload often is.
     code, stdout, stderr = await run_yt_dlp([
         "--dump-single-json",
-        "--no-playlist",
+        "--flat-playlist",
         "--skip-download",
-        "--default-search", "ytsearch1",
+        "--default-search", "ytsearch5",
         search_query,
     ], timeout=60)
 
@@ -1250,28 +1252,61 @@ async def resolve_music_source(query: str) -> dict | None:
         return None
 
     entries = data.get("entries")
-    if isinstance(entries, list) and entries:
-        data = entries[0]
+    if not isinstance(entries, list):
+        entries = [data]
 
-    webpage_url = str(data.get("webpage_url") or data.get("original_url") or "").strip()
-    title = str(data.get("title") or (spotify_info or {}).get("title") or "").strip()
-    artist = str(
-        (spotify_info or {}).get("artist")
-        or data.get("artist")
-        or data.get("uploader")
-        or "Unknown Artist"
-    ).strip()
+    requested_title = str((spotify_info or {}).get("title") or "").casefold()
+    requested_artist = str((spotify_info or {}).get("artist") or "").casefold()
 
-    if not webpage_url or not title:
-        return None
+    def score(entry: dict) -> int:
+        title = str(entry.get("title") or "").casefold()
+        uploader = str(entry.get("uploader") or entry.get("channel") or "").casefold()
+        value = 0
+        if requested_title and requested_title in title:
+            value += 10
+        if requested_artist and requested_artist in title:
+            value += 8
+        if requested_artist and requested_artist in uploader:
+            value += 5
+        if any(word in title for word in ("official", "topic", "audio")):
+            value += 2
+        if any(word in title for word in ("live", "remix", "cover", "8d")):
+            value -= 3
+        return value
 
-    return {
-        "title": title,
-        "artist": artist,
-        "url": webpage_url,
-        "duration": data.get("duration"),
-        "spotify_url": (spotify_info or {}).get("spotify_url"),
-    }
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    entries.sort(key=score, reverse=True)
+
+    for entry in entries:
+        webpage_url = str(
+            entry.get("webpage_url")
+            or entry.get("url")
+            or entry.get("original_url")
+            or ""
+        ).strip()
+        if not webpage_url:
+            continue
+
+        title = str(entry.get("title") or (spotify_info or {}).get("title") or "").strip()
+        artist = str(
+            (spotify_info or {}).get("artist")
+            or entry.get("artist")
+            or entry.get("uploader")
+            or entry.get("channel")
+            or "Unknown Artist"
+        ).strip()
+        if not title:
+            continue
+
+        return {
+            "title": title,
+            "artist": artist,
+            "url": webpage_url,
+            "duration": entry.get("duration"),
+            "spotify_url": (spotify_info or {}).get("spotify_url"),
+        }
+
+    return None
 
 
 async def download_music_audio(track: dict) -> Path | None:
@@ -1279,14 +1314,17 @@ async def download_music_audio(track: dict) -> Path | None:
     token = secrets.token_hex(12)
     output_template = MUSIC_CACHE_DIR / f"{token}.%(ext)s"
 
+    # Keep the source audio in its native format. This avoids an extra
+    # post-processing conversion step that can make otherwise playable songs
+    # fail. FFmpeg can decode m4a/webm/opus/wav directly.
     code, _, stderr = await run_yt_dlp([
         "--no-playlist",
-        "--format", "bestaudio/best",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
+        "--format", "bestaudio[ext=m4a]/bestaudio/best",
         "--output", str(output_template),
         "--no-part",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "--extractor-args", "youtube:player_client=android,web",
         track["url"],
     ], timeout=15 * 60)
 
@@ -1298,33 +1336,70 @@ async def download_music_audio(track: dict) -> Path | None:
     return next(
         (
             path for path in candidates
-            if path.is_file() and path.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".wav"}
+            if path.is_file() and path.suffix.lower() in {
+                ".mp3", ".m4a", ".webm", ".opus", ".wav", ".aac", ".flac"
+            }
         ),
         None,
     )
 
 
 async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
-    artist = track.get("artist", "")
-    title = track.get("title", "")
+    artist = str(track.get("artist", "")).strip()
+    title = str(track.get("title", "")).strip()
     if not title:
         return []
 
     async with aiohttp.ClientSession() as session:
-        data = await fetch_json(
+        # LRCLIB's exact lookup is much more reliable than a broad search.
+        exact = await fetch_json(
             session,
-            LRCLIB_SEARCH_URL,
-            params={"q": f"{artist} {title}"},
+            "https://lrclib.net/api/get",
+            params={
+                "artist_name": artist,
+                "track_name": title,
+            },
         )
 
-    if not isinstance(data, list):
-        return []
+        candidates = []
+        if isinstance(exact, dict):
+            candidates.append(exact)
 
+        if not candidates or not str(candidates[0].get("syncedLyrics") or "").strip():
+            data = await fetch_json(
+                session,
+                LRCLIB_SEARCH_URL,
+                params={"q": f"{artist} {title}"},
+            )
+            if isinstance(data, list):
+                candidates.extend(item for item in data if isinstance(item, dict))
+
+    artist_key = re.sub(r"[^a-z0-9]+", "", artist.casefold())
+    title_key = re.sub(r"[^a-z0-9]+", "", title.casefold())
+
+    def lyric_score(item: dict) -> int:
+        item_artist = re.sub(
+            r"[^a-z0-9]+", "", str(item.get("artistName") or "").casefold()
+        )
+        item_title = re.sub(
+            r"[^a-z0-9]+", "", str(item.get("trackName") or "").casefold()
+        )
+        score = 0
+        if item_title == title_key:
+            score += 20
+        elif title_key and title_key in item_title:
+            score += 10
+        if item_artist == artist_key:
+            score += 20
+        elif artist_key and artist_key in item_artist:
+            score += 10
+        if str(item.get("syncedLyrics") or "").strip():
+            score += 30
+        return score
+
+    candidates.sort(key=lyric_score, reverse=True)
     best = next(
-        (
-            item for item in data
-            if isinstance(item, dict) and str(item.get("syncedLyrics") or "").strip()
-        ),
+        (item for item in candidates if str(item.get("syncedLyrics") or "").strip()),
         None,
     )
     if best is None:
@@ -1424,6 +1499,14 @@ async def start_track(guild_id: int) -> None:
             state["current"] = None
             continue
 
+        # Fetch lyrics before starting the audio. Previously this happened
+        # after voice.play(), so a slow lyrics API could make the first line late.
+        try:
+            lyrics = await fetch_lyrics(track)
+        except Exception as exc:
+            logger.warning("Lyrics lookup failed: %s", exc)
+            lyrics = []
+
         try:
             source = discord.FFmpegPCMAudio(
                 str(source_path),
@@ -1446,14 +1529,19 @@ async def start_track(guild_id: int) -> None:
                 loop.call_soon_threadsafe(finished.set)
 
         voice.play(source, after=after_play)
-        started_at = asyncio.get_running_loop().time()
-        lyrics_task = asyncio.create_task(lyrics_loop(guild_id, voice.channel, track, started_at))
+        # A tiny scheduling allowance compensates for the voice client's initial
+        # audio buffering without noticeably advancing the lyrics.
+        started_at = asyncio.get_running_loop().time() - 0.15
+        lyrics_task = (
+            asyncio.create_task(lyrics_loop(guild_id, voice.channel, track, started_at))
+            if lyrics else None
+        )
         state["lyrics_task"] = lyrics_task
 
         try:
             await finished.wait()
         finally:
-            if state.get("lyrics_task") is lyrics_task:
+            if lyrics_task is not None and state.get("lyrics_task") is lyrics_task:
                 lyrics_task.cancel()
                 try:
                     await lyrics_task
@@ -1717,6 +1805,60 @@ def safe_download_name(url: str) -> str:
     return candidate.name
 
 
+async def probe_m3u8_duration(url: str) -> float | None:
+    """Try to calculate total duration directly from a VOD M3U8 playlist."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/140 Safari/537.36",
+        "Accept": "*/*",
+    }
+
+    async def fetch_playlist(session, playlist_url: str) -> tuple[str, str] | None:
+        try:
+            async with session.get(
+                playlist_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                if response.status != 200:
+                    return None
+                return await response.text(), str(response.url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            first = await fetch_playlist(session, url)
+            if first is None:
+                return None
+            text, final_url = first
+
+            # Master playlist: use the first variant and inspect that media playlist.
+            if "#EXT-X-STREAM-INF" in text:
+                variant = None
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        variant = line
+                        break
+                if variant:
+                    variant_url = __import__("urllib.parse", fromlist=["urljoin"]).urljoin(
+                        final_url, variant
+                    )
+                    second = await fetch_playlist(session, variant_url)
+                    if second is None:
+                        return None
+                    text, final_url = second
+
+            values = re.findall(r"#EXTINF:([0-9]+(?:\.[0-9]+)?),", text)
+            if not values:
+                return None
+            total = sum(float(value) for value in values)
+            return total if total > 0 else None
+    except Exception:
+        return None
+
+
 async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | None]:
     """Download the complete M3U8 movie, show progress, then prepare two-part hosting."""
     global active_host
@@ -1735,23 +1877,9 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
     filename = safe_download_name(url)
     output = MOVIES_DIR / filename
 
-    # Use FFmpeg's normal M3U8 path only. No secondary/fallback downloader.
-    try:
-        probe = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            "-protocol_whitelist", "http,https,tcp,tls,crypto",
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        probe_stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=60)
-        duration = float(probe_stdout.decode("utf-8", errors="replace").strip())
-        if probe.returncode != 0 or duration <= 0:
-            duration = None
-    except (FileNotFoundError, OSError, ValueError, asyncio.TimeoutError):
-        duration = None
+    # ffprobe can fail on signed CDN URLs even when FFmpeg can play them.
+    # Parse the VOD playlist as a second way to obtain an accurate duration.
+    duration = await probe_m3u8_duration(url)
 
     async with host_lock:
         if active_host is not None:
@@ -1789,7 +1917,7 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         ffmpeg_stderr_task = asyncio.create_task(_collect_ffmpeg_stderr(process, ffmpeg_stderr_lines))
 
         async def monitor_download() -> None:
-            last_percent = -1
+            last_percent = None
             if process.stdout is None:
                 return
             try:
@@ -1798,17 +1926,25 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
                     if not line:
                         break
                     value = line.decode("utf-8", errors="replace").strip()
-                    if not value.startswith("out_time_ms=") or duration is None:
+                    if not value.startswith("out_time_ms="):
                         continue
                     try:
                         media_time = int(value.split("=", 1)[1]) / 1_000_000
                     except ValueError:
                         continue
-                    percent = max(0, min(99, int((media_time / duration) * 100)))
-                    if percent != last_percent:
-                        last_percent = percent
+
+                    if duration:
+                        percent = max(0, min(99, int((media_time / duration) * 100)))
+                        display = f"{percent}%"
+                    else:
+                        # Signed/odd CDN playlists sometimes hide duration from
+                        # ffprobe. Still show real progress instead of 0% forever.
+                        display = f"{int(media_time // 60)}m {int(media_time % 60):02d}s"
+
+                    if display != last_percent:
+                        last_percent = display
                         if progress is not None:
-                            await progress(f"Downloading movie... {percent}%")
+                            await progress(f"Downloading movie... {display}")
             except asyncio.CancelledError:
                 raise
             except (OSError, RuntimeError):
@@ -1824,38 +1960,29 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         }
         active_host["task"] = asyncio.create_task(finish_m3u8_host(token, process, playlist, output))
 
-    await process.wait()
-    await progress_task
+    # Do not wait for the whole movie here. As soon as FFmpeg has created a
+    # usable local HLS playlist, return the player URL and let the background
+    # task finish the download/remux. This makes playback start while downloading.
+    for _ in range(120):
+        if playlist.exists() and playlist.stat().st_size > 0:
+            if progress is not None:
+                await progress("Movie stream ready. You can watch it now.")
+            logger.info("M3U8 playback is ready: %s", playlist)
+            return True, f"{PUBLIC_BASE_URL}/movie/{token}", None
 
-    if process.returncode != 0:
-        error_text = "\n".join(ffmpeg_stderr_lines[-50:])
-        logger.error("FFmpeg M3U8 download failed with code %s: %s",
-                     process.returncode, error_text[-5000:] or "(no stderr output)")
-        await clear_hosted_movie(token, reason="M3U8 download failed")
-        return False, "FFmpeg could not finish downloading the M3U8 movie. Check the bot console for the FFmpeg error.", None
+        if process.returncode is not None:
+            error_text = "\n".join(ffmpeg_stderr_lines[-50:])
+            logger.error(
+                "FFmpeg M3U8 download failed before playback became ready: %s",
+                error_text[-5000:] or "(no stderr output)",
+            )
+            await clear_hosted_movie(token, reason="M3U8 download failed before playback")
+            return False, "FFmpeg could not start playback for this M3U8 movie. Check the bot console.", None
 
-    if progress is not None:
-        await progress("Downloading movie... 100%")
-        await progress("Preparing movie...")
+        await asyncio.sleep(0.5)
 
-    finish_task = active_host.get("task") if active_host is not None else None
-    if finish_task is not None and finish_task is not asyncio.current_task():
-        try:
-            await finish_task
-        except asyncio.CancelledError:
-            return False, "The movie preparation was cancelled.", None
-
-    current = active_host
-    if current is None or current.get("token") != token:
-        return False, "The movie host ended before the movie could be prepared.", None
-    if not output.exists() or output.stat().st_size == 0:
-        await clear_hosted_movie(token, reason="M3U8 movie preparation failed")
-        return False, "The movie downloaded, but could not be prepared for playback.", None
-
-    if progress is not None:
-        await progress("Embedding movie...")
-    logger.info("M3U8 movie download complete: %s", output.name)
-    return True, f"{PUBLIC_BASE_URL}/movie/{token}", output
+    await clear_hosted_movie(token, reason="M3U8 playback did not start")
+    return False, "The M3U8 stream did not become playable in time.", None
 
 
 async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: list[str]) -> None:
