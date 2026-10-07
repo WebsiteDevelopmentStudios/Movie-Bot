@@ -1538,6 +1538,10 @@ async def download_m3u8_segments(
                 logger.warning(
                     "M3U8 CDN returned repeated HTTP 403 responses; switching to FFmpeg fallback."
                 )
+                (hls_dir / "playlist.m3u8").unlink(missing_ok=True)
+                (hls_dir / "playlist.m3u8.tmp").unlink(missing_ok=True)
+                for partial in hls_dir.glob("segment-*"):
+                    partial.unlink(missing_ok=True)
             else:
                 logger.warning(
                     "Parallel M3U8 download failed: %s; falling back to FFmpeg.",
@@ -1566,6 +1570,9 @@ async def download_m3u8_with_ffmpeg(
     """Fallback HLS downloader for CDNs that reject individual aiohttp requests."""
     hls_dir.mkdir(parents=True, exist_ok=True)
     playlist = hls_dir / "playlist.m3u8"
+    playlist.unlink(missing_ok=True)
+    for partial in hls_dir.glob("segment-*"):
+        partial.unlink(missing_ok=True)
     origin_url = media_url or url
     parsed = urlparse(origin_url)
     headers = (
