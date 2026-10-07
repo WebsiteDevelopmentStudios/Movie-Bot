@@ -1201,11 +1201,15 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # This works even when the pip-installed yt-dlp executable is not on PATH.
+    # Explicitly select Deno for YouTube's current JavaScript challenge
+    # solver. Render installs Deno during the image build, but yt-dlp will
+    # not automatically use it unless the runtime is explicitly selected.
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
         "yt_dlp",
+        "--js-runtimes",
+        "deno",
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
