@@ -1482,7 +1482,7 @@ async def download_m3u8_segments(
             temp.replace(hls_dir / "playlist.m3u8")
 
         async def worker(index: int) -> None:
-            nonlocal completed_bytes
+            nonlocal completed_bytes, forbidden_count
             segment_url = segments[index][1]
             target = hls_dir / segment_names[index]
 
@@ -1578,7 +1578,7 @@ async def download_m3u8_with_ffmpeg(
     process = await asyncio.create_subprocess_exec(
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-headers", headers,
-        "-i", url,
+        "-i", origin_url,
         "-c", "copy",
         "-f", "hls",
         "-hls_time", "6",
