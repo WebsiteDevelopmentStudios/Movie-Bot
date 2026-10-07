@@ -38,10 +38,12 @@ async function verifyDiscordRequest(request, publicKeyHex) {
   }
 }
 
-function deferredResponse() {
-  return new Response(JSON.stringify({ type: 5 }), {
-    headers: { "Content-Type": "application/json" },
-  });
+function interactionResponse(payload) {
+  if (payload.type === 2) return { type: 5 };
+  if (payload.type === 3) return { type: 6 };
+  if (payload.type === 4) return { type: 8, data: { choices: [] } };
+  if (payload.type === 5) return { type: 5 };
+  return { type: 5 };
 }
 
 export default {
@@ -80,10 +82,12 @@ export default {
         },
         body: JSON.stringify(payload),
       }).catch(() => {
-        // Render may be cold-starting; the deferred Discord response is already sent.
+        // Render may be cold-starting; Discord already received its ACK.
       }),
     );
 
-    return deferredResponse();
+    return new Response(JSON.stringify(interactionResponse(payload)), {
+      headers: { "Content-Type": "application/json" },
+    });
   },
 };
