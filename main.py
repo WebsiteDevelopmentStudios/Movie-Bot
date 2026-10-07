@@ -237,16 +237,10 @@ class MovieConfirmView(discord.ui.View):
             await interaction.edit_original_response(content="The configured movie channel is unavailable.", view=self)
             return
 
-        embed = discord.Embed(
-            title=f"Now Playing: {self.movie.stem}",
-            description=f"[▶ Watch Movie]({message})",
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(name="Format", value=self.movie.suffix.lower().lstrip(".").upper())
-        embed.set_footer(text="This movie link expires automatically when the movie ends.")
-
         try:
-            await channel.send(content=message, embed=embed)
+            await channel.send(
+                content=f"▶ **Now Playing:** {self.movie.stem}\n{message}"
+            )
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
             await interaction.edit_original_response(content="I could not post the movie player in the configured channel.", view=self)
@@ -2352,32 +2346,11 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
             return
 
         movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
-        embed = discord.Embed(
-            title=f"Now Playing: {movie_name}",
-            description=(
-                "Your movie is ready to watch.\n\n"
-                f"[▶ Watch Movie]({player_url})"
-            ),
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(name="Format", value="MP4", inline=True)
-        embed.add_field(name="Playback", value="Streaming", inline=True)
-        embed.set_footer(
-            text="Playback starts while the movie is still downloading. "
-                 "The link expires automatically when the movie finishes."
-        )
-
         try:
-            # The web-player URL is valid immediately. Do not post the
-            # /media URL until the MP4 exists, because Discord can cache an
-            # early 404 and keep showing a broken preview.
+            # Keep the Discord message simple for now. The player/embed
+            # presentation can be improved separately later.
             await channel.send(
-                content=(
-                    f"▶ **Now Playing:** {movie_name}\n"
-                    f"{player_url}"
-                ),
-                embed=embed,
-                suppress_embeds=False,
+                content=f"▶ **Now Playing:** {movie_name}\n{player_url}"
             )
             await interaction.followup.send(
                 f"Now streaming {movie_name} in {channel.mention}.",
@@ -2427,26 +2400,11 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         await interaction.followup.send("The configured movie channel is unavailable.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title=f"Now Playing: {selected.stem}",
-        description=(
-            "Your movie is ready to watch.\n\n"
-            f"[▶ Watch Movie]({message})"
-        ),
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(
-        name="Format",
-        value=selected.suffix.lower().lstrip(".").upper(),
-        inline=True,
-    )
-    embed.add_field(name="Playback", value="Streaming", inline=True)
-    embed.set_footer(text="This movie link expires automatically when the movie ends.")
     try:
+        # Plain URL for now. Discord's native media preview can be revisited
+        # later without changing the hosting/player architecture.
         await channel.send(
-            content=f"▶ **Now Playing:** {selected.stem}\n{message}",
-            embed=embed,
-            suppress_embeds=False,
+            content=f"▶ **Now Playing:** {selected.stem}\n{message}"
         )
         await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
     except (discord.Forbidden, discord.HTTPException):
