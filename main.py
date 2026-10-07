@@ -1450,6 +1450,8 @@ async def download_m3u8_segments(
         lock = asyncio.Lock()
         completed_bytes = 0
         started_at = asyncio.get_running_loop().time()
+        forbidden_count = 0
+        fallback_requested = asyncio.Event()
 
         async def write_playlist(final: bool = False) -> None:
             count = 0
@@ -1509,11 +1511,21 @@ async def download_m3u8_segments(
                 except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                     target.unlink(missing_ok=True)
                     if isinstance(exc, aiohttp.ClientResponseError) and exc.status == 403:
+                        async with lock:
+                            forbidden_count += 1
+                            current_forbidden = forbidden_count
                         logger.warning(
-                            "Segment %d was rejected with HTTP 403; "
-                            "retrying with CDN-compatible headers.",
+                            "Segment %d was rejected with HTTP 403 (%d blocked requests).",
                             index + 1,
+                            current_forbidden,
                         )
+                        if current_forbidden >= 3:
+                            fallback_requested.set()
+                            raise RuntimeError("Too many HTTP 403 responses; switching to FFmpeg.")
+                        if attempt < 1:
+                            await asyncio.sleep(0.5)
+                            continue
+                        raise RuntimeError(f"segment {index + 1} failed with HTTP 403") from exc
                     if attempt == 3:
                         raise RuntimeError(f"segment {index + 1} failed: {exc}") from exc
                     await asyncio.sleep(1.5 * (attempt + 1))
@@ -1522,10 +1534,15 @@ async def download_m3u8_segments(
             await asyncio.gather(*(worker(index) for index in range(len(segments))))
             await write_playlist(final=True)
         except Exception as exc:
-            logger.warning(
-                "Parallel M3U8 download failed: %s; falling back to FFmpeg.",
-                exc,
-            )
+            if fallback_requested.is_set():
+                logger.warning(
+                    "M3U8 CDN returned repeated HTTP 403 responses; switching to FFmpeg fallback."
+                )
+            else:
+                logger.warning(
+                    "Parallel M3U8 download failed: %s; falling back to FFmpeg.",
+                    exc,
+                )
             return await download_m3u8_with_ffmpeg(
                 url,
                 hls_dir,
