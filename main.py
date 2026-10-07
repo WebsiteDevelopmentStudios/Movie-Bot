@@ -1940,12 +1940,35 @@ async def stream_m3u8_movie(url: str, progress=None) -> tuple[bool, str, Path | 
         hls_dir.mkdir(parents=True, exist_ok=False)
         playlist = hls_dir / "playlist.m3u8"
 
+        parsed_url = urlparse(url)
+        origin = f"{parsed_url.scheme}://{parsed_url.netloc}/"
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+        request_headers = (
+            f"User-Agent: {user_agent}\r\n"
+            f"Referer: {origin}\r\n"
+            "Accept: */*\r\n"
+            "Connection: keep-alive\r\n"
+        )
+
         try:
             process = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-                "-protocol_whitelist", "http,https,tcp,tls,crypto",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
                 "-allowed_extensions", "ALL", "-extension_picky", "0",
-                "-http_persistent", "1", "-i", url,
+                "-user_agent", user_agent,
+                "-referer", origin,
+                "-headers", request_headers,
+                "-http_persistent", "1",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-rw_timeout", "30000000",
+                "-i", url,
                 "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
                 "-start_number", "0", "-hls_time", "2", "-hls_list_size", "0",
                 "-hls_playlist_type", "vod",
