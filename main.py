@@ -1861,26 +1861,36 @@ async def finish_m3u8_host(
                     if channel is not None:
                         direct_media_url = f"{PUBLIC_BASE_URL}/cdn/{token}.mp4"
 
+                        final_embed = discord.Embed(
+                            title=f"Now Playing: {output.stem}",
+                            description=f"[▶ Watch Movie]({direct_media_url})",
+                            color=discord.Color.blurple(),
+                        )
+
                         if message_id:
                             try:
                                 old_message = await channel.fetch_message(message_id)
-                                await old_message.delete()
-                            except discord.NotFound:
-                                pass
-                            except discord.HTTPException as exc:
-                                logger.warning(
-                                    "Could not delete temporary movie player message for %s: %s",
-                                    token,
-                                    exc,
+                                await old_message.edit(
+                                    content=f"▶ **Now Playing:** {output.stem}",
+                                    embed=final_embed,
+                                    suppress_embeds=False,
                                 )
+                            except discord.NotFound:
+                                await channel.send(
+                                    content=f"▶ **Now Playing:** {output.stem}",
+                                    embed=final_embed,
+                                    suppress_embeds=False,
+                                )
+                        else:
+                            await channel.send(
+                                content=f"▶ **Now Playing:** {output.stem}",
+                                embed=final_embed,
+                                suppress_embeds=False,
+                            )
 
-                        await channel.send(
-                            content=f"▶ **Now Playing:** {output.stem}\n{direct_media_url}",
-                            suppress_embeds=False,
-                        )
                         preview_posted = True
                         logger.info(
-                            "Posted fresh direct MP4 URL for Discord media preview: %s",
+                            "Updated movie embed with final title and direct MP4 URL: %s",
                             token,
                         )
                         break
