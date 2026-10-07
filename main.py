@@ -1283,15 +1283,84 @@ async def piped_instances() -> list[str]:
     return discovered[:8]
 
 
+async def yt_dlp_search_candidates(search_query: str, spotify_info: dict | None) -> list[dict]:
+    """Search YouTube as a fallback when public Piped instances are unavailable."""
+    search_variants = [search_query]
+    if spotify_info:
+        title = str(spotify_info.get("title") or "").strip()
+        artist = str(spotify_info.get("artist") or "").strip()
+        if title:
+            search_variants.append(f"{title} {artist} official audio".strip())
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    for variant in search_variants:
+        try:
+            code, stdout, stderr = await run_yt_dlp(
+                [
+                    "--flat-playlist",
+                    "--dump-single-json",
+                    "--skip-download",
+                    "--no-warnings",
+                    "--extractor-args", "youtube:player_client=web",
+                    f"ytsearch8:{variant}",
+                ],
+                timeout=90,
+            )
+        except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
+            logger.warning("yt-dlp fallback search failed: %s", exc)
+            continue
+
+        if code != 0:
+            logger.warning("yt-dlp fallback search failed: %s", stderr[-1500:])
+            continue
+
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            continue
+
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            continue
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            video_id = str(entry.get("id") or "").strip()
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+
+            title = str(entry.get("title") or "").strip()
+            if not title:
+                continue
+
+            candidates.append({
+                "title": title,
+                "artist": str(entry.get("channel") or entry.get("uploader") or "").strip()
+                    or ((spotify_info or {}).get("artist") if spotify_info else "")
+                    or "Unknown Artist",
+                "video_id": video_id,
+                "webpage_url": str(
+                    entry.get("webpage_url")
+                    or f"https://www.youtube.com/watch?v={video_id}"
+                ),
+                "duration": entry.get("duration"),
+                "spotify_url": (spotify_info or {}).get("spotify_url"),
+                "source": "yt-dlp",
+            })
+
+    return candidates
+
+
 async def resolve_music_source(query: str) -> dict | None:
     spotify_info = await resolve_spotify_track(query) if spotify_track_url(query) else None
     search_query = spotify_info["search"] if spotify_info else query.strip()
     if not search_query:
         return None
 
-    # YouTube is currently returning HTTP 429 to Render. Piped performs the
-    # search through its own API so Render does not have to make YouTube
-    # search/player requests directly.
     instances = await piped_instances()
     candidates: list[dict] = []
 
@@ -1305,9 +1374,11 @@ async def resolve_music_source(query: str) -> dict | None:
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as response:
                     if response.status != 200:
+                        logger.warning("Piped search %s returned HTTP %s", api_base, response.status)
                         continue
                     data = await response.json(content_type=None)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                logger.warning("Piped search failed for %s: %s", api_base, exc)
                 continue
 
             if not isinstance(data, list):
@@ -1344,6 +1415,12 @@ async def resolve_music_source(query: str) -> dict | None:
 
             if candidates:
                 break
+
+    # If Piped is unavailable, use yt-dlp directly as a fallback. This keeps
+    # normal song searches and Spotify track URLs working even when every
+    # public Piped instance is down or rate-limited.
+    if not candidates:
+        candidates = await yt_dlp_search_candidates(search_query, spotify_info)
 
     if not candidates:
         return None
@@ -1404,10 +1481,51 @@ async def download_music_audio(track: dict) -> Path | None:
         if isinstance(candidate, dict)
     ]
 
-    # Ask the Piped instance for the audio stream. Prefer proxyUrl when the
-    # instance supplies one so the actual media request stays on the instance.
+    # Prefer Piped when it is available, but allow yt-dlp search candidates
+    # to download directly when Piped is unavailable.
     async with aiohttp.ClientSession() as session:
         for attempt, candidate in enumerate(candidates, start=1):
+            if candidate.get("source") == "yt-dlp":
+                webpage_url = str(candidate.get("webpage_url") or "").strip()
+                if not webpage_url:
+                    continue
+
+                token = secrets.token_hex(12)
+                output_template = str(MUSIC_CACHE_DIR / f"{token}.%(ext)s")
+                try:
+                    code, stdout, stderr = await run_yt_dlp(
+                        [
+                            "--no-playlist",
+                            "--no-warnings",
+                            "--no-progress",
+                            "--extractor-args", "youtube:player_client=web",
+                            "--format", "bestaudio[ext=m4a]/bestaudio/best",
+                            "--output", output_template,
+                            webpage_url,
+                        ],
+                        timeout=10 * 60,
+                    )
+                except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
+                    logger.warning("yt-dlp audio download failed for %s: %s", candidate.get("title", "unknown"), exc)
+                    continue
+
+                if code == 0:
+                    downloaded = next(
+                        (
+                            path for path in MUSIC_CACHE_DIR.glob(f"{token}.*")
+                            if path.is_file() and not path.name.endswith(".part")
+                        ),
+                        None,
+                    )
+                    if downloaded is not None and downloaded.stat().st_size > 0:
+                        return downloaded
+
+                logger.warning(
+                    "yt-dlp audio download failed for %s: %s",
+                    candidate.get("title", "unknown"),
+                    stderr[-1500:],
+                )
+                continue
             api_base = str(candidate.get("api_base") or "").rstrip("/")
             video_id = str(candidate.get("video_id") or "").strip()
             if not api_base or not video_id:
