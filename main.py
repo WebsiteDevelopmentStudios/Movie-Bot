@@ -30,7 +30,7 @@ HOST_EXPIRY_BUFFER_SECONDS = 30
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://moviebot.devs.surf").strip().rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://MineBot.wisp.uno").strip().rstrip("/")
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
 active_host = None
