@@ -3,3 +3,4 @@ python-dotenv>=1.1,<2
 aiohttp>=3.12,<4
 PyNaCl>=1.5,<2
 yt-dlp>=2025.1.0
+davey>=0.1.0
