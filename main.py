@@ -1598,7 +1598,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         embed.add_field(name="Format", value="MP4", inline=True)
         embed.add_field(name="Playback", value="Streaming", inline=True)
         embed.set_footer(
-            text="Playback starts while the movie is still downloading. "
+            text="The embed player will be sent after the movie is done downloading. "
                  "The link expires automatically when the movie finishes."
         )
 
