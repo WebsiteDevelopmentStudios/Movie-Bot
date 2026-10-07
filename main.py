@@ -1521,11 +1521,11 @@ async def finish_m3u8_host(
             message_id = current.get("discord_message_id")
             channel_id = current.get("discord_channel_id")
 
-        # Discord may cache the first URL it unfurls. While the M3U8 is
-        # downloading, /media/<token> intentionally redirects to the web
-        # player, so do not give Discord the direct-media URL until the MP4
-        # actually exists. Editing the message after completion gives Discord
-        # a fresh direct MP4 URL to unfurl.
+        # Discord caches URL previews aggressively. The first message contains
+        # the HTML player URL because the MP4 does not exist yet. Once the
+        # download is complete, replace that message with a fresh Discord
+        # message containing ONLY the direct .mp4 URL. This gives Discord's
+        # media crawler a fresh URL that resolves directly to video/mp4.
         if message_id and channel_id and output.exists():
             try:
                 channel = bot.get_channel(channel_id)
@@ -1533,23 +1533,19 @@ async def finish_m3u8_host(
                     fetched = await bot.fetch_channel(channel_id)
                     channel = fetched if isinstance(fetched, discord.TextChannel) else None
                 if channel is not None:
-                    message = await channel.fetch_message(message_id)
+                    old_message = await channel.fetch_message(message_id)
                     direct_media_url = f"{PUBLIC_BASE_URL}/cdn/{token}.mp4"
-                    embed = discord.Embed(
-                        title=f"Now Playing: {output.stem}",
-                        description=f"[▶ Watch Movie]({f'{PUBLIC_BASE_URL}/movie/{token}'})",
-                        color=discord.Color.blurple(),
+                    try:
+                        await old_message.delete()
+                    except discord.HTTPException:
+                        pass
+                    await channel.send(
+                        content=f"▶ **Now Playing:** {output.stem}\\n{direct_media_url}",
+                        suppress_embeds=False,
                     )
-                    embed.add_field(name="Format", value="MP4", inline=True)
-                    embed.add_field(name="Playback", value="Streaming", inline=True)
-                    embed.set_footer(text="Direct video preview is now available.")
-                    await message.edit(
-                        content=f"▶ **Now Playing:** {output.stem}\n{direct_media_url}",
-                        embed=embed,
-                    )
-                    logger.info("Updated Discord movie message with direct MP4 preview: %s", token)
+                    logger.info("Posted fresh direct MP4 URL for Discord media preview: %s", token)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                logger.warning("Could not update Discord movie embed for %s: %s", token, exc)
+                logger.warning("Could not post direct Discord movie preview for %s: %s", token, exc)
 
         await asyncio.sleep(DISCORD_EMBED_GRACE_SECONDS)
         await clear_hosted_movie(token, reason="completed movie expired")
