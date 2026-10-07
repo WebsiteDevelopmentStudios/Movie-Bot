@@ -1230,19 +1230,55 @@ async def resolve_music_source(query: str) -> dict | None:
     if not search_query:
         return None
 
-    # Search several candidates so one unavailable/restricted YouTube upload
-    # does not make the entire song fail.
-    code, stdout, stderr = await run_yt_dlp([
-        "--dump-single-json",
-        "--flat-playlist",
-        "--skip-download",
-        "--default-search", "ytsearch8",
-        "--remote-components", "ejs:github",
-        search_query,
-    ], timeout=60)
+    async def search_candidates(search_term: str, source: str) -> list[dict]:
+        if source == "soundcloud":
+            search_target = f"scsearch8:{search_term}"
+            extra_args = []
+        else:
+            search_target = search_term
+            extra_args = [
+                "--default-search", "ytsearch8",
+                "--remote-components", "ejs:github",
+            ]
 
-    if code != 0:
-        logger.warning("yt-dlp search failed: %s", stderr[-2000:])
+        code, stdout, stderr = await run_yt_dlp([
+            "--dump-single-json",
+            "--flat-playlist",
+            "--skip-download",
+            *extra_args,
+            search_target,
+        ], timeout=60)
+
+        if code != 0:
+            logger.warning("%s music search failed: %s", source, stderr[-2000:])
+            return []
+
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        entries = data.get("entries")
+        if not isinstance(entries, list):
+            entries = [data]
+
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    # SoundCloud is tried first because it does not require YouTube's
+    # browser/challenge authentication and is much less likely to reject a
+    # hosted Render IP. YouTube remains a fallback for tracks that are not
+    # available on SoundCloud.
+    entries = await search_candidates(search_query, "soundcloud")
+    source_name = "SoundCloud"
+
+    if not entries:
+        entries = await search_candidates(search_query, "youtube")
+        source_name = "YouTube"
+
+    if not entries:
         return None
 
     try:
@@ -1340,13 +1376,14 @@ async def resolve_music_source(query: str) -> dict | None:
             "url": webpage_url,
             "duration": entry.get("duration"),
             "spotify_url": (spotify_info or {}).get("spotify_url"),
+            "source": source_name,
         })
 
     if not candidates:
         return None
 
     # Keep the best candidate as the main track, but retain alternatives for
-    # the downloader to try if YouTube rejects a particular upload.
+    # the downloader to try if a particular upload is unavailable.
     primary = candidates[0]
     primary["alternatives"] = candidates[1:8]
     return primary
@@ -1360,22 +1397,13 @@ async def download_music_audio(track: dict) -> Path | None:
         if isinstance(candidate, dict)
     ]
 
-    # Do not force a YouTube player client. YouTube currently gives some
-    # clients thumbnail/image formats only. Let yt-dlp choose the working
-    # client and available audio formats, with the EJS challenge solver
-    # enabled by yt-dlp[default].
+    # SoundCloud is the preferred source. YouTube is retained only as a
+    # fallback because hosted Render IPs are frequently challenged with
+    # 429/403 responses and "Sign in to confirm you're not a bot".
+    # The candidates list already contains only one source at a time, so
+    # profiles are kept deliberately simple and source-neutral.
     download_profiles = [
-        [
-            "--format", "bestaudio/best",
-        ],
-        [
-            "--format", "bestaudio/best",
-            "--extractor-args", "youtube:player_client=web_safari",
-        ],
-        [
-            "--format", "bestaudio/best",
-            "--extractor-args", "youtube:player_client=mweb",
-        ],
+        ["--format", "bestaudio/best"],
     ]
 
     for attempt, candidate in enumerate(candidates, start=1):
@@ -1407,17 +1435,19 @@ async def download_music_audio(track: dict) -> Path | None:
                 if files:
                     if attempt > 1 or profile_index > 1:
                         logger.info(
-                            "Using fallback YouTube source/profile %d for %s",
+                            "Using fallback %s source/profile %d for %s",
+                            candidate.get("source", "audio"),
                             profile_index,
                             candidate.get("title", "unknown"),
                         )
                     return files[0]
 
             logger.warning(
-                "yt-dlp audio attempt %d/profile %d failed for %s: %s",
+                "Audio attempt %d/profile %d failed for %s (%s): %s",
                 attempt,
                 profile_index,
                 candidate.get("title", "unknown"),
+                candidate.get("source", "audio"),
                 stderr[-1500:],
             )
 
