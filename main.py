@@ -1277,10 +1277,25 @@ async def resolve_music_source(query: str) -> dict | None:
         if artist_key and artist_key in uploader_key:
             value += 8
 
-        if any(word in title.casefold() for word in ("official audio", "official", "topic", "audio")):
-            value += 4
-        if any(word in title.casefold() for word in ("live", "remix", "cover", "8d", "nightcore", "slowed", "sped up")):
-            value -= 8
+        title_lower = title.casefold()
+        # Prefer standard audio uploads because their timing is much more
+        # likely to match LRCLIB's synced lyrics. Music videos and edits often
+        # contain intros/outros that shift every lyric timestamp.
+        if "official audio" in title_lower:
+            value += 15
+        elif "official" in title_lower:
+            value += 8
+        if "topic" in title_lower or "audio" in title_lower:
+            value += 6
+        if any(word in title_lower for word in (
+            "music video", "official video", "lyrics", "lyric video",
+            "visualizer", "edit", "intro", "extended",
+        )):
+            value -= 12
+        if any(word in title_lower for word in (
+            "live", "remix", "cover", "8d", "nightcore", "slowed", "sped up",
+        )):
+            value -= 10
         if entry.get("duration") is not None:
             value += 2
         return value
