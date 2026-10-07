@@ -23,6 +23,8 @@ SUPPORTED_EXTENSIONS = {".mp4", ".mp3"}
 M3U8_SUFFIX = ".m3u8"
 DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
 HOST_EXPIRY_BUFFER_SECONDS = 30
+# Keep the completed MP4 alive long enough for Discord to fetch and cache its native video preview.
+DISCORD_EMBED_GRACE_SECONDS = 5 * 60
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
@@ -1515,7 +1517,7 @@ async def finish_m3u8_host(
             if current is None or current["token"] != token:
                 return
             current["downloading"] = False
-            current["expires_at"] = asyncio.get_running_loop().time() + HOST_EXPIRY_BUFFER_SECONDS
+            current["expires_at"] = asyncio.get_running_loop().time() + DISCORD_EMBED_GRACE_SECONDS
             message_id = current.get("discord_message_id")
             channel_id = current.get("discord_channel_id")
 
@@ -1549,7 +1551,7 @@ async def finish_m3u8_host(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
                 logger.warning("Could not update Discord movie embed for %s: %s", token, exc)
 
-        await asyncio.sleep(HOST_EXPIRY_BUFFER_SECONDS)
+        await asyncio.sleep(DISCORD_EMBED_GRACE_SECONDS)
         await clear_hosted_movie(token, reason="completed movie expired")
     except asyncio.CancelledError:
         raise
@@ -1605,11 +1607,6 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         )
 
         try:
-            direct_media_url = (
-                f"{PUBLIC_BASE_URL}/cdn/{active_host['token']}.mp4"
-                if active_host is not None
-                else player_url
-            )
             posted_message = await channel.send(
                 content=(
                     f"▶ **Now Playing:** {movie_name}\n"
@@ -1619,9 +1616,10 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
                 suppress_embeds=False,
             )
             async with host_lock:
-                if active_host is not None and active_host["token"] == active_host.get("token"):
-                    active_host["discord_message_id"] = posted_message.id
-                    active_host["discord_channel_id"] = channel.id
+                current = active_host
+                if current is not None:
+                    current["discord_message_id"] = posted_message.id
+                    current["discord_channel_id"] = channel.id
             await interaction.followup.send(
                 f"Now streaming {movie_name} in {channel.mention}.",
                 ephemeral=True,
