@@ -1832,12 +1832,17 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
 
+    # A voice connection can take several seconds. A Discord interaction only
+    # has a short acknowledgement window, so defer before doing any network or
+    # voice work.
+    await interaction.response.defer(ephemeral=True)
+
     voice = await connect_member_voice(interaction)
     if voice is None:
-        await interaction.response.send_message("Join a voice channel first. I can then play the song there.", ephemeral=True)
+        await interaction.edit_original_response(
+            content="Join a voice channel first. I can then play the song there."
+        )
         return
-
-    await interaction.response.defer(ephemeral=True)
 
     try:
         track = await resolve_music_source(song)
