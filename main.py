@@ -30,7 +30,7 @@ HOST_EXPIRY_BUFFER_SECONDS = 30
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://moviebot.devs.surf").strip().rstrip("/")
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
 active_host = None
@@ -438,14 +438,6 @@ async def expire_hosted_movie(token: str, duration: float) -> None:
 
 async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
     global active_host
-
-    if not PUBLIC_BASE_URL:
-        if progress is not None:
-            await progress("Connecting movie player...")
-        await bot.ensure_cloudflare_tunnel()
-
-    if not PUBLIC_BASE_URL:
-        return False, "Movie streaming is unavailable. Make sure cloudflared is installed and in PATH, then restart the bot."
 
     try:
         resolved = movie.resolve()
@@ -1093,9 +1085,6 @@ class MovieBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.movie_web_runner = await start_movie_web_server()
-
-        # Do not block Discord login while cloudflared starts.
-        asyncio.create_task(self.ensure_cloudflare_tunnel())
 
         try:
             synced = await self.tree.sync()
