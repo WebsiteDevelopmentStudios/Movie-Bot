@@ -1638,6 +1638,61 @@ async def _collect_ffmpeg_stderr(process: asyncio.subprocess.Process, lines: lis
         raise
 
 
+async def get_movie_metadata_title(movie: Path) -> str | None:
+    """Read a useful title from media metadata, if the source provides one."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format_tags=title",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(movie),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+    except (FileNotFoundError, OSError, asyncio.TimeoutError):
+        return None
+
+    if process.returncode != 0:
+        return None
+
+    title = stdout.decode("utf-8", errors="replace").strip()
+    title = re.sub(r"\\s+", " ", title).strip(" .")
+    if not title:
+        return None
+
+    # Avoid replacing a useful filename with a generic player/stream name.
+    generic = {"index", "movie", "video", "stream", "playlist"}
+    if title.casefold() in generic:
+        return None
+    return title[:120]
+
+
+async def rename_movie_from_metadata(movie: Path) -> Path:
+    title = await get_movie_metadata_title(movie)
+    if not title:
+        return movie
+
+    safe_title = re.sub(r"[^A-Za-z0-9._ -]+", "", title).strip(" .")
+    safe_title = safe_title[:100].strip(" .")
+    if not safe_title or safe_title.casefold() == movie.stem.casefold():
+        return movie
+
+    candidate = MOVIES_DIR / f"{safe_title}{movie.suffix.lower()}"
+    number = 2
+    while candidate.exists() and candidate.resolve() != movie.resolve():
+        candidate = MOVIES_DIR / f"{safe_title} ({number}){movie.suffix.lower()}"
+        number += 1
+
+    try:
+        movie.replace(candidate)
+        logger.info("Using media metadata title for movie name: %s", candidate.stem)
+        return candidate
+    except OSError as exc:
+        logger.warning("Could not rename movie from metadata: %s", exc)
+        return movie
+
+
 async def split_movie_into_parts(source: Path, parts_dir: Path) -> tuple[Path, Path] | None:
     """Create two fragmented MP4 files for site-side sequential playback."""
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -1759,6 +1814,16 @@ async def finish_m3u8_host(
                 await clear_hosted_movie(token, reason="M3U8 MP4 remux failed")
                 return
             remux_temp.replace(output)
+
+            # Some M3U8 URLs use generic names such as index-f2-v1-a1.
+            # Prefer the actual title embedded in the media when available.
+            renamed_output = await rename_movie_from_metadata(output)
+            if renamed_output != output:
+                output = renamed_output
+                async with host_lock:
+                    current = active_host
+                    if current is not None and current["token"] == token:
+                        current["movie"] = output
         except (FileNotFoundError, OSError) as exc:
             logger.warning("Could not remux completed M3U8 movie: %s", exc)
             remux_temp.unlink(missing_ok=True)
