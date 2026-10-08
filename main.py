@@ -30,7 +30,7 @@ HOST_EXPIRY_BUFFER_SECONDS = 30
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://MineBot.wisp.uno").strip().rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://wisp.uno").strip().rstrip("/")
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
 active_host = None
@@ -44,10 +44,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger("movie-bot")
 
+# ==============================================================================
+# AUTOMATED HEADLESS DENO INSTALLER FOR CLOUD PORTS
+# ==============================================================================
+import urllib.request
+import zipfile
+import platform
+
+def install_local_deno():
+    deno_bin_dir = BASE_DIR / ".deno_bin"
+    deno_exe = deno_bin_dir / "deno"
+    
+    # Register the custom binary folder directly into the script's system environment path
+    os.environ["PATH"] = f"{deno_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    
+    if deno_exe.exists():
+        return
+        
+    logger.info("Deno not found. Starting automatic cloud deployment...")
+    deno_bin_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Match the cloud hosting server's processing layout architecture
+    arch = platform.machine().lower()
+    if "arm" in arch or "aarch64" in arch:
+        url = "https://github.com"
+    else:
+        url = "https://github.com"
+        
+    zip_path = deno_bin_dir / "deno.zip"
+    try:
+        urllib.request.urlretrieve(url, zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(deno_bin_dir)
+        zip_path.unlink()
+        
+        # Grant executable file privileges inside the server workspace
+        os.chmod(deno_exe, 0o755)
+        logger.info("Deno successfully compiled and deployed to project environment paths!")
+    except Exception as e:
+        logger.warning("Automated Deno installation aborted: %s", e)
+
+# Run the installation wrapper immediately on start
+install_local_deno()
+# ==============================================================================
+
 
 def ensure_movies_dir() -> None:
     MOVIES_DIR.mkdir(parents=True, exist_ok=True)
-
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
