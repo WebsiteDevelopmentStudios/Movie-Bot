@@ -19,7 +19,7 @@ jobs:
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Compile Python
-        run: python -m py_compile main.py cloud_backend.py
+        run: python -m py_compile main.py cloud_backend.py lavalink_manager.py
 
       - name: Import dependencies
         run: python -c "import aiohttp, discord, wavelink; print(discord.__version__, wavelink.__version__)"
