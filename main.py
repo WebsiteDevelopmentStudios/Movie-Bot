@@ -2130,13 +2130,27 @@ async def voice_leave(interaction: discord.Interaction) -> None:
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        try:
+            await interaction.response.send_message(
+                "This command only works in a server.",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
         return
 
     # A voice connection can take several seconds. A Discord interaction only
     # has a short acknowledgement window, so defer before doing any network or
-    # voice work.
-    await interaction.response.defer(ephemeral=True)
+    # voice work. Discord can occasionally report 40060 if the same interaction
+    # was acknowledged by another handler/dispatch path. In that case the
+    # interaction is already acknowledged, so continue using the followup
+    # webhook instead of turning a working music request into a command error.
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException as exc:
+        if exc.status != 400 or "40060" not in str(exc):
+            raise
+        logger.warning("Music /play interaction was already acknowledged; continuing with followups.")
 
     voice = await connect_member_voice(interaction)
     if voice is None:
@@ -2212,12 +2226,30 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
                 exc,
             )
     except FileNotFoundError:
-        await interaction.followup.send("yt-dlp is not installed. Install the requirements and restart the bot.", ephemeral=True)
+        try:
+            await interaction.followup.send(
+                "yt-dlp is not installed. Install the requirements and restart the bot.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as response_error:
+            logger.warning("Could not send /play yt-dlp error response: %s", response_error)
     except asyncio.TimeoutError:
-        await interaction.followup.send("The song download took too long and was cancelled.", ephemeral=True)
+        try:
+            await interaction.followup.send(
+                "The song download took too long and was cancelled.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as response_error:
+            logger.warning("Could not send /play timeout response: %s", response_error)
     except Exception as exc:
         logger.exception("Music play failed: %s", exc)
-        await interaction.followup.send("Something went wrong while preparing that song.", ephemeral=True)
+        try:
+            await interaction.followup.send(
+                "Something went wrong while preparing that song.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as response_error:
+            logger.warning("Could not send /play failure response: %s", response_error)
 
 
 @bot.tree.command(name="pause", description="Pause the current song.")
@@ -2935,7 +2967,13 @@ async def on_app_command_error(
     if isinstance(error, app_commands.MissingPermissions):
         message = "You need administrator permissions to use that command."
     elif isinstance(error, app_commands.CommandInvokeError):
-        logger.error("Command error: %r", error.original)
+        original = error.original
+        if isinstance(original, discord.HTTPException) and original.status == 400 and "40060" in str(original):
+            # Discord has already acknowledged this interaction. Do not attempt
+            # another response, which would only produce a second 40060 error.
+            logger.warning("Command interaction was already acknowledged: %r", original)
+            return
+        logger.error("Command error: %r", original)
         message = "Something went wrong while processing that command."
     else:
         logger.warning("Slash command error: %s", error)
