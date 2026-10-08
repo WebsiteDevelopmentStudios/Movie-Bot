@@ -1261,19 +1261,23 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Explicitly register the local sandboxed Deno execution binary path.
+    # Route tracking handshakes via remote public challenge providers.
     deno_path = str(BASE_DIR / ".deno_bin" / "deno")
     
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--extractor-args", "youtube:player_client=web,default",
-        "--js-runtimes", f"deno:{deno_path}", # <-- FORCES YT-DLP TO NATIVELY LOAD DENO
+        "--extractor-args", (
+            "youtube:player_client=web,default;"
+            "pot_provider=bgutil:http;" # <-- ROUTES PROTOCOLS EXTERNALLY
+            "pot_provider_args=bgutil:http?server_home=https://bgutil.com" # <-- LIVE PUBLIC RESOLVER
+        ),
+        "--js-runtimes", f"deno:{deno_path}",
         "-4",
     ]
     
-    logger.info("yt-dlp: verified Deno installation layer hook.")
+    logger.info("yt-dlp: initialized remote proxy challenge provider wrapper.")
 
     # Merge remaining query paths and flags cleanly
     command.extend(args)
