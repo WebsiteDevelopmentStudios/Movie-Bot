@@ -1218,12 +1218,13 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Route via IOS client structures to step around signature requirements completely
+    # Enables the plugin framework to automatically fetch and use dynamic PO Tokens.
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--extractor-args", "youtube:player_client=ios",
+        "--extractor-args", "youtube:player_client=web,default",
+        "--verbose", # <-- FORCES YT-DLP TO EMIT EXTRACTOR AND PROVIDER HOOK LOGS
         "-4",
     ]
     if shutil.which("deno"):
@@ -1232,7 +1233,7 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     else:
         logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
 
-    # Safely append all incoming array arguments without filtering out queries or URLs
+    # Merge incoming parameters (queries/URLs) safely
     command.extend(args)
 
     process = await asyncio.create_subprocess_exec(
@@ -1241,13 +1242,28 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        
+        # Look for token signatures inside standard and debugging logs
+        combined_logs = stdout + stderr
+        
+        # Scrape token matching strings
+        token_match = re.search(r"(?:po_token|pot_token|PO Token|poToken)[:=]\s*([a-zA-Z0-9_\-\+\.]+)", combined_logs, re.IGNORECASE)
+        visitor_match = re.search(r"visitor_data[:=]\s*([a-zA-Z0-9_\-\+\.%]+)", combined_logs, re.IGNORECASE)
+        
+        if token_match:
+            print(f"\n========================================\nFOUND TOKEN FOR PRIVATE REPO:\npo_token: {token_match.group(1)}\n========================================\n", flush=True)
+        if visitor_match:
+            print(f"FOUND VISITOR DATA ID: {visitor_match.group(1)}\n========================================\n", flush=True)
+
+        return process.returncode, stdout, stderr
+        
+    except asyncio.timeoutError:
         process.kill()
         await process.communicate()
         raise
-
-    return process.returncode, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
 
 async def piped_instances() -> list[str]:
     """Return public Piped API instances for music search and audio streams."""
