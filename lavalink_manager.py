@@ -160,6 +160,18 @@ def _ensure_java() -> Path:
     return java
 
 
+def _cleanup_legacy_plugin_copy() -> None:
+    """Remove the plugin copy created by older Movie-Bot builds."""
+    if not PLUGINS_DIR.exists():
+        return
+    for plugin in PLUGINS_DIR.glob("youtube-plugin-*.jar"):
+        try:
+            plugin.unlink()
+            logger.info("Removed legacy manually-downloaded YouTube Source plugin copy.")
+        except OSError as exc:
+            logger.warning("Could not remove legacy YouTube plugin copy: %s", exc)
+
+
 def _cleanup_runtime_logs() -> None:
     """Prevent Lavalink's rolling logs from consuming the bot's disk quota."""
     logs_dir = RUNTIME_DIR / "logs"
@@ -280,6 +292,7 @@ async def start_lavalink(password: str) -> None:
 
     java = await asyncio.to_thread(_ensure_java)
     await _download_runtime_files()
+    await asyncio.to_thread(_cleanup_legacy_plugin_copy)
     await asyncio.to_thread(_cleanup_runtime_logs)
     await asyncio.to_thread(_write_config, password)
 
