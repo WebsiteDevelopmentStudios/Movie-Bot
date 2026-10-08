@@ -88,6 +88,41 @@ async def wait_until_ready(timeout: float = 20.0) -> None:
     )
 
 
+async def keep_lavalink_awake(interval: float = 300.0) -> None:
+    """Keep a Render free web service awake while the bot is running.
+
+    Render can suspend an idle free web service. The Discord bot periodically
+    requests Lavalink's authenticated /version endpoint so the Lavalink
+    service receives real inbound traffic while the bot is online.
+    """
+    _validate_lavalink_config()
+
+    headers = {
+        "Authorization": LAVALINK_PASSWORD,
+        "User-Agent": "Movie-Bot/1.0",
+    }
+    timeout = aiohttp.ClientTimeout(total=10)
+    version_url = f"{LAVALINK_URI}/version"
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with session.get(version_url, headers=headers) as response:
+                    if response.status == 200:
+                        logger.debug("Lavalink keep-alive request succeeded.")
+                    else:
+                        logger.warning(
+                            "Lavalink keep-alive returned HTTP %s.",
+                            response.status,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                logger.debug("Lavalink keep-alive failed: %s", exc)
+
+            await asyncio.sleep(interval)
+
+
 async def stop_lavalink() -> None:
     """Nothing to stop because Lavalink runs as a separate service."""
     return
