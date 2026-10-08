@@ -12,6 +12,7 @@ Movies/*
 .vscode/
 .idea/
 .movie_hls/
+.music_cache/
+.lavalink/
 .DS_Store
 Thumbs.db
-.music_cache/
