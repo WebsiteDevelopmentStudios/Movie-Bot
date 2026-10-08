@@ -1218,12 +1218,13 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
+    # Run yt-dlp through the exact Python interpreter hosting the bot.
+    # Authenticate via OAuth token flows to register the datacenter IP safely.
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--cookies", str(BASE_DIR / "cookies.txt"),
-        "--extractor-args", "youtube:player_client=web_music,default",
+        "--extractor-args", "youtube:oauth=1", # <-- ENABLES SECURE OAUTH HANDSHAKE
         "-4",
     ]
     if shutil.which("deno"):
@@ -1232,9 +1233,10 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     else:
         logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
 
+    command.extend(args)
+
     process = await asyncio.create_subprocess_exec(
         *command,
-        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
