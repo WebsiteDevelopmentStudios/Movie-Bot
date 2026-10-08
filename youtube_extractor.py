@@ -28,7 +28,14 @@ def _is_youtube_url(value: str) -> bool:
     host = (parsed.hostname or "").lower()
     return (
         parsed.scheme in {"http", "https"}
-        and host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"}
+        and host in {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtu.be",
+            "www.youtu.be",
+        }
     )
 
 
@@ -58,6 +65,22 @@ def _extract_sync(query: str) -> dict | None:
         },
     }
 
+    # bgutil-ytdlp-pot-provider is the preferred PO-token backend. The
+    # provider runs separately from the bot so this container does not need
+    # Chromium, Node.js, or browser automation.
+    pot_provider = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip().rstrip("/")
+    if pot_provider:
+        opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {
+                "base_url": pot_provider,
+            },
+            # These clients are recommended by the provider documentation when
+            # a PO-token flow needs to be explicitly selected.
+            "youtube": {
+                "player_client": ["mweb", "tv", "web_safari"],
+            },
+        }
+
     cookies = _youtube_cookies_file()
     if cookies:
         opts["cookiefile"] = cookies
@@ -77,12 +100,10 @@ def _extract_sync(query: str) -> dict | None:
         if not info:
             return None
 
-        # yt-dlp may expose multiple formats. Prefer a direct HTTPS audio URL
-        # because Lavalink's HTTP source can play it without invoking the
-        # youtube-source SABR client.
         formats = info.get("formats") or []
         audio_formats = [
-            item for item in formats
+            item
+            for item in formats
             if item.get("url")
             and item.get("vcodec") in {None, "none"}
             and item.get("acodec") not in {None, "none"}
@@ -99,8 +120,12 @@ def _extract_sync(query: str) -> dict | None:
             duration_ms = max(0, int(float(info["duration"]) * 1000))
 
         artist = (
-            str(info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist")
-            .strip()
+            str(
+                info.get("artist")
+                or info.get("uploader")
+                or info.get("channel")
+                or "Unknown Artist"
+            ).strip()
         )
 
         return {
@@ -116,8 +141,8 @@ async def extract_youtube_audio(query: str) -> dict | None:
     """Extract a playable direct audio URL without asking Lavalink to resolve YouTube.
 
     yt-dlp runs off the event loop because extraction performs blocking HTTP and
-    JavaScript/player parsing work. OAuth-authenticated YouTube sessions should
-    be represented by a Netscape-format cookie file in YOUTUBE_COOKIES_FILE.
+    JavaScript/player parsing work. YouTube authentication/cookies stay inside
+    the extractor environment and are never sent to Discord or Lavalink.
     """
     try:
         return await asyncio.to_thread(_extract_sync, query)
