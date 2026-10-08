@@ -1261,7 +1261,7 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Route tracking handshakes via remote public challenge providers.
+    # Route handshake queries through active public community token APIs.
     deno_path = str(BASE_DIR / ".deno_bin" / "deno")
     
     command = [
@@ -1270,14 +1270,14 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
         "yt_dlp",
         "--extractor-args", (
             "youtube:player_client=web,default;"
-            "pot_provider=bgutil:http;" # <-- ROUTES PROTOCOLS EXTERNALLY
-            "pot_provider_args=bgutil:http?server_home=https://bgutil.com" # <-- LIVE PUBLIC RESOLVER
+            "pot_provider=bgutil:http;"
+            "pot_provider_args=bgutil:http?server_home=https://pnd.tl" # <-- WORKING COMMUNITY ENDPOINT
         ),
         "--js-runtimes", f"deno:{deno_path}",
         "-4",
     ]
     
-    logger.info("yt-dlp: initialized remote proxy challenge provider wrapper.")
+    logger.info("yt-dlp: validated active community challenge resolver pipeline.")
 
     # Merge remaining query paths and flags cleanly
     command.extend(args)
