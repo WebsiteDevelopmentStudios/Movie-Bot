@@ -1221,6 +1221,7 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     command = [
         sys.executable,
         "-m",
+        "-4",
         "yt_dlp",
         "--cookies", str(BASE_DIR / "cookies.txt"),
         "--extractor-args", "youtube:player_client=web_safari", # <-- ADD THIS LINE
