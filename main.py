@@ -1034,10 +1034,155 @@ async def stop_cloudflare_quick_tunnel() -> None:
 
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
+
+
+async def youtube_oauth_callback(request: web.Request) -> web.Response:
+    state = request.query.get("state", "")
+    code = request.query.get("code", "")
+    oauth_error = request.query.get("error", "")
+
+    state_info = youtube_oauth_states.pop(state, None)
+    if not state_info:
+        return web.Response(
+            text="This YouTube login link is invalid or has expired.",
+            status=400,
+            content_type="text/plain",
+        )
+
+    created = float(state_info.get("created", 0))
+    if asyncio.get_running_loop().time() - created > 600:
+        return web.Response(
+            text="This YouTube login link expired. Run /login youtube again.",
+            status=400,
+            content_type="text/plain",
+        )
+
+    if oauth_error:
+        return web.Response(
+            text=f"YouTube login was cancelled or denied: {oauth_error}",
+            status=400,
+            content_type="text/plain",
+        )
+
+    if not code:
+        return web.Response(
+            text="Google did not return an authorization code.",
+            status=400,
+            content_type="text/plain",
+        )
+
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    redirect_uri = os.getenv("YOUTUBE_OAUTH_REDIRECT_URI", "").strip()
+
+    if not client_id or not client_secret or not redirect_uri:
+        return web.Response(
+            text="YouTube OAuth is not configured on the bot.",
+            status=500,
+            content_type="text/plain",
+        )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                token_data = await response.json(content_type=None)
+
+            if response.status != 200 or not isinstance(token_data, dict):
+                logger.warning("Google OAuth token exchange failed: HTTP %s", response.status)
+                return web.Response(
+                    text="Google could not complete the YouTube login.",
+                    status=502,
+                    content_type="text/plain",
+                )
+
+            access_token = str(token_data.get("access_token", "")).strip()
+            refresh_token = str(token_data.get("refresh_token", "")).strip()
+
+            if not access_token:
+                return web.Response(
+                    text="Google did not return an access token.",
+                    status=502,
+                    content_type="text/plain",
+                )
+
+            async with session.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as user_response:
+                user_data = await user_response.json(content_type=None)
+
+        token_file = BASE_DIR / "youtube-oauth.json"
+        existing = {}
+        if token_file.exists():
+            try:
+                existing = json.loads(token_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+
+        existing.update(
+            {
+                "user_id": state_info["user_id"],
+                "access_token": access_token,
+                "token_type": token_data.get("token_type", "Bearer"),
+                "expires_in": token_data.get("expires_in"),
+                "scope": token_data.get("scope", ""),
+                "updated_at": int(asyncio.get_running_loop().time()),
+            }
+        )
+        if refresh_token:
+            existing["refresh_token"] = refresh_token
+
+        temp_file = token_file.with_suffix(".json.tmp")
+        temp_file.write_text(
+            json.dumps(existing, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temp_file.replace(token_file)
+
+        email = ""
+        if isinstance(user_data, dict):
+            email = str(user_data.get("email", "")).strip()
+
+        logger.info(
+            "YouTube Google OAuth account linked for Discord user %s%s.",
+            state_info["user_id"],
+            f" ({email})" if email else "",
+        )
+
+        return web.Response(
+            text=(
+                "YouTube login successful.\n\n"
+                "Your Google/YouTube account is now linked to Movie-Bot. "
+                "You can close this page and return to Discord."
+            ),
+            content_type="text/plain",
+        )
+
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+        logger.warning("YouTube OAuth callback failed: %s", exc)
+        return web.Response(
+            text="The YouTube login could not be completed. Please try again.",
+            status=502,
+            content_type="text/plain",
+        )
+
+
     app.router.add_get("/movie/{token}", hosted_movie_handler)
     app.router.add_get("/media/{token}", hosted_media_handler)
     app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
     app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
+    app.router.add_get("/oauth/youtube/callback", youtube_oauth_callback)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
@@ -2614,7 +2759,7 @@ def youtube_cookie_path() -> Path:
     ).expanduser()
 
 
-def is_bot_owner(user: discord.abc.User) -> bool:
+async def is_bot_owner(user: discord.abc.User) -> bool:
     owner_id = os.getenv("OWNER_ID", "").strip()
     if owner_id:
         try:
@@ -2622,7 +2767,13 @@ def is_bot_owner(user: discord.abc.User) -> bool:
         except ValueError:
             logger.warning("OWNER_ID is not a valid Discord user ID.")
             return False
-    return bot.application.owner_id == user.id if bot.application else False
+
+    try:
+        app_info = await bot.application_info()
+        return user.id == app_info.owner.id
+    except Exception as exc:
+        logger.warning("Could not determine bot owner: %s", exc)
+        return False
 
 
 async def save_youtube_cookies(attachment: discord.Attachment) -> tuple[bool, str]:
@@ -2744,7 +2895,9 @@ class YouTubeLoginView(discord.ui.View):
                 "YouTube Login\n\n"
                 f"[Sign in with Google]({login_url})\n\n"
                 "After authorization, Google will return you to the bot. "
-                "Your Google password is never sent to Discord."
+                "Your Google password is never sent to Discord.\n\n"
+                "Note: Google OAuth links the YouTube account, while yt-dlp playback "
+                "authentication still uses the imported cookies.txt when YouTube requires it."
             ),
             view=None,
         )
@@ -2775,7 +2928,7 @@ async def login_youtube(
         )
         return
 
-    if not is_bot_owner(interaction.user):
+    if not await is_bot_owner(interaction.user):
         await interaction.edit_original_response(
             content="Only the bot owner can link the YouTube account."
         )
