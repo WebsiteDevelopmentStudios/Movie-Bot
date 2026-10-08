@@ -1701,7 +1701,8 @@ class MovieBot(discord.Client):
         # HTTP traffic. Start the keep-alive before connecting so a sleeping
         # Lavalink service is woken while initialize_lavalink waits for it.
         if LAVALINK_URI and LAVALINK_PASSWORD:
-            self.lavalink_keepalive_task = asyncio.create_task(                keep_lavalink_awake(),
+            self.lavalink_keepalive_task = asyncio.create_task(
+                keep_lavalink_awake(),
                 name="lavalink-render-keepalive",
             )
 
