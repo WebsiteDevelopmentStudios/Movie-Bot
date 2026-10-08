@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import sys
 import json
 import logging
@@ -1253,6 +1254,48 @@ class ChannelLinkView(discord.ui.View):
             view=self,
         )
         self.stop()
+
+
+
+channel_group = app_commands.Group(
+    name="channel",
+    description="Configure the movie channel.",
+)
+movie_group = app_commands.Group(
+    name="movie",
+    description="Browse and send available movies.",
+)
+
+
+@channel_group.command(name="link", description="Choose the channel where movies will be sent.")
+@app_commands.checks.has_permissions(administrator=True)
+async def channel_link(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    await send_interaction_response(interaction, 
+        "Choose the Discord text channel where movies should be sent:",
+        view=ChannelLinkView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@movie_group.command(name="list", description="Privately list all available movies.")
+async def movie_list(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    movies = get_movie_files()
+
+    if not movies:
+        await send_interaction_response(interaction, 
+            "No movies are currently available.",
+            ephemeral=True,
+        )
+        return
+
+    view = MovieListView(movies, interaction.user.id)
+    await send_interaction_response(interaction, 
+        embed=movie_embed(movies, 0, view.per_page),
+        view=view,
+        ephemeral=True,
+    )
 
 
 
