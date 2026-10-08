@@ -1211,6 +1211,7 @@ def get_music_state(guild_id: int) -> dict:
             "lyrics_task": None,
             "lyrics_enabled": True,
             "advance_lock": asyncio.Lock(),
+            "voice_lock": asyncio.Lock(),
             "stopping": False,
         }
         music_states[guild_id] = state
@@ -1474,31 +1475,82 @@ async def cancel_lyrics(guild_id: int) -> None:
 async def connect_member_voice(interaction: discord.Interaction):
     if interaction.guild is None or wavelink is None:
         return None
+
     member = interaction.user
     if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel is None:
         return None
 
     voice_channel = member.voice.channel
     state = get_music_state(interaction.guild.id)
-    player = state.get("player")
-    if player is not None:
-        try:
-            if player.connected:
-                if player.channel.id != voice_channel.id:
-                    await player.move_to(voice_channel)
-                return player
-            await player.disconnect()
-        except Exception as exc:
-            logger.warning("Existing Lavalink player for guild %s was stale: %s", interaction.guild.id, exc)
-        state["player"] = None
 
-    try:
-        player = await voice_channel.connect(cls=wavelink.Player, self_deaf=True)
-    except Exception as exc:
-        logger.warning("Could not connect Lavalink player to guild %s: %s", interaction.guild.id, exc)
-        return None
-    state["player"] = player
-    return player
+    # Serialize voice connection attempts. Two /play or /join commands arriving
+    # together must never race and create a second Discord voice connection.
+    async with state["voice_lock"]:
+        player = state.get("player")
+
+        # Recover an existing Wavelink player if the in-memory music state lost
+        # its reference after a reconnect or another command created the player.
+        if player is None:
+            for existing in bot.voice_clients:
+                if getattr(existing, "guild", None) == interaction.guild:
+                    if isinstance(existing, wavelink.Player):
+                        player = existing
+                        state["player"] = existing
+                        logger.info(
+                            "Recovered existing Lavalink player for guild %s.",
+                            interaction.guild.id,
+                        )
+                    break
+
+        if player is not None:
+            try:
+                if player.connected:
+                    if player.channel is not None and player.channel.id != voice_channel.id:
+                        await player.move_to(voice_channel)
+                    return player
+                await player.disconnect()
+            except Exception as exc:
+                logger.warning(
+                    "Existing Lavalink player for guild %s was stale: %s",
+                    interaction.guild.id,
+                    exc,
+                )
+            state["player"] = None
+            player = None
+
+        try:
+            player = await voice_channel.connect(cls=wavelink.Player, self_deaf=True)
+        except Exception as exc:
+            # A voice client can have appeared between our lookup and connect.
+            # Recover it instead of reporting the duplicate-connection error.
+            for existing in bot.voice_clients:
+                if (
+                    getattr(existing, "guild", None) == interaction.guild
+                    and isinstance(existing, wavelink.Player)
+                ):
+                    player = existing
+                    state["player"] = existing
+                    logger.info(
+                        "Recovered Lavalink player after duplicate connection "
+                        "race for guild %s.",
+                        interaction.guild.id,
+                    )
+                    try:
+                        if player.connected and player.channel is not None and player.channel.id != voice_channel.id:
+                            await player.move_to(voice_channel)
+                    except Exception:
+                        pass
+                    return player
+
+            logger.warning(
+                "Could not connect Lavalink player to guild %s: %s",
+                interaction.guild.id,
+                exc,
+            )
+            return None
+
+        state["player"] = player
+        return player
 
 
 async def play_next(guild_id: int) -> bool:
@@ -2441,6 +2493,11 @@ async def on_app_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ) -> None:
+    if isinstance(error, discord.NotFound) and getattr(error, "code", None) == 10062:
+        # Discord can invalidate an interaction before the bot gets a chance
+        # to acknowledge it. This is not recoverable with another response.
+        logger.warning("Discord interaction expired before it could be acknowledged (10062).")
+        return
     if isinstance(error, app_commands.MissingPermissions):
         message = "You need administrator permissions to use that command."
     elif isinstance(error, app_commands.CommandInvokeError):
