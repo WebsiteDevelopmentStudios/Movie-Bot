@@ -1572,8 +1572,12 @@ async def youtube_login(
 
     await send_interaction_response(
         interaction,
-        "YouTube Account Login\nChoose how to connect the YouTube account used by the music system.",
-        view=YouTubeLoginView(interaction.user.id),
+        "YouTube account setup\n\n"
+        "To import cookies, run /login youtube again and attach your exported "
+        "Netscape-format cookies.txt file in the `cookies` option. "
+        "The Google OAuth callback currently does not provide the browser session "
+        "cookies yt-dlp needs for YouTube audio playback, so I have not exposed a "
+        "Google Login button that would appear to fix music playback.",
         ephemeral=True,
     )
 
