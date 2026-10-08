@@ -1,5 +1,4 @@
 import asyncio
-import asyncio
 import sys
 import json
 import logging
@@ -2009,6 +2008,302 @@ async def play_next(guild_id: int) -> bool:
                 state["current"] = None
     return False
 
+
+@bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
+@app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
+async def music_play(interaction: discord.Interaction, song: str) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+
+    if not lavalink_ready:
+        await interaction.edit_original_response(content="The music backend is currently unavailable.")
+        return
+
+    player = await connect_member_voice(interaction)
+    if player is None:
+        await interaction.edit_original_response(content="Join a voice channel first. I can then play the song there.")
+        return
+
+    try:
+        track = await resolve_music_source(song)
+    except Exception as exc:
+        logger.exception("Music source resolution failed: %s", exc)
+        track = None
+
+    if track is None:
+        await interaction.edit_original_response(content="I couldn't find or load that song from the music backend.")
+        return
+
+    state = get_music_state(interaction.guild.id)
+    was_playing = state.get("current") is not None or bool(player.playing) or bool(state.get("queue"))
+    state["queue"].append(track)
+    position = len(state["queue"])
+    started = await play_next(interaction.guild.id)
+
+    if not was_playing and not started and state.get("current") is None:
+        await interaction.edit_original_response(
+            content="I couldn't load that audio source from the music backend."
+        )
+        return
+
+    if was_playing:
+        message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
+    else:
+        message = f"Playing **{track['title']}** by **{track['artist']}**."
+    await interaction.edit_original_response(content=message)
+
+
+@bot.tree.command(name="pause", description="Pause the current song.")
+async def music_pause(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    player = state.get("player")
+    if player is None or not player.playing or player.paused:
+        await send_interaction_response(interaction, "Nothing is currently playing.", ephemeral=True)
+        return
+    try:
+        await player.pause(True)
+    except Exception as exc:
+        logger.warning("Could not pause music: %s", exc)
+        await send_interaction_response(interaction, "I couldn't pause the current song.", ephemeral=True)
+        return
+    await send_interaction_response(interaction, "Paused the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="resume", description="Resume the paused song.")
+async def music_resume(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    player = state.get("player")
+    if player is None or not player.paused:
+        await send_interaction_response(interaction, "The song is not paused.", ephemeral=True)
+        return
+    try:
+        await player.pause(False)
+    except Exception as exc:
+        logger.warning("Could not resume music: %s", exc)
+        await send_interaction_response(interaction, "I couldn't resume the current song.", ephemeral=True)
+        return
+    await send_interaction_response(interaction, "Resumed the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="lyrics", description="Toggle synchronized lyrics on or off.")
+@app_commands.describe(enabled="Turn synchronized lyrics on or off. Leave empty to toggle.")
+async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = None) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    if enabled is None:
+        enabled = not state.get("lyrics_enabled", False)
+    state["lyrics_enabled"] = bool(enabled)
+    if state["lyrics_enabled"]:
+        await send_interaction_response(
+            interaction,
+            "Warning: This Feature Is In Beta, Don't Expect A Fully Working Version Soon",
+            ephemeral=True,
+        )
+    if state["lyrics_enabled"] and state.get("current") is not None:
+        await cancel_lyrics(interaction.guild.id)
+        player = state.get("player")
+        current = state.get("current")
+        if player is not None and current is not None and current.get("lyrics"):
+            state["lyrics_task"] = asyncio.create_task(
+                lyrics_loop(
+                    interaction.guild.id,
+                    player,
+                    player.channel,
+                    current,
+                    start_from_position=True,
+                )
+            )
+    status = "enabled" if enabled else "disabled"
+    await send_interaction_response(interaction, f"Synchronized lyrics are now **{status}**.", ephemeral=True)
+
+
+@bot.tree.command(name="skip", description="Skip the currently playing song.")
+async def music_skip(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    player = state.get("player")
+    if player is None or not player.playing:
+        await send_interaction_response(interaction, "Nothing is currently playing.", ephemeral=True)
+        return
+    await cancel_lyrics(interaction.guild.id)
+    try:
+        await player.stop()
+    except Exception as exc:
+        logger.warning("Could not skip current track: %s", exc)
+        await send_interaction_response(interaction, "I couldn't skip the current song.", ephemeral=True)
+        return
+    await send_interaction_response(interaction, "Skipped the current song.", ephemeral=True)
+
+
+@bot.tree.command(name="queue", description="Show the current music queue.")
+async def music_queue(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    current = state.get("current")
+    queue = state.get("queue", [])
+    lines: list[str] = []
+    if current is not None:
+        seconds = current.get("duration", 0) / 1000
+        lines.append(f"**Now playing:** {current['title']} — {current['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
+    for index, track in enumerate(queue, 1):
+        seconds = track.get("duration", 0) / 1000
+        lines.append(f"**{index}.** {track['title']} — {track['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
+    if not lines:
+        lines = ["The music queue is empty."]
+    await send_interaction_response(interaction, "\n".join(lines[:51]), ephemeral=True)
+
+
+@bot.tree.command(name="volume", description="Set the music volume.")
+@app_commands.describe(level="Volume from 0 to 100.")
+async def music_volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    state["volume"] = int(level)
+    player = state.get("player")
+    if player is not None and player.connected:
+        try:
+            await player.set_volume(int(level))
+        except Exception as exc:
+            logger.warning("Could not change Lavalink volume: %s", exc)
+            await send_interaction_response(interaction, "I couldn't change the current volume.", ephemeral=True)
+            return
+    await send_interaction_response(interaction, f"Volume set to **{level}%**.", ephemeral=True)
+
+
+@bot.tree.command(name="stop", description="Stop music and clear the queue.")
+async def music_stop(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    state["queue"].clear()
+    await cancel_lyrics(interaction.guild.id)
+    player = state.get("player")
+    if player is not None and player.playing:
+        state["stopping"] = True
+        try:
+            await player.stop()
+        except Exception as exc:
+            logger.warning("Could not stop Lavalink playback: %s", exc)
+        finally:
+            state["stopping"] = False
+    state["current"] = None
+    await send_interaction_response(interaction, "Stopped playback and cleared the queue.", ephemeral=True)
+
+
+@bot.event
+async def on_wavelink_node_ready(payload) -> None:
+    global lavalink_ready
+    lavalink_ready = True
+    logger.info("Lavalink node ready: %s (resumed=%s)", payload.node.identifier, payload.resumed)
+
+
+@bot.event
+async def on_wavelink_node_disconnected(payload) -> None:
+    global lavalink_ready
+    lavalink_ready = False
+    logger.warning("Lavalink node disconnected: %s", getattr(getattr(payload, "node", None), "identifier", "unknown"))
+
+
+@bot.event
+async def on_wavelink_node_closed(node, disconnected) -> None:
+    global lavalink_ready
+    lavalink_ready = False
+    logger.warning(
+        "Lavalink node closed: %s; disconnected players=%d",
+        getattr(node, "identifier", "unknown"),
+        len(disconnected or []),
+    )
+
+
+@bot.event
+async def on_wavelink_track_start(payload) -> None:
+    player = getattr(payload, "player", None)
+    if player is None or player.guild is None:
+        return
+    state = music_states.get(player.guild.id)
+    if state is None or state.get("current") is None:
+        return
+    await cancel_lyrics(player.guild.id)
+    track = state["current"]
+    if track.get("lyrics") and state.get("lyrics_enabled", False):
+        state["lyrics_task"] = asyncio.create_task(
+            lyrics_loop(player.guild.id, player, player.channel, track)
+        )
+
+
+@bot.event
+async def on_wavelink_track_end(payload) -> None:
+    player = getattr(payload, "player", None)
+    if player is None or player.guild is None:
+        return
+    state = music_states.get(player.guild.id)
+    if state is None:
+        return
+    await cancel_lyrics(player.guild.id)
+    state["current"] = None
+    if state.get("stopping"):
+        return
+    await play_next(player.guild.id)
+
+
+@bot.event
+async def on_wavelink_track_exception(payload) -> None:
+    player = getattr(payload, "player", None)
+    if player is None or player.guild is None:
+        return
+    logger.warning(
+        "Lavalink track exception in guild %s for %s: %s",
+        player.guild.id,
+        getattr(getattr(payload, "track", None), "title", "unknown"),
+        getattr(getattr(payload, "exception", None), "message", "unknown error"),
+    )
+
+
+@bot.event
+async def on_wavelink_websocket_closed(payload) -> None:
+    logger.warning(
+        "Discord voice websocket closed through Lavalink: guild=%s code=%s reason=%s remote=%s",
+        getattr(getattr(payload, "player", None), "guild", None),
+        getattr(payload, "code", "unknown"),
+        getattr(payload, "reason", "unknown"),
+        getattr(payload, "by_remote", "unknown"),
+    )
+
+channel_group = app_commands.Group(
+    name="channel",
+    description="Configure the movie channel.",
+)
+movie_group = app_commands.Group(
+    name="movie",
+    description="Browse and send available movies.",
+)
+
+
+@channel_group.command(name="link", description="Choose the channel where movies will be sent.")
 
 @bot.tree.command(name="join", description="Join your current voice channel.")
 async def voice_join(interaction: discord.Interaction) -> None:
