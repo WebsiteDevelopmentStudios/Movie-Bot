@@ -1233,8 +1233,8 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     else:
         logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
 
-    # Only append non-conflicting arguments from incoming download requests
-    cleaned_args = [arg for arg in args if not any(x in str(arg) for x in ["player_client", "youtube:"])]
+    # ONLY strip out clashing client arguments, preserving search queries and URLs safely
+    cleaned_args = [arg for arg in args if "player_client" not in str(arg)]
     command.extend(cleaned_args)
 
     process = await asyncio.create_subprocess_exec(
