@@ -1219,15 +1219,22 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Explicitly select Deno for YouTube's current JavaScript challenge
-    # solver. Render installs Deno during the image build, but yt-dlp will
-    # not automatically use it unless the runtime is explicitly selected.
-    process = await asyncio.create_subprocess_exec(
+    # Only select Deno when it is actually installed on the host. Wispbyte
+    # Python containers do not necessarily include Deno, and forcing a
+    # missing runtime makes every YouTube search fail immediately.
+    command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--js-runtimes",
-        "deno",
+    ]
+    if shutil.which("deno"):
+        command.extend(["--js-runtimes", "deno"])
+        logger.info("yt-dlp: using Deno JavaScript runtime.")
+    else:
+        logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1356,73 +1363,95 @@ async def yt_dlp_search_candidates(search_query: str, spotify_info: dict | None)
 
 
 async def resolve_music_source(query: str) -> dict | None:
+    """
+    Resolve a requested song without depending on public Piped instances.
+
+    yt-dlp is the primary search source because public Piped APIs are
+    frequently unavailable, rate-limited, or return inconsistent results.
+    Piped remains available later in the playback pipeline as an audio
+    fallback, but it is no longer required just to find a song.
+    """
     spotify_info = await resolve_spotify_track(query) if spotify_track_url(query) else None
     search_query = spotify_info["search"] if spotify_info else query.strip()
     if not search_query:
         return None
 
-    instances = await piped_instances()
-    candidates: list[dict] = []
+    logger.info("Music search: using yt-dlp for %r", search_query)
+    candidates = await yt_dlp_search_candidates(search_query, spotify_info)
 
-    async with aiohttp.ClientSession() as session:
-        for api_base in instances:
-            try:
-                async with session.get(
-                    f"{api_base}/search",
-                    params={"q": search_query, "filter": "music"},
-                    headers={"User-Agent": "Movie-Bot/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as response:
-                    if response.status != 200:
-                        logger.warning("Piped search %s returned HTTP %s", api_base, response.status)
+    if candidates:
+        logger.info(
+            "Music search: yt-dlp returned %d candidate(s); selected from YouTube results.",
+            len(candidates),
+        )
+    else:
+        logger.warning(
+            "Music search: yt-dlp returned no candidates for %r; trying Piped as a fallback.",
+            search_query,
+        )
+
+        instances = await piped_instances()
+        async with aiohttp.ClientSession() as session:
+            for api_base in instances:
+                try:
+                    async with session.get(
+                        f"{api_base}/search",
+                        params={"q": search_query, "filter": "music"},
+                        headers={"User-Agent": "Movie-Bot/1.0"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                "Piped fallback search %s returned HTTP %s",
+                                api_base,
+                                response.status,
+                            )
+                            continue
+                        data = await response.json(content_type=None)
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                    logger.warning("Piped fallback search failed for %s: %s", api_base, exc)
+                    continue
+
+                if not isinstance(data, list):
+                    continue
+
+                for entry in data:
+                    if not isinstance(entry, dict):
                         continue
-                    data = await response.json(content_type=None)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-                logger.warning("Piped search failed for %s: %s", api_base, exc)
-                continue
 
-            if not isinstance(data, list):
-                continue
+                    video_id = str(entry.get("url") or "").strip()
+                    if video_id.startswith("/watch?v="):
+                        video_id = video_id.split("v=", 1)[1].split("&", 1)[0]
+                    if not video_id:
+                        video_id = str(entry.get("id") or "").strip()
+                    if not video_id:
+                        continue
 
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
+                    candidates.append({
+                        "title": str(entry.get("title") or "").strip(),
+                        "artist": str(
+                            entry.get("uploaderName")
+                            or entry.get("uploader")
+                            or ((spotify_info or {}).get("artist") if spotify_info else "")
+                            or "Unknown Artist"
+                        ).strip(),
+                        "video_id": video_id,
+                        "api_base": api_base,
+                        "duration": entry.get("duration"),
+                        "spotify_url": (spotify_info or {}).get("spotify_url"),
+                        "source": "Piped",
+                    })
 
-                video_id = str(entry.get("url") or "").strip()
-                if video_id.startswith("/watch?v="):
-                    video_id = video_id.split("v=", 1)[1].split("&", 1)[0]
-                if not video_id:
-                    video_id = str(entry.get("id") or "").strip()
-                if not video_id:
-                    continue
-
-                artist = str(
-                    entry.get("uploaderName")
-                    or entry.get("uploader")
-                    or ((spotify_info or {}).get("artist") if spotify_info else "")
-                    or "Unknown Artist"
-                ).strip()
-
-                candidates.append({
-                    "title": str(entry.get("title") or "").strip(),
-                    "artist": artist,
-                    "video_id": video_id,
-                    "api_base": api_base,
-                    "duration": entry.get("duration"),
-                    "spotify_url": (spotify_info or {}).get("spotify_url"),
-                    "source": "Piped",
-                })
-
-            if candidates:
-                break
-
-    # If Piped is unavailable, use yt-dlp directly as a fallback. This keeps
-    # normal song searches and Spotify track URLs working even when every
-    # public Piped instance is down or rate-limited.
-    if not candidates:
-        candidates = await yt_dlp_search_candidates(search_query, spotify_info)
+                if candidates:
+                    logger.info(
+                        "Music search: Piped fallback returned %d candidate(s) from %s.",
+                        len(candidates),
+                        api_base,
+                    )
+                    break
 
     if not candidates:
+        logger.warning("Music search failed completely for %r.", search_query)
         return None
 
     requested_title = str((spotify_info or {}).get("title") or "").casefold()
@@ -1470,8 +1499,14 @@ async def resolve_music_source(query: str) -> dict | None:
     candidates.sort(key=score, reverse=True)
     primary = candidates[0]
     primary["alternatives"] = candidates[1:8]
-    return primary
 
+    logger.info(
+        "Music search selected: %s — %s [%s]",
+        primary.get("title", "Unknown"),
+        primary.get("artist", "Unknown Artist"),
+        primary.get("source", "unknown"),
+    )
+    return primary
 
 async def download_music_audio(track: dict) -> Path | None:
     MUSIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
