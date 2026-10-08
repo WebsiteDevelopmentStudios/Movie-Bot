@@ -1255,6 +1255,195 @@ class ChannelLinkView(discord.ui.View):
         self.stop()
 
 
+
+class YouTubeLoginView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await send_interaction_response(
+            interaction,
+            "This YouTube login menu belongs to the member who opened it.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="Cookies", style=discord.ButtonStyle.secondary)
+    async def cookies_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.interaction_allowed(interaction):
+            return
+        await send_interaction_response(
+            interaction,
+            "Use /login youtube again and attach your exported YouTube cookies.txt file in the cookies field. "
+            "The file must be in Netscape cookie format.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Login", style=discord.ButtonStyle.primary)
+    async def login_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.interaction_allowed(interaction):
+            return
+
+        client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+        redirect_uri = os.getenv("YOUTUBE_OAUTH_REDIRECT_URI", "").strip()
+        if not client_id or not redirect_uri:
+            await send_interaction_response(
+                interaction,
+                "Google YouTube login is not configured. Set GOOGLE_CLIENT_ID and YOUTUBE_OAUTH_REDIRECT_URI first.",
+                ephemeral=True,
+            )
+            return
+
+        state = secrets.token_urlsafe(32)
+        youtube_oauth_states[state] = {
+            "user_id": interaction.user.id,
+            "created": asyncio.get_running_loop().time(),
+        }
+
+        from urllib.parse import urlencode
+        params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "access_type": "offline",
+            "prompt": "consent",
+            "scope": "https://www.googleapis.com/auth/youtube.readonly",
+            "state": state,
+        }
+        authorization_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+        await send_interaction_response(
+            interaction,
+            f"Open Google to log in: {authorization_url}\n\n"
+            "After Google finishes, return to Discord. "
+            "For yt-dlp playback, you may still need to provide an exported cookies file.",
+            ephemeral=True,
+        )
+
+
+async def install_youtube_cookies(
+    interaction: discord.Interaction,
+    cookies: discord.Attachment,
+) -> None:
+    filename = Path(cookies.filename or "").name
+    if not filename.lower().endswith(".txt"):
+        await send_interaction_response(
+            interaction,
+            "Please upload a .txt cookies export in Netscape format.",
+            ephemeral=True,
+        )
+        return
+
+    if cookies.size > 10 * 1024 * 1024:
+        await send_interaction_response(
+            interaction,
+            "That cookies file is too large. The maximum size is 10 MB.",
+            ephemeral=True,
+        )
+        return
+
+    cookie_path = Path(
+        os.getenv("YOUTUBE_COOKIES_FILE", str(BASE_DIR / "youtube-cookies.txt"))
+    ).expanduser()
+
+    try:
+        data = await cookies.read()
+        text_data = data.decode("utf-8-sig", errors="replace")
+    except (discord.HTTPException, OSError, UnicodeError) as exc:
+        logger.warning("Could not download YouTube cookies attachment: %s", exc)
+        await send_interaction_response(
+            interaction,
+            "I could not read that cookies file from Discord.",
+            ephemeral=True,
+        )
+        return
+
+    lines = [line.strip() for line in text_data.splitlines() if line.strip()]
+    if not lines or not any(
+        line == "# Netscape HTTP Cookie File"
+        or line == "# HTTP Cookie File"
+        or line.startswith("# Netscape HTTP Cookie File")
+        for line in lines[:5]
+    ):
+        await send_interaction_response(
+            interaction,
+            "That file does not look like a Netscape-format YouTube cookies export.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cookie_path.with_name(cookie_path.name + ".tmp")
+        temp_path.write_bytes(data)
+        temp_path.replace(cookie_path)
+    except OSError as exc:
+        logger.error("Could not save YouTube cookies: %s", exc)
+        await send_interaction_response(
+            interaction,
+            "I could not save the YouTube cookies on the bot host.",
+            ephemeral=True,
+        )
+        return
+
+    logger.info("YouTube cookies updated by Discord user %s from %s.", interaction.user.id, filename)
+    await send_interaction_response(
+        interaction,
+        "YouTube cookies were imported successfully. The music extractor will use them for future /play requests.",
+        ephemeral=True,
+    )
+
+
+login_group = app_commands.Group(
+    name="login",
+    description="Manage the account used by the music system.",
+)
+
+
+@login_group.command(
+    name="youtube",
+    description="Choose YouTube cookies or Google login for the music system.",
+)
+@app_commands.describe(
+    cookies="Optional exported YouTube cookies.txt file in Netscape format.",
+)
+async def youtube_login(
+    interaction: discord.Interaction,
+    cookies: discord.Attachment | None = None,
+) -> None:
+    await acknowledge_command(interaction)
+
+    if interaction.guild is None:
+        await send_interaction_response(
+            interaction,
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await send_interaction_response(
+            interaction,
+            "You need administrator permissions to configure the bot's YouTube account.",
+            ephemeral=True,
+        )
+        return
+
+    if cookies is not None:
+        await install_youtube_cookies(interaction, cookies)
+        return
+
+    await send_interaction_response(
+        interaction,
+        "YouTube Account Login\nChoose how to connect the YouTube account used by the music system.",
+        view=YouTubeLoginView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
 class MovieBot(discord.Client):
     def __init__(self) -> None:
         self.movie_web_runner: web.AppRunner | None = None
@@ -1845,6 +2034,10 @@ async def sync_commands(interaction: discord.Interaction) -> None:
 
 bot.tree.add_command(channel_group)
 bot.tree.add_command(movie_group)
+
+# Remove any stale top-level /login command/group left by an older version,
+# then register exactly one current /login group.
+bot.tree.remove_command("login")
 bot.tree.add_command(login_group)
 
 
