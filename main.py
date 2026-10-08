@@ -1223,7 +1223,7 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
         "-m",
         "yt_dlp",
         "--cookies", str(BASE_DIR / "cookies.txt"),
-        "--extractor-args", "youtube:player_client=web_safari", # <-- ADD THIS LINE
+        "--extractor-args", "youtube:player_client=android",
         "-4",
     ]
     if shutil.which("deno"):
