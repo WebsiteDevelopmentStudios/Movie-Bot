@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import zipfile
@@ -39,13 +40,32 @@ _log_task: asyncio.Task | None = None
 
 def _java_executable() -> Path | None:
     exe = "java.exe" if os.name == "nt" else "java"
+    candidates = []
+
     existing = shutil.which(exe)
     if existing:
-        return Path(existing)
+        candidates.append(Path(existing))
 
-    candidate = JAVA_DIR / "bin" / exe
-    if candidate.exists():
-        return candidate
+    candidates.append(JAVA_DIR / "bin" / exe)
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            completed = subprocess.run(
+                [str(candidate), "-version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            output = (completed.stdout or "") + (completed.stderr or "")
+            match = __import__("re").search(r'version "([0-9]+)', output)
+            if match and int(match.group(1)) >= 17:
+                return candidate
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+
     return None
 
 
