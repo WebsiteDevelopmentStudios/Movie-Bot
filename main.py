@@ -397,7 +397,8 @@ async def get_media_duration(movie: Path) -> float | None:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(movie),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,        )
+            stderr=asyncio.subprocess.DEVNULL,
+        )
     except (FileNotFoundError, OSError):
         return None
 
@@ -1301,7 +1302,8 @@ class ChannelLinkView(discord.ui.View):
             channel_types=[discord.ChannelType.text],
             min_values=1,
             max_values=1,
-        )        self.channel_select.callback = self.channel_selected
+        )
+        self.channel_select.callback = self.channel_selected
         self.add_item(self.channel_select)
 
     async def channel_selected(self, interaction: discord.Interaction) -> None:
