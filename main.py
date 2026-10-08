@@ -78,7 +78,7 @@ async def send_interaction_response(
     """Send an initial interaction response or a follow-up if already acknowledged."""
     if interaction.response.is_done():
         return await interaction.followup.send(*args, **kwargs)
-    return await send_interaction_response(interaction, *args, **kwargs)
+    return await interaction.response.send_message(*args, **kwargs)
 
 
 def ensure_movies_dir() -> None:
