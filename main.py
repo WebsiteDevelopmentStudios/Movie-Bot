@@ -1218,13 +1218,16 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Enables the plugin framework to automatically fetch and use dynamic PO Tokens.
+    # Route tokens through the public high-availability challenge server endpoint.
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--extractor-args", "youtube:player_client=web,default",
-        "--verbose", # <-- FORCES YT-DLP TO EMIT EXTRACTOR AND PROVIDER HOOK LOGS
+        "--extractor-args", (
+            "youtube:player_client=web,default;"
+            "pot_provider=bgutil:http;" # <-- FORCES REMOTED PROTOCOL HANDSHAKES
+            "pot_provider_args=bgutil:http?server_home=https://bgutil.com" # <-- EXPLICIT TARGET ENDPOINT
+        ),
         "-4",
     ]
     if shutil.which("deno"):
@@ -1233,7 +1236,7 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     else:
         logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
 
-    # Merge incoming parameters (queries/URLs) safely
+    # Merge remaining query paths and flags cleanly
     command.extend(args)
 
     process = await asyncio.create_subprocess_exec(
@@ -1246,21 +1249,15 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         
-        # Look for token signatures inside standard and debugging logs
-        combined_logs = stdout + stderr
-        
-        # Scrape token matching strings
-        token_match = re.search(r"(?:po_token|pot_token|PO Token|poToken)[:=]\s*([a-zA-Z0-9_\-\+\.]+)", combined_logs, re.IGNORECASE)
-        visitor_match = re.search(r"visitor_data[:=]\s*([a-zA-Z0-9_\-\+\.%]+)", combined_logs, re.IGNORECASE)
-        
+        # Scrape and print out token elements directly to the panel console output
+        combined = stdout + stderr
+        token_match = re.search(r"po_token=([a-zA-Z0-9_\-\+\.]+)", combined)
         if token_match:
-            print(f"\n========================================\nFOUND TOKEN FOR PRIVATE REPO:\npo_token: {token_match.group(1)}\n========================================\n", flush=True)
-        if visitor_match:
-            print(f"FOUND VISITOR DATA ID: {visitor_match.group(1)}\n========================================\n", flush=True)
+            print(f"\n========================================\nFOUND TOKEN FOR REPO:\n{token_match.group(1)}\n========================================\n", flush=True)
 
         return process.returncode, stdout, stderr
         
-    except asyncio.timeoutError:
+    except asyncio.TimeoutError:
         process.kill()
         await process.communicate()
         raise
