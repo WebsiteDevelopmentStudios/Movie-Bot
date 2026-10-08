@@ -1458,167 +1458,6 @@ async def save_youtube_cookies(attachment: discord.Attachment) -> tuple[bool, st
     return True, "YouTube cookies imported successfully. /play can now use the linked account."
 
 
-class YouTubeLoginView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=180)
-        self.owner_id = owner_id
-
-    async def allowed(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.owner_id:
-            return True
-        await send_interaction_response(
-            interaction,
-            "Only the member who opened this YouTube login menu can use it.",
-            ephemeral=True,
-        )
-        return False
-
-    @discord.ui.button(label="Cookies", style=discord.ButtonStyle.secondary)
-    async def cookies(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        if not await self.allowed(interaction):
-            return
-
-        await interaction.response.edit_message(
-            content=(
-                "YouTube Cookies Login\n\n"
-                "Upload your exported YouTube cookies.txt file with /login youtube "
-                "and attach the file to the cookies field.\n\n"
-                "The file must be a Netscape-format cookies export. "
-                "Do not paste the cookie contents into chat."
-            ),
-            view=None,
-        )
-
-    @discord.ui.button(label="Login", style=discord.ButtonStyle.primary)
-    async def login(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        if not await self.allowed(interaction):
-            return
-
-        client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-        redirect_uri = os.getenv("YOUTUBE_OAUTH_REDIRECT_URI", "").strip()
-
-        if not client_id or not redirect_uri:
-            await interaction.response.edit_message(
-                content=(
-                    "YouTube Login\n\n"
-                    "The Google login flow is not configured on this bot yet.\n"
-                    "Set GOOGLE_CLIENT_ID and YOUTUBE_OAUTH_REDIRECT_URI "
-                    "in the bot environment, then restart the bot."
-                ),
-                view=None,
-            )
-            return
-
-        state = secrets.token_urlsafe(32)
-        youtube_oauth_states[state] = {
-            "user_id": interaction.user.id,
-            "created": asyncio.get_running_loop().time(),
-        }
-
-        from urllib.parse import urlencode
-
-        params = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "access_type": "offline",
-            "prompt": "consent",
-            "scope": "https://www.googleapis.com/auth/youtube.readonly",
-            "state": state,
-        }
-        login_url = (
-            "https://accounts.google.com/o/oauth2/v2/auth?"
-            + urlencode(params)
-        )
-
-        await interaction.response.edit_message(
-            content=(
-                "YouTube Login\n\n"
-                f"[Sign in with Google]({login_url})\n\n"
-                "After authorization, Google will return you to the bot. "
-                "Your Google password is never sent to Discord."
-            ),
-            view=None,
-        )
-
-
-login_group = app_commands.Group(
-    name="login",
-    description="Link an account used by the music system.",
-)
-
-class YouTubeLoginView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=180)
-        self.owner_id = owner_id
-
-    async def interaction_allowed(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.owner_id:
-            return True
-        await send_interaction_response(
-            interaction,
-            "This YouTube login menu belongs to the member who opened it.",
-            ephemeral=True,
-        )
-        return False
-
-    @discord.ui.button(label="Cookies", style=discord.ButtonStyle.secondary)
-    async def cookies_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await self.interaction_allowed(interaction):
-            return
-        await send_interaction_response(
-            interaction,
-            "Use /login youtube again and attach your exported YouTube cookies.txt file in the cookies field. "
-            "The file must be in Netscape cookie format.",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Login", style=discord.ButtonStyle.primary)
-    async def login_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await self.interaction_allowed(interaction):
-            return
-
-        client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-        redirect_uri = os.getenv("YOUTUBE_OAUTH_REDIRECT_URI", "").strip()
-        if not client_id or not redirect_uri:
-            await send_interaction_response(
-                interaction,
-                "Google YouTube login is not configured. Set GOOGLE_CLIENT_ID and YOUTUBE_OAUTH_REDIRECT_URI first.",
-                ephemeral=True,
-            )
-            return
-
-        state = secrets.token_urlsafe(32)
-        youtube_oauth_states[state] = {
-            "user_id": interaction.user.id,
-            "created": asyncio.get_running_loop().time(),
-        }
-
-        from urllib.parse import urlencode
-        params = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "access_type": "offline",
-            "prompt": "consent",
-            "scope": "https://www.googleapis.com/auth/youtube.readonly",
-            "state": state,
-        }
-        authorization_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
-
-        await send_interaction_response(
-            interaction,
-            f"Open Google to log in: {authorization_url}\n\n"
-            "After Google finishes, return to Discord. "
-            "For yt-dlp playback, you may still need to provide an exported cookies file.",
-            ephemeral=True,
-        )
-
-
 async def install_youtube_cookies(
     interaction: discord.Interaction,
     cookies: discord.Attachment,
@@ -2545,6 +2384,45 @@ async def on_wavelink_websocket_closed(payload) -> None:
         getattr(payload, "reason", "unknown"),
         getattr(payload, "by_remote", "unknown"),
     )
+
+@bot.tree.command(name="join", description="Join your current voice channel.")
+async def voice_join(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if not lavalink_ready:
+        await send_interaction_response(interaction, "The music backend is currently unavailable.", ephemeral=True)
+        return
+    player = await connect_member_voice(interaction)
+    if player is None:
+        await send_interaction_response(interaction, "Join a voice channel first, then use /join.", ephemeral=True)
+        return
+    await send_interaction_response(interaction, f"Joined **{player.channel.name}**.", ephemeral=True)
+
+
+@bot.tree.command(name="leave", description="Leave the voice channel and clear the music queue.")
+async def voice_leave(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
+        return
+    state = get_music_state(interaction.guild.id)
+    player = state.get("player")
+    if player is None or not player.connected:
+        await send_interaction_response(interaction, "I am not in a voice channel.", ephemeral=True)
+        return
+
+    state["stopping"] = True
+    state["queue"].clear()
+    await cancel_lyrics(interaction.guild.id)
+    try:
+        await player.disconnect()
+    except Exception as exc:
+        logger.warning("Lavalink player disconnect failed for guild %s: %s", interaction.guild.id, exc)
+    state["player"] = None
+    state["current"] = None
+    state["stopping"] = False
+    await send_interaction_response(interaction, "Left the voice channel and cleared the queue.", ephemeral=True)
+
+
 
 bot.tree.add_command(channel_group)
 bot.tree.add_command(movie_group)
