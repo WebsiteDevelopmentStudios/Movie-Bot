@@ -2415,26 +2415,32 @@ async def sync_commands(interaction: discord.Interaction) -> None:
         return
 
     try:
-        bot.tree.copy_global_to(guild=interaction.guild)
-        synced = await bot.tree.sync(guild=interaction.guild)
+        # Remove the guild-scoped copies first. This bot already syncs its
+        # canonical command tree globally on startup, so copying the global
+        # tree into the guild creates a second set of visible commands.
+        bot.tree.clear_commands(guild=interaction.guild)
+        await bot.tree.sync(guild=interaction.guild)
+
+        # Keep the existing global sync mechanism as the single source of truth.
+        synced = await bot.tree.sync()
         logger.info(
-            "Synced %d guild slash command(s) to %s (%s).",
+            "Cleared guild-specific commands and synced %d global slash command(s) for %s (%s).",
             len(synced),
             interaction.guild.name,
             interaction.guild.id,
         )
     except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Could not sync guild commands: %s", exc)
+        logger.warning("Could not reset/sync slash commands: %s", exc)
         await send_interaction_response(
             interaction,
-            "I could not sync the commands to this server. Check the bot's application-command permissions and try again.",
+            "I could not reset and sync the commands. Check the bot's application-command permissions and try again.",
             ephemeral=True,
         )
         return
 
     await send_interaction_response(
         interaction,
-        f"Synced {len(synced)} slash command(s) to **{interaction.guild.name}**. They should appear shortly.",
+        f"Removed duplicate server-specific commands and synced {len(synced)} global slash command(s). They may take a little while to refresh.",
         ephemeral=True,
     )
 
