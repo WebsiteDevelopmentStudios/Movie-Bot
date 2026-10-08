@@ -24,8 +24,8 @@ except ImportError:
     wavelink = None
 
 from lavalink_manager import (
-    LAVALINK_HOST,
-    LAVALINK_PORT,
+    LAVALINK_URI,
+    LAVALINK_PASSWORD,
     start_lavalink,
     stop_lavalink,
     wait_until_ready as wait_for_lavalink,
@@ -1174,10 +1174,8 @@ bot = MovieBot()
 
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 
-# Lavalink is now fully managed by the bot. A fresh random password is
-# generated for the local-only Lavalink process on every bot start.
-LAVALINK_PASSWORD = secrets.token_urlsafe(32)
-
+# Lavalink runs separately. Set LAVALINK_URI and LAVALINK_PASSWORD in the
+# hosting environment to match the external Lavalink server.
 music_states: dict[int, dict] = {}
 lavalink_ready = False
 
@@ -1200,7 +1198,7 @@ def get_music_state(guild_id: int) -> dict:
 
 
 def lavalink_uri() -> str:
-    return f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
+    return LAVALINK_URI
 
 
 async def initialize_lavalink() -> None:
@@ -1210,8 +1208,8 @@ async def initialize_lavalink() -> None:
         return
 
     try:
-        # Start and own the Lavalink process instead of requiring a separate
-        # server or any LAVALINK_* environment variables.
+        # Lavalink runs on a separate Java server. The Python container only
+        # connects to it and never downloads or starts a JVM.
         await start_lavalink(LAVALINK_PASSWORD)
         await wait_for_lavalink()
 
@@ -1230,12 +1228,12 @@ async def initialize_lavalink() -> None:
         )
         lavalink_ready = bool(nodes)
         if lavalink_ready:
-            logger.info("Self-hosted Lavalink music backend connected.")
+            logger.info("External Lavalink music backend connected.")
         else:
-            logger.warning("Self-hosted Lavalink did not report a ready Wavelink node.")
+            logger.warning("External Lavalink did not report a ready Wavelink node.")
     except Exception as exc:
         lavalink_ready = False
-        logger.exception("Failed to start self-hosted Lavalink: %s", exc)
+        logger.exception("Failed to connect to external Lavalink: %s", exc)
 
 
 def spotify_track_url(value: str) -> bool:
