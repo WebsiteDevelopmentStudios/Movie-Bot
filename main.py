@@ -2424,6 +2424,37 @@ async def voice_leave(interaction: discord.Interaction) -> None:
 
 
 
+
+@bot.tree.command(name="sync", description="Sync all slash commands to this server.")
+@app_commands.checks.has_permissions(administrator=True)
+async def sync_commands(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
+    if interaction.guild is None:
+        await send_interaction_response(
+            interaction,
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        synced = await bot.tree.sync()
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        logger.warning("Could not sync global commands: %s", exc)
+        await send_interaction_response(
+            interaction,
+            "I could not sync the commands. Please try again later.",
+            ephemeral=True,
+        )
+        return
+
+    await send_interaction_response(
+        interaction,
+        f"Synced {len(synced)} global slash command(s).",
+        ephemeral=True,
+    )
+
+
 bot.tree.add_command(channel_group)
 bot.tree.add_command(movie_group)
 
