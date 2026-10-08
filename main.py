@@ -1545,7 +1545,7 @@ async def download_music_audio(track: dict) -> Path | None:
                             "--no-warnings",
                             "--skip-download",
                             "--get-url",
-                            "--format", "ba/ba*",
+                            "--format", "bestaudio/best",
                             webpage_url,
                         ],
                         timeout=90,
