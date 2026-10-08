@@ -4,3 +4,5 @@ aiohttp>=3.12,<4
 PyNaCl>=1.5,<2
 yt-dlp[default]>=2025.1.0
 davey>=0.1.0
+yt-dlp-get-pot
+bgutil-ytdlp-pot-provider
