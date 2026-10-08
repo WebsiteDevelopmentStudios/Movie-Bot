@@ -29,9 +29,7 @@ The bot can send manually stored movies and can download a user-provided HTTP/HT
 - A Discord bot application/token
 - The bot must be able to view and send messages in the configured movie channel
 - The bot needs Send Messages and Attach Files permissions in that channel
-- FFmpeg installed and available in PATH for voice playback
 - PyNaCl for Discord voice support
-- yt-dlp for music source lookup and audio extraction
 
 ## Installation
 
@@ -70,7 +68,24 @@ From the repository directory:
 
 ## Voice music
 
-The bot uses Lavalink as its music transport. The Discord bot does not directly download or stream YouTube audio from the WispByte/Render process, which keeps the music transport separate from the movie system and avoids depending on public Piped instances.
+The bot uses Lavalink as its music transport. The Discord bot does not directly download or stream## Voice music
+
+The bot now runs its own Lavalink music backend. You do **not** need to create a second Lavalink server, expose port 2333, or configure any `LAVALINK_*` environment variables.
+
+On startup, the bot automatically:
+
+1. Checks for an existing Java 17+ runtime.
+2. If Java is unavailable, downloads a private Java 21 JRE into `.lavalink/java/`.
+3. Downloads Lavalink 4.2.2 if it is not already cached.
+4. Downloads the YouTube Source 1.18.2 plugin if it is not already cached.
+5. Generates a random local Lavalink password.
+6. Starts Lavalink on `127.0.0.1:2333`.
+7. Waits for Lavalink to become ready.
+8. Connects Wavelink to the local server.
+
+The generated password is only used between the bot and its local Lavalink process. It is not stored in Git, and the Lavalink port is bound to localhost.
+
+The runtime files are stored in `.lavalink/` and are ignored by Git. On persistent hosts, they are reused after the first successful download. On ephemeral hosts, they are downloaded again automatically when the service starts.
 
 Commands:
 
@@ -86,24 +101,19 @@ Commands:
 
 Run /join while you are in a voice channel, or use /play while you are already in one. /play accepts normal song searches and Spotify track URLs.
 
-Spotify does not provide Discord bots with unrestricted full-track audio. For a Spotify URL, the bot uses Spotify oEmbed only for title/artist metadata and then asks Lavalink to resolve a playable source separately. The bot never requests a user's Spotify password or stores Spotify credentials.
+Spotify does not provide Discord bots with unrestricted full-track audio. For a Spotify URL, the bot uses Spotify oEmbed only for title/artist metadata and then asks the local Lavalink YouTube Source backend to resolve a playable source separately. The bot never requests a user's Spotify password or stores Spotify credentials.
 
-### Lavalink configuration
+### Self-hosted Lavalink
 
-A Lavalink v4 server is required for music playback. It should be reachable by the WispByte bot over the network.
+Movie-Bot currently bundles its Lavalink bootstrap configuration around:
 
-Set these environment variables:
+- Lavalink 4.2.2
+- YouTube Source 1.18.2
+- Java 21 when an existing Java 17+ installation is not available
 
-    LAVALINK_HOST=your-lavalink-host.example.com
-    LAVALINK_PORT=2333
-    LAVALINK_PASSWORD=your_lavalink_password
-    LAVALINK_SECURE=false
+The YouTube Source plugin is configured with YouTube search enabled and the built-in Lavalink YouTube source disabled, as required by the plugin.
 
-Set LAVALINK_SECURE=true when the Lavalink endpoint is exposed through HTTPS/TLS.
-
-The Lavalink server must have a working audio source configured for the searches used by this bot. The bot deliberately does not implement a collection of public Piped-instance fallbacks or YouTube anti-bot workarounds. If the Lavalink node cannot resolve the requested source, /play reports that the music backend could not load it.
-
-Lavalink and the bot may be hosted separately. This is recommended when the WispByte bot container has a shared outbound IP that is frequently challenged by a media provider.
+If YouTube rejects a particular request, the bot reports that the music source could not be loaded. The self-hosted Lavalink architecture removes the need for public Piped-instance fallbacks, but it cannot guarantee that an external media provider will accept every automated request.
 
 The music queue is maintained independently for each Discord guild. Lavalink owns the actual audio transport while the bot owns queue state, commands, lyrics, and user-facing messages.
 
@@ -113,13 +123,7 @@ Volume is changed through Lavalink's player volume control; the audio pipeline i
 
 The bot acknowledges /play before connecting to voice or performing network resolution, preventing long source lookups from causing Discord interaction timeout errors.
 
-## Link the movie channel
-
-An administrator runs:
-
-    /channel link #movies
-
-The channel ID is stored in config.json, so the setting survives restarts.
+son, so the setting survives restarts.
 
 If the configured channel is deleted or cannot be fetched, an administrator must link another channel.
 
@@ -205,11 +209,14 @@ If a file is too large for the current Discord attachment limit, the bot reports
     ├── Movies/
     │   └── .gitkeep
     ├── main.py
+    ├── lavalink_manager.py
     ├── requirements.txt
     ├── .env.example
     ├── .gitignore
     ├── config.json
     └── README.md
+
+The `.lavalink/` directory is created automatically at runtime and is intentionally not committed to Git.
 
 config.json contains only the linked channel ID. The Discord token is never stored there.
 
