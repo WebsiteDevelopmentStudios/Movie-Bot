@@ -1216,7 +1216,6 @@ async def resolve_spotify_track(value: str) -> dict | None:
         "spotify_url": value.strip(),
     }
 
-
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
     # Route via IOS client structures to step around signature requirements completely
@@ -1233,9 +1232,8 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     else:
         logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
 
-    # ONLY strip out clashing client arguments, preserving search queries and URLs safely
-    cleaned_args = [arg for arg in args if "player_client" not in str(arg)]
-    command.extend(cleaned_args)
+    # Safely append all incoming array arguments without filtering out queries or URLs
+    command.extend(args)
 
     process = await asyncio.create_subprocess_exec(
         *command,
