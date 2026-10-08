@@ -1597,7 +1597,6 @@ async def install_youtube_cookies(
             ephemeral=True,
         )
         return
-
     lines = [line.strip() for line in text_data.splitlines() if line.strip()]
     if not lines or not any(
         line == "# Netscape HTTP Cookie File"
@@ -2396,7 +2395,6 @@ async def on_wavelink_node_disconnected(payload) -> None:
     global lavalink_ready
     lavalink_ready = False
     logger.warning("Lavalink node disconnected: %s", getattr(getattr(payload, "node", None), "identifier", "unknown"))
-
 
 @bot.event
 async def on_wavelink_node_closed(node, disconnected) -> None:
