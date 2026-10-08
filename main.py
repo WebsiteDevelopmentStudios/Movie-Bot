@@ -1389,11 +1389,26 @@ async def send_voice_chat_message(voice_channel: discord.abc.GuildChannel, conte
         return None
 
 
-async def lyrics_loop(guild_id: int, player, voice_channel, track: dict) -> None:
+async def lyrics_loop(
+    guild_id: int,
+    player,
+    voice_channel,
+    track: dict,
+    start_from_position: bool = False,
+) -> None:
     lyrics = track.get("lyrics") or []
     if not lyrics:
         return
+
     last_index = -1
+    if start_from_position:
+        position_seconds = max(0, player.position) / 1000.0
+        for index, (timestamp, _) in enumerate(lyrics):
+            if timestamp <= position_seconds:
+                last_index = index
+            else:
+                break
+
     try:
         while True:
             state = music_states.get(guild_id)
@@ -1562,7 +1577,13 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
     was_playing = state.get("current") is not None or bool(player.playing) or bool(state.get("queue"))
     state["queue"].append(track)
     position = len(state["queue"])
-    await play_next(interaction.guild.id)
+    started = await play_next(interaction.guild.id)
+
+    if not was_playing and not started and state.get("current") is None:
+        await interaction.edit_original_response(
+            content="I couldn't load that audio source from the music backend."
+        )
+        return
 
     if was_playing:
         message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
@@ -1619,6 +1640,20 @@ async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = 
     if enabled is None:
         enabled = not state.get("lyrics_enabled", True)
     state["lyrics_enabled"] = bool(enabled)
+    if state["lyrics_enabled"] and state.get("current") is not None:
+        await cancel_lyrics(interaction.guild.id)
+        player = state.get("player")
+        current = state.get("current")
+        if player is not None and current is not None and current.get("lyrics"):
+            state["lyrics_task"] = asyncio.create_task(
+                lyrics_loop(
+                    interaction.guild.id,
+                    player,
+                    player.channel,
+                    current,
+                    start_from_position=True,
+                )
+            )
     status = "enabled" if enabled else "disabled"
     await interaction.response.send_message(f"Synchronized lyrics are now **{status}**.", ephemeral=True)
 
