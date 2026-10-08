@@ -4,14 +4,22 @@ services:
     runtime: python
     plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt && curl -fsSL https://deno.land/install.sh | sh
-    startCommand: export PATH="$HOME/.deno/bin:$PATH" && python cloud_backend.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: python cloud_backend.py
     healthCheckPath: /health
     envVars:
       - key: DISCORD_TOKEN
         sync: false
       - key: WAKE_SECRET
         sync: false
+      - key: LAVALINK_HOST
+        sync: false
+      - key: LAVALINK_PORT
+        value: "2333"
+      - key: LAVALINK_PASSWORD
+        sync: false
+      - key: LAVALINK_SECURE
+        value: "false"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: MOVIE_HOST
