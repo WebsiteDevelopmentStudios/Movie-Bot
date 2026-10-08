@@ -1232,7 +1232,7 @@ def get_music_state(guild_id: int) -> dict:
             "current": None,
             "volume": 100,
             "lyrics_task": None,
-            "lyrics_enabled": True,
+            "lyrics_enabled": False,
             "advance_lock": asyncio.Lock(),
             "voice_lock": asyncio.Lock(),
             "stopping": False,
@@ -1463,7 +1463,7 @@ async def lyrics_loop(
             state = music_states.get(guild_id)
             if state is None or state.get("current") is not track:
                 return
-            if not state.get("lyrics_enabled", True):
+            if not state.get("lyrics_enabled", False):
                 await asyncio.sleep(0.5)
                 continue
 
@@ -1737,8 +1737,14 @@ async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = 
         return
     state = get_music_state(interaction.guild.id)
     if enabled is None:
-        enabled = not state.get("lyrics_enabled", True)
+        enabled = not state.get("lyrics_enabled", False)
     state["lyrics_enabled"] = bool(enabled)
+    if state["lyrics_enabled"]:
+        await send_interaction_response(
+            interaction,
+            "Warning: This Feature Is In Beta, Don't Expect A Fully Working Version Soon",
+            ephemeral=True,
+        )
     if state["lyrics_enabled"] and state.get("current") is not None:
         await cancel_lyrics(interaction.guild.id)
         player = state.get("player")
@@ -1876,7 +1882,7 @@ async def on_wavelink_track_start(payload) -> None:
         return
     await cancel_lyrics(player.guild.id)
     track = state["current"]
-    if track.get("lyrics") and state.get("lyrics_enabled", True):
+    if track.get("lyrics") and state.get("lyrics_enabled", False):
         state["lyrics_task"] = asyncio.create_task(
             lyrics_loop(player.guild.id, player, player.channel, track)
         )
