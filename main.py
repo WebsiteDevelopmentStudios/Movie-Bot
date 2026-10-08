@@ -1218,15 +1218,12 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
-    # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Only select Deno when it is actually installed on the host. Wispbyte
-    # Python containers do not necessarily include Deno, and forcing a
-    # missing runtime makes every YouTube search fail immediately.
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--cookies", str(BASE_DIR / "cookies.txt"), # <-- UPDATE THIS EXACT LINE
+        "--cookies", str(BASE_DIR / "cookies.txt"),
+        "--extractor-args", "youtube:player_client=web_safari", # <-- ADD THIS LINE
     ]
     if shutil.which("deno"):
         command.extend(["--js-runtimes", "deno"])
