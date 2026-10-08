@@ -58,6 +58,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("movie-bot")
 
+async def acknowledge_command(interaction: discord.Interaction) -> None:
+    """Acknowledge a slash command immediately so long-running work cannot expire it."""
+    if interaction.response.is_done():
+        return
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException as exc:
+        if exc.status == 400 and "40060" in str(exc):
+            return
+        raise
+
+
+async def send_interaction_response(
+    interaction: discord.Interaction,
+    *args,
+    **kwargs,
+):
+    """Send an initial interaction response or a follow-up if already acknowledged."""
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, **kwargs)
+    return await send_interaction_response(interaction, *args, **kwargs)
+
+
 def ensure_movies_dir() -> None:
     MOVIES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -184,7 +207,7 @@ class MovieSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "This movie list belongs to the member who opened it.",
                 ephemeral=True,
             )
@@ -197,14 +220,14 @@ class MovieSelect(discord.ui.Select):
         )
 
         if selected is None or not selected.exists() or not selected.is_file():
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "That movie is no longer available. Use /movie list to refresh the list.",
                 ephemeral=True,
             )
             return
 
         view = MovieConfirmView(selected, self.owner_id)
-        await interaction.response.send_message(
+        await send_interaction_response(interaction, 
             f"Selected {selected.stem}. Press Select This Movie to send it.",
             view=view,
             ephemeral=True,
@@ -222,7 +245,7 @@ class MovieConfirmView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "You cannot use another member's movie selection.",
                 ephemeral=True,
             )
@@ -297,7 +320,7 @@ class MovieListView(discord.ui.View):
         if interaction.user.id == self.owner_id:
             return True
 
-        await interaction.response.send_message(
+        await send_interaction_response(interaction, 
             "This movie list belongs to the member who opened it.",
             ephemeral=True,
         )
@@ -1036,7 +1059,7 @@ class ChannelLinkView(discord.ui.View):
 
     async def channel_selected(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "This channel selector belongs to the administrator who opened it.",
                 ephemeral=True,
             )
@@ -1048,7 +1071,7 @@ class ChannelLinkView(discord.ui.View):
         # response works consistently across channel object types.
         channel_id = getattr(selected_channel, "id", None)
         if not isinstance(channel_id, int):
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "I could not read the selected channel. Please try again.",
                 ephemeral=True,
             )
@@ -1062,7 +1085,7 @@ class ChannelLinkView(discord.ui.View):
                 channel = None
 
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "Please select a text channel.",
                 ephemeral=True,
             )
@@ -1073,7 +1096,7 @@ class ChannelLinkView(discord.ui.View):
             save_config(config)
         except OSError as exc:
             logger.error("Could not save config: %s", exc)
-            await interaction.response.send_message(
+            await send_interaction_response(interaction, 
                 "I could not save the channel configuration.",
                 ephemeral=True,
             )
@@ -1583,25 +1606,27 @@ async def play_next(guild_id: int) -> bool:
 
 @bot.tree.command(name="join", description="Join your current voice channel.")
 async def voice_join(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if not lavalink_ready:
-        await interaction.response.send_message("The music backend is currently unavailable.", ephemeral=True)
+        await send_interaction_response(interaction, "The music backend is currently unavailable.", ephemeral=True)
         return
     player = await connect_member_voice(interaction)
     if player is None:
-        await interaction.response.send_message("Join a voice channel first, then use /join.", ephemeral=True)
+        await send_interaction_response(interaction, "Join a voice channel first, then use /join.", ephemeral=True)
         return
-    await interaction.response.send_message(f"Joined **{player.channel.name}**.", ephemeral=True)
+    await send_interaction_response(interaction, f"Joined **{player.channel.name}**.", ephemeral=True)
 
 
 @bot.tree.command(name="leave", description="Leave the voice channel and clear the music queue.")
 async def voice_leave(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     player = state.get("player")
     if player is None or not player.connected:
-        await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
+        await send_interaction_response(interaction, "I am not in a voice channel.", ephemeral=True)
         return
 
     state["stopping"] = True
@@ -1614,22 +1639,16 @@ async def voice_leave(interaction: discord.Interaction) -> None:
     state["player"] = None
     state["current"] = None
     state["stopping"] = False
-    await interaction.response.send_message("Left the voice channel and cleared the queue.", ephemeral=True)
+    await send_interaction_response(interaction, "Left the voice channel and cleared the queue.", ephemeral=True)
 
 
 @bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
-
-    try:
-        await interaction.response.defer(ephemeral=True)
-    except discord.HTTPException as exc:
-        if exc.status != 400 or "40060" not in str(exc):
-            raise
-        logger.warning("Music /play interaction was already acknowledged; continuing with followups.")
 
     if not lavalink_ready:
         await interaction.edit_original_response(content="The music backend is currently unavailable.")
@@ -1671,47 +1690,50 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
 
 @bot.tree.command(name="pause", description="Pause the current song.")
 async def music_pause(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     player = state.get("player")
     if player is None or not player.playing or player.paused:
-        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        await send_interaction_response(interaction, "Nothing is currently playing.", ephemeral=True)
         return
     try:
         await player.pause(True)
     except Exception as exc:
         logger.warning("Could not pause music: %s", exc)
-        await interaction.response.send_message("I couldn't pause the current song.", ephemeral=True)
+        await send_interaction_response(interaction, "I couldn't pause the current song.", ephemeral=True)
         return
-    await interaction.response.send_message("Paused the current song.", ephemeral=True)
+    await send_interaction_response(interaction, "Paused the current song.", ephemeral=True)
 
 
 @bot.tree.command(name="resume", description="Resume the paused song.")
 async def music_resume(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     player = state.get("player")
     if player is None or not player.paused:
-        await interaction.response.send_message("The song is not paused.", ephemeral=True)
+        await send_interaction_response(interaction, "The song is not paused.", ephemeral=True)
         return
     try:
         await player.pause(False)
     except Exception as exc:
         logger.warning("Could not resume music: %s", exc)
-        await interaction.response.send_message("I couldn't resume the current song.", ephemeral=True)
+        await send_interaction_response(interaction, "I couldn't resume the current song.", ephemeral=True)
         return
-    await interaction.response.send_message("Resumed the current song.", ephemeral=True)
+    await send_interaction_response(interaction, "Resumed the current song.", ephemeral=True)
 
 
 @bot.tree.command(name="lyrics", description="Toggle synchronized lyrics on or off.")
 @app_commands.describe(enabled="Turn synchronized lyrics on or off. Leave empty to toggle.")
 async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = None) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     if enabled is None:
@@ -1732,33 +1754,35 @@ async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = 
                 )
             )
     status = "enabled" if enabled else "disabled"
-    await interaction.response.send_message(f"Synchronized lyrics are now **{status}**.", ephemeral=True)
+    await send_interaction_response(interaction, f"Synchronized lyrics are now **{status}**.", ephemeral=True)
 
 
 @bot.tree.command(name="skip", description="Skip the currently playing song.")
 async def music_skip(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     player = state.get("player")
     if player is None or not player.playing:
-        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        await send_interaction_response(interaction, "Nothing is currently playing.", ephemeral=True)
         return
     await cancel_lyrics(interaction.guild.id)
     try:
         await player.stop()
     except Exception as exc:
         logger.warning("Could not skip current track: %s", exc)
-        await interaction.response.send_message("I couldn't skip the current song.", ephemeral=True)
+        await send_interaction_response(interaction, "I couldn't skip the current song.", ephemeral=True)
         return
-    await interaction.response.send_message("Skipped the current song.", ephemeral=True)
+    await send_interaction_response(interaction, "Skipped the current song.", ephemeral=True)
 
 
 @bot.tree.command(name="queue", description="Show the current music queue.")
 async def music_queue(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     current = state.get("current")
@@ -1772,14 +1796,15 @@ async def music_queue(interaction: discord.Interaction) -> None:
         lines.append(f"**{index}.** {track['title']} — {track['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
     if not lines:
         lines = ["The music queue is empty."]
-    await interaction.response.send_message("\n".join(lines[:51]), ephemeral=True)
+    await send_interaction_response(interaction, "\n".join(lines[:51]), ephemeral=True)
 
 
 @bot.tree.command(name="volume", description="Set the music volume.")
 @app_commands.describe(level="Volume from 0 to 100.")
 async def music_volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     state["volume"] = int(level)
@@ -1789,15 +1814,16 @@ async def music_volume(interaction: discord.Interaction, level: app_commands.Ran
             await player.set_volume(int(level))
         except Exception as exc:
             logger.warning("Could not change Lavalink volume: %s", exc)
-            await interaction.response.send_message("I couldn't change the current volume.", ephemeral=True)
+            await send_interaction_response(interaction, "I couldn't change the current volume.", ephemeral=True)
             return
-    await interaction.response.send_message(f"Volume set to **{level}%**.", ephemeral=True)
+    await send_interaction_response(interaction, f"Volume set to **{level}%**.", ephemeral=True)
 
 
 @bot.tree.command(name="stop", description="Stop music and clear the queue.")
 async def music_stop(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
     state["queue"].clear()
@@ -1812,7 +1838,7 @@ async def music_stop(interaction: discord.Interaction) -> None:
         finally:
             state["stopping"] = False
     state["current"] = None
-    await interaction.response.send_message("Stopped playback and cleared the queue.", ephemeral=True)
+    await send_interaction_response(interaction, "Stopped playback and cleared the queue.", ephemeral=True)
 
 
 @bot.event
@@ -1907,7 +1933,8 @@ movie_group = app_commands.Group(
 @channel_group.command(name="link", description="Choose the channel where movies will be sent.")
 @app_commands.checks.has_permissions(administrator=True)
 async def channel_link(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message(
+    await acknowledge_command(interaction)
+    await send_interaction_response(interaction, 
         "Choose the Discord text channel where movies should be sent:",
         view=ChannelLinkView(interaction.user.id),
         ephemeral=True,
@@ -1916,17 +1943,18 @@ async def channel_link(interaction: discord.Interaction) -> None:
 
 @movie_group.command(name="list", description="Privately list all available movies.")
 async def movie_list(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     movies = get_movie_files()
 
     if not movies:
-        await interaction.response.send_message(
+        await send_interaction_response(interaction, 
             "No movies are currently available.",
             ephemeral=True,
         )
         return
 
     view = MovieListView(movies, interaction.user.id)
-    await interaction.response.send_message(
+    await send_interaction_response(interaction, 
         embed=movie_embed(movies, 0, view.per_page),
         view=view,
         ephemeral=True,
@@ -2360,6 +2388,7 @@ async def finish_m3u8_host(
 @movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
 @app_commands.describe(movie="Movie name, or an HTTP/HTTPS .m3u8 URL.")
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
+    await acknowledge_command(interaction)
     if is_m3u8_url(movie):
         await interaction.response.defer(ephemeral=True)
 
@@ -2411,7 +2440,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
 
 
     if not get_movie_files():
-        await interaction.response.send_message(
+        await send_interaction_response(interaction, 
             "No movies are currently available.",
             ephemeral=True,
         )
@@ -2419,7 +2448,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
 
     selected = find_movie(movie)
     if selected is None:
-        await interaction.response.send_message(
+        await send_interaction_response(interaction, 
             "That movie is not available. Use /movie list or provide an HTTP/HTTPS .m3u8 URL.",
             ephemeral=True,
         )
@@ -2460,8 +2489,9 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
 @bot.tree.command(name="sync", description="Sync all slash commands to this server.")
 @app_commands.checks.has_permissions(administrator=True)
 async def sync_commands(interaction: discord.Interaction) -> None:
+    await acknowledge_command(interaction)
     if interaction.guild is None:
-        await interaction.response.send_message(
+        await send_interaction_response(interaction, 
             "This command can only be used inside a server.",
             ephemeral=True,
         )
@@ -2517,7 +2547,7 @@ async def on_app_command_error(
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await send_interaction_response(interaction, message, ephemeral=True)
     except (discord.NotFound, discord.HTTPException) as response_error:
         # The interaction token can expire while a long-running command is
         # failing. Do not create a second traceback for the error handler.
