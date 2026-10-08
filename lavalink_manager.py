@@ -50,7 +50,7 @@ async def start_lavalink(password: str | None = None) -> None:
     logger.info("Using external Lavalink at %s.", LAVALINK_URI)
 
 
-async def wait_until_ready(timeout: float = 20.0) -> None:
+async def wait_until_ready(timeout: float = 120.0) -> None:
     """Wait until the external Lavalink HTTP endpoint responds."""
     _validate_lavalink_config()
     deadline = asyncio.get_running_loop().time() + timeout
