@@ -1537,19 +1537,19 @@ async def download_music_audio(track: dict) -> Path | None:
                     continue
 
                 token = secrets.token_hex(12)
-                output_template = str(MUSIC_CACHE_DIR / f"{token}.%(ext)s")
-                 try:
-            code, stdout, stderr = await run_yt_dlp(
-                [
-                    "--no-playlist",
-                    "--no-warnings",
-                    "--skip-download",
-                    "--get-url",
-                    "--format", "ba/ba*",
-                    webpage_url,
-                ],
-                timeout=90,
-            )
+                title = str(candidate.get("title") or track.get("title") or "unknown")
+                try:
+                    code, stdout, stderr = await run_yt_dlp(
+                        [
+                            "--no-playlist",
+                            "--no-warnings",
+                            "--skip-download",
+                            "--get-url",
+                            "--format", "ba/ba*",
+                            webpage_url,
+                        ],
+                        timeout=90,
+                    )
                 except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
                     logger.warning("yt-dlp audio download failed for %s: %s", candidate.get("title", "unknown"), exc)
                     continue
