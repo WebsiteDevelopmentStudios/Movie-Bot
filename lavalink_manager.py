@@ -34,18 +34,35 @@ _log_task: asyncio.Task | None = None
 
 
 def _java_executable() -> Path | None:
+    """Find Java supplied by the hosting environment.
+
+    Do not use .lavalink/java here. Bot-hosting.net has a small disk quota,
+    and downloading/extracting a second JVM caused the previous deployment
+    to consume excessive disk and memory.
+    """
     exe = "java.exe" if os.name == "nt" else "java"
-    candidates = []
+    candidates: list[Path] = []
+
+    java_home = os.getenv("JAVA_HOME", "").strip()
+    if java_home:
+        candidates.append(Path(java_home) / "bin" / exe)
 
     existing = shutil.which(exe)
     if existing:
         candidates.append(Path(existing))
 
-    candidates.append(JAVA_DIR / "bin" / exe)
-
+    seen: set[str] = set()
     for candidate in candidates:
-        if not candidate.exists():
+        try:
+            candidate = candidate.expanduser()
+            key = str(candidate.resolve())
+        except OSError:
+            key = str(candidate)
+
+        if key in seen or not candidate.is_file():
             continue
+        seen.add(key)
+
         try:
             completed = subprocess.run(
                 [str(candidate), "-version"],
@@ -64,101 +81,44 @@ def _java_executable() -> Path | None:
     return None
 
 
-def _download(url: str, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = Request(url, headers={"User-Agent": "Movie-Bot/1.0"})
-    with urlopen(request, timeout=120) as response, destination.open("wb") as output:
-        shutil.copyfileobj(response, output)
+def _cleanup_private_java() -> None:
+    """Delete any old bundled JVM left by previous Movie-Bot releases."""
+    if not JAVA_DIR.exists():
+        return
 
-
-def _adoptium_asset_url() -> str:
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-
-    if system == "windows":
-        os_name = "windows"
-    elif system == "darwin":
-        os_name = "mac"
-    else:
-        os_name = "linux"
-
-    if machine in {"aarch64", "arm64"}:
-        architecture = "aarch64"
-    elif machine in {"x86_64", "amd64", "x64"}:
-        architecture = "x64"
-    elif machine in {"x86", "i386", "i686"}:
-        architecture = "x32"
-    else:
-        raise RuntimeError(f"Unsupported CPU architecture for automatic Java setup: {machine}")
-
-    api_url = (
-        f"https://api.adoptium.net/v3/assets/latest/{JAVA_MAJOR}/hotspot"
-        f"?architecture={architecture}&image_type=jre&os={os_name}&vendor=eclipse"
-    )
-    request = Request(api_url, headers={"User-Agent": "Movie-Bot/1.0"})
-    with urlopen(request, timeout=30) as response:
-        assets = json.load(response)
-
-    if not assets:
-        raise RuntimeError(f"Adoptium did not provide a Java {JAVA_MAJOR} JRE for {os_name}/{architecture}.")
-
-    return assets[0]["binary"]["package"]["link"]
-
-
-def _extract_java(archive: Path) -> None:
-    JAVA_DIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=RUNTIME_DIR) as temp:
-        temp_dir = Path(temp)
-        if archive.suffix.lower() == ".zip":
-            with zipfile.ZipFile(archive) as zf:
-                zf.extractall(temp_dir)
-        else:
-            with tarfile.open(archive, "r:*") as tf:
-                tf.extractall(temp_dir)
-
-        java_candidates = list(temp_dir.rglob("java.exe" if os.name == "nt" else "java"))
-        if not java_candidates:
-            raise RuntimeError("The downloaded Java archive did not contain a Java executable.")
-
-        java_bin = java_candidates[0]
-        source_root = java_bin.parent.parent
-        if JAVA_DIR.exists():
-            shutil.rmtree(JAVA_DIR)
-        shutil.copytree(source_root, JAVA_DIR)
+    try:
+        shutil.rmtree(JAVA_DIR)
+        logger.info("Removed unused private Java runtime to recover disk space.")
+    except OSError as exc:
+        logger.warning("Could not remove old private Java runtime: %s", exc)
 
 
 def _ensure_java() -> Path:
-    existing = _java_executable()
-    if existing:
-        # Prefer the host's Java. If an older private runtime was downloaded
-        # by an earlier Movie-Bot release, remove it to recover disk space.
-        private_java = JAVA_DIR
-        if private_java.exists() and private_java.resolve() != existing.resolve():
-            try:
-                shutil.rmtree(private_java)
-                logger.info("Removed unused private Java runtime to recover disk space.")
-            except OSError as exc:
-                logger.warning("Could not remove old private Java runtime: %s", exc)
-        return existing
-
-    logger.info("No Java 17+ runtime found. Downloading a private Java %s runtime...", JAVA_MAJOR)
-    archive_url = _adoptium_asset_url()
-    suffix = ".zip" if platform.system().lower() == "windows" else ".tar.gz"
-    archive = RUNTIME_DIR / f"java-{JAVA_MAJOR}{suffix}"
-    if not archive.exists():
-        _download(archive_url, archive)
-
-    _extract_java(archive)
-    try:
-        archive.unlink()
-    except OSError:
-        pass
-
+    # Always use the host-provided JVM. Never download another JVM into the
+    # bot's storage volume.
     java = _java_executable()
-    if java is None:
-        raise RuntimeError("Automatic Java installation completed, but the Java executable could not be found.")
-    return java
 
+    if java is None:
+        raise RuntimeError(
+            "Movie-Bot requires Java 17 or newer for Lavalink, but no host Java "
+            "runtime was found. Install/provide Java 17+ in the hosting panel "
+            "(JAVA_HOME or PATH) instead of downloading a private JVM."
+        )
+
+    # Clean up a JVM left behind by older versions after we have selected the
+    # host JVM. This prevents the returned executable from ever pointing into
+    # the directory we are deleting.
+    _cleanup_private_java()
+
+    # Verify the executable still exists after cleanup. This also protects
+    # against unusual hosting setups where JAVA_HOME points at .lavalink/java.
+    if not java.is_file():
+        raise RuntimeError(
+            f"The configured host Java executable disappeared during cleanup: {java}"
+        )
+
+    logger.info("Using host Java for Lavalink: %s", java)
+    return java
 
 def _cleanup_legacy_plugin_copy() -> None:
     """Remove the plugin copy created by older Movie-Bot builds."""
@@ -306,9 +266,9 @@ async def start_lavalink(password: str) -> None:
     # Bot-hosting services commonly enforce tight memory/CPU quotas. Keep
     # Lavalink deliberately small so the Discord bot and movie server retain
     # resources. The values can be overridden for larger hosts.
-    xms = os.getenv("LAVALINK_XMS", "64m")
-    xmx = os.getenv("LAVALINK_XMX", "256m")
-    metaspace = os.getenv("LAVALINK_MAX_METASPACE", "96m")
+    xms = os.getenv("LAVALINK_XMS", "48m")
+    xmx = os.getenv("LAVALINK_XMX", "192m")
+    metaspace = os.getenv("LAVALINK_MAX_METASPACE", "64m")
 
     _process = await asyncio.create_subprocess_exec(
         str(java),
