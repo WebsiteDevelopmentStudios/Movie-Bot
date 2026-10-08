@@ -26,6 +26,7 @@ except ImportError:
 from lavalink_manager import (
     LAVALINK_URI,
     LAVALINK_PASSWORD,
+    keep_lavalink_awake,
     start_lavalink,
     stop_lavalink,
     wait_until_ready as wait_for_lavalink,
@@ -1090,12 +1091,23 @@ class ChannelLinkView(discord.ui.View):
 class MovieBot(discord.Client):
     def __init__(self) -> None:
         self.movie_web_runner: web.AppRunner | None = None
+        self.lavalink_keepalive_task: asyncio.Task | None = None
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         self.movie_web_runner = await start_movie_web_server()
+
+        # Render free web services can suspend after a period without inbound
+        # HTTP traffic. Start the keep-alive before connecting so a sleeping
+        # Lavalink service is woken while initialize_lavalink waits for it.
+        if LAVALINK_URI and LAVALINK_PASSWORD:
+            self.lavalink_keepalive_task = asyncio.create_task(
+                keep_lavalink_awake(),
+                name="lavalink-render-keepalive",
+            )
+
         await initialize_lavalink()
 
         try:
@@ -1129,6 +1141,14 @@ class MovieBot(discord.Client):
     async def close(self) -> None:
         for guild_id in list(music_states):
             await cancel_lyrics(guild_id)
+        if self.lavalink_keepalive_task is not None:
+            self.lavalink_keepalive_task.cancel()
+            try:
+                await self.lavalink_keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self.lavalink_keepalive_task = None
+
         if wavelink is not None:
             try:
                 await wavelink.Pool.close()
