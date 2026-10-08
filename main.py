@@ -1672,6 +1672,86 @@ async def voice_leave(interaction: discord.Interaction) -> None:
     await send_interaction_response(interaction, "Left the voice channel and cleared the queue.", ephemeral=True)
 
 
+@bot.tree.command(name="login", description="Link the bot's YouTube account using an exported cookies file.")
+@app_commands.describe(cookies="Your exported YouTube cookies.txt file in Netscape format.")
+async def youtube_login(interaction: discord.Interaction, cookies: discord.Attachment) -> None:
+    """Install the dedicated YouTube account's exported cookies for yt-dlp.
+
+    This intentionally uses a cookies-file upload instead of pretending to be a
+    browser or trying to convert youtube-source OAuth tokens into yt-dlp
+    credentials. The uploaded file replaces the bot's current cookie file.
+    """
+    await acknowledge_command(interaction)
+
+    owner_id = os.getenv("OWNER_ID", "").strip()
+    if owner_id:
+        try:
+            allowed = interaction.user.id == int(owner_id)
+        except ValueError:
+            logger.warning("OWNER_ID is not a valid Discord user ID.")
+            allowed = False
+    else:
+        try:
+            app_info = await bot.application_info()
+            allowed = interaction.user.id == app_info.owner.id
+        except Exception as exc:
+            logger.warning("Could not determine bot owner for /login: %s", exc)
+            allowed = False
+
+    if not allowed:
+        await interaction.edit_original_response(
+            content="Only the bot owner can link the YouTube account."
+        )
+        return
+
+    filename = (cookies.filename or "").lower()
+    if not filename.endswith(".txt"):
+        await interaction.edit_original_response(
+            content="Upload the exported Netscape-format YouTube cookies .txt file."
+        )
+        return
+
+    if cookies.size and cookies.size > 10 * 1024 * 1024:
+        await interaction.edit_original_response(
+            content="That cookies file is too large."
+        )
+        return
+
+    cookie_path = Path(
+        os.getenv("YOUTUBE_COOKIES_FILE", str(BASE_DIR / "youtube-cookies.txt"))
+    ).expanduser()
+
+    try:
+        cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        data = await cookies.read()
+        if b"# Netscape HTTP Cookie File" not in data[:4096] and b"# HTTP Cookie File" not in data[:4096]:
+            await interaction.edit_original_response(
+                content="That does not look like a Netscape-format cookies.txt export."
+            )
+            return
+
+        temp_path = cookie_path.with_suffix(cookie_path.suffix + ".tmp")
+        temp_path.write_bytes(data)
+        temp_path.replace(cookie_path)
+    except Exception as exc:
+        logger.exception("Could not install YouTube cookies: %s", exc)
+        await interaction.edit_original_response(
+            content="I could not save the YouTube cookies file."
+        )
+        return
+
+    logger.info(
+        "YouTube cookies were updated by the bot owner. File: %s",
+        cookie_path,
+    )
+    await interaction.edit_original_response(
+        content=(
+            "YouTube account linked successfully. The exported cookies are now "
+            "available to yt-dlp. Try /play again."
+        )
+    )
+
+
 @bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
