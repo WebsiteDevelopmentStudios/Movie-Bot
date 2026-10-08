@@ -2390,8 +2390,6 @@ async def finish_m3u8_host(
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     await acknowledge_command(interaction)
     if is_m3u8_url(movie):
-        await interaction.response.defer(ephemeral=True)
-
         async def progress(message: str) -> None:
             try:
                 await interaction.edit_original_response(content=message)
@@ -2454,8 +2452,6 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
-
     async def progress(message: str) -> None:
         try:
             await interaction.edit_original_response(content=message)
@@ -2497,7 +2493,6 @@ async def sync_commands(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
     try:
         synced = await bot.tree.sync()
     except (discord.Forbidden, discord.HTTPException) as exc:
@@ -2528,6 +2523,15 @@ async def on_app_command_error(
         # to acknowledge it. This is not recoverable with another response.
         logger.warning("Discord interaction expired before it could be acknowledged (10062).")
         return
+
+    try:
+        await acknowledge_command(interaction)
+    except discord.NotFound as response_error:
+        if getattr(response_error, "code", None) == 10062:
+            logger.warning("Discord interaction expired while handling a slash command error (10062).")
+            return
+        raise
+
     if isinstance(error, app_commands.MissingPermissions):
         message = "You need administrator permissions to use that command."
     elif isinstance(error, app_commands.CommandInvokeError):
