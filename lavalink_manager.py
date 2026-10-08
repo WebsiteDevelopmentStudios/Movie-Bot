@@ -231,7 +231,6 @@ async def start_lavalink(password: str) -> None:
         str(java),
         "-jar",
         str(LAVALINK_JAR),
-        "--spring.config.additional-location=" + str(CONFIG_FILE),
         cwd=str(RUNTIME_DIR),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
