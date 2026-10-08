@@ -31,6 +31,7 @@ from lavalink_manager import (
     stop_lavalink,
     wait_until_ready as wait_for_lavalink,
 )
+from youtube_extractor import extract_youtube_audio
 
 load_dotenv()
 
@@ -1319,8 +1320,17 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 
 async def resolve_music_source(query: str) -> dict | None:
+    """Resolve a song and hand Lavalink a direct, short-lived audio URL.
+
+    YouTube's current playback API can return SABR-only formats that the
+    youtube-source plugin cannot always turn into a playable Lavalink track.
+    We therefore use yt-dlp as an extractor and let Lavalink's HTTP source
+    handle the resulting audio URL. YouTube authentication/cookies stay in
+    the extractor environment and are never sent to Discord.
+    """
     if not lavalink_ready or wavelink is None:
         return None
+
     is_spotify = spotify_track_url(query)
     spotify_info = await resolve_spotify_track(query) if is_spotify else None
     if is_spotify and spotify_info is None:
@@ -1328,39 +1338,59 @@ async def resolve_music_source(query: str) -> dict | None:
 
     if spotify_info:
         search_term = f"{spotify_info['artist']} - {spotify_info['title']}"
-        identifier = f"ytsearch:{search_term}"
     else:
         search_term = query.strip()
         if not search_term:
             return None
-        identifier = search_term if search_term.startswith(("http://", "https://")) else f"ytsearch:{search_term}"
 
     try:
-        results = await wavelink.Pool.fetch_tracks(identifier)
+        extracted = await extract_youtube_audio(search_term)
     except Exception as exc:
-        logger.warning("Lavalink could not resolve %r: %s", search_term, exc)
+        logger.warning("YouTube extractor failed for %r: %s", search_term, exc)
         return None
+
+    if not extracted or not extracted.get("url"):
+        return None
+
+    audio_url = str(extracted["url"])
+    try:
+        results = await wavelink.Pool.fetch_tracks(audio_url)
+    except Exception as exc:
+        logger.warning("Lavalink could not load extracted audio for %r: %s", search_term, exc)
+        return None
+
     if not results:
         return None
+
     tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results)
     if not tracks:
         return None
 
     playable = tracks[0]
-    title = str(getattr(playable, "title", "") or "").strip()
+    title = str(extracted.get("title") or getattr(playable, "title", "") or "").strip()
     if not title:
         return None
+
     artist = (
         str(spotify_info["artist"]).strip()
         if spotify_info
-        else str(getattr(playable, "author", "") or "Unknown Artist").strip()
+        else str(extracted.get("artist") or getattr(playable, "author", "") or "Unknown Artist").strip()
     )
+
     return {
         "track": playable,
         "title": title,
         "artist": artist or "Unknown Artist",
-        "duration": max(0, int(getattr(playable, "length", 0) or 0)),
+        "duration": max(
+            0,
+            int(
+                extracted.get("duration_ms")
+                or getattr(playable, "length", 0)
+                or 0
+            ),
+        ),
         "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
+        "youtube_url": extracted.get("webpage_url"),
         "lyrics": [],
     }
 
