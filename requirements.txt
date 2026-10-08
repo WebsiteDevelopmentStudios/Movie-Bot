@@ -4,3 +4,4 @@ aiohttp>=3.12,<4
 PyNaCl>=1.5,<2
 davey>=0.1.0
 wavelink>=3.5.2,<4
+yt-dlp>=2026.9.26
