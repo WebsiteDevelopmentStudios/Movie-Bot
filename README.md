@@ -110,6 +110,7 @@ Movie-Bot currently bundles its Lavalink bootstrap configuration around:
 - Lavalink 4.2.2
 - YouTube Source 1.18.2
 - Java 21 when an existing Java 17+ installation is not available
+- A conservative Lavalink profile capped at 256 MB heap, one active JVM processor, and small rolling logs for low-resource hosting
 
 The YouTube Source plugin is configured with YouTube search enabled and the built-in Lavalink YouTube source disabled, as required by the plugin.
 
