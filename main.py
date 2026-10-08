@@ -397,8 +397,7 @@ async def get_media_duration(movie: Path) -> float | None:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(movie),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+            stderr=asyncio.subprocess.DEVNULL,        )
     except (FileNotFoundError, OSError):
         return None
 
@@ -580,6 +579,112 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
 
     await clear_hosted_movie(token)
     return False, "The movie stream took too long to start."
+
+
+def is_m3u8_url(value: str) -> bool:
+    """Return True for a valid HTTP(S) URL whose path is an M3U8 playlist."""
+    try:
+        parsed = urlparse(value.strip())
+    except (AttributeError, ValueError):
+        return False
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.netloc)
+        and parsed.path.lower().endswith(M3U8_SUFFIX)
+    )
+
+
+async def stream_m3u8_movie(
+    url: str,
+    progress=None,
+) -> tuple[bool, str | None, Path | None]:
+    """Download an M3U8 stream to Movies, then prepare the normal hosted player."""
+    if not is_m3u8_url(url):
+        return False, None, None
+
+    ensure_movies_dir()
+    filename = f"M3U8-{secrets.token_hex(5)}.mp4"
+    downloaded = MOVIES_DIR / filename
+    temporary = MOVIES_DIR / f".{filename}.part.mp4"
+
+    if progress is not None:
+        await progress("Downloading the M3U8 movie...")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            url.strip(),
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(temporary),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return False, None, None
+    except OSError as exc:
+        logger.warning("Could not start M3U8 download: %s", exc)
+        return False, None, None
+
+    try:
+        _, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        temporary.unlink(missing_ok=True)
+        logger.warning("M3U8 download exceeded the %s-second timeout.", DOWNLOAD_TIMEOUT_SECONDS)
+        return False, None, None
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        temporary.unlink(missing_ok=True)
+        raise
+
+    if process.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        error_text = stderr.decode("utf-8", errors="replace").strip()
+        logger.warning("M3U8 download failed: %s", error_text[-2000:])
+        temporary.unlink(missing_ok=True)
+        return False, None, None
+
+    duration = await get_media_duration(temporary)
+    if duration is None:
+        logger.warning("Downloaded M3U8 output is not a readable media file.")
+        temporary.unlink(missing_ok=True)
+        return False, None, None
+
+    try:
+        temporary.replace(downloaded)
+    except OSError as exc:
+        logger.warning("Could not finalize downloaded M3U8 movie: %s", exc)
+        temporary.unlink(missing_ok=True)
+        return False, None, None
+
+    if progress is not None:
+        await progress("Preparing the Discord movie player...")
+
+    success, player_url = await host_movie(downloaded, progress)
+    if not success:
+        return False, None, downloaded
+
+    return True, player_url, downloaded
 
 
 async def _get_active_host(token: str):
@@ -798,7 +903,6 @@ async def hosted_media_handler(request: web.Request) -> web.StreamResponse:
             return web.Response(status=404, text="Movie is not ready yet.")
     except OSError:
         return web.Response(status=404, text="Movie is not ready yet.")
-
     # aiohttp's FileResponse handles byte ranges, which Discord and browsers
     # need when probing/streaming large MP4 files.
     return web.FileResponse(
@@ -1197,8 +1301,7 @@ class ChannelLinkView(discord.ui.View):
             channel_types=[discord.ChannelType.text],
             min_values=1,
             max_values=1,
-        )
-        self.channel_select.callback = self.channel_selected
+        )        self.channel_select.callback = self.channel_selected
         self.add_item(self.channel_select)
 
     async def channel_selected(self, interaction: discord.Interaction) -> None:
@@ -1597,8 +1700,7 @@ class MovieBot(discord.Client):
         # HTTP traffic. Start the keep-alive before connecting so a sleeping
         # Lavalink service is woken while initialize_lavalink waits for it.
         if LAVALINK_URI and LAVALINK_PASSWORD:
-            self.lavalink_keepalive_task = asyncio.create_task(
-                keep_lavalink_awake(),
+            self.lavalink_keepalive_task = asyncio.create_task(                keep_lavalink_awake(),
                 name="lavalink-render-keepalive",
             )
 
@@ -1998,7 +2100,6 @@ async def connect_member_voice(interaction: discord.Interaction):
                             interaction.guild.id,
                         )
                     break
-
         if player is not None:
             try:
                 if player.connected:
@@ -2398,7 +2499,6 @@ async def voice_leave(interaction: discord.Interaction) -> None:
     state["current"] = None
     state["stopping"] = False
     await send_interaction_response(interaction, "Left the voice channel and cleared the queue.", ephemeral=True)
-
 
 
 
