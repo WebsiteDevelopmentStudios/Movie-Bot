@@ -29,11 +29,6 @@ LAVALINK_URL = (
     f"https://github.com/lavalink-devs/Lavalink/releases/download/"
     f"{LAVALINK_VERSION}/Lavalink.jar"
 )
-YOUTUBE_PLUGIN_URL = (
-    f"https://github.com/lavalink-devs/youtube-source/releases/download/"
-    f"{YOUTUBE_PLUGIN_VERSION}/youtube-plugin-{YOUTUBE_PLUGIN_VERSION}.jar"
-)
-
 _process: asyncio.subprocess.Process | None = None
 _log_task: asyncio.Task | None = None
 
@@ -273,10 +268,8 @@ async def _download_runtime_files() -> None:
         logger.info("Downloading Lavalink %s...", LAVALINK_VERSION)
         await asyncio.to_thread(_download, LAVALINK_URL, LAVALINK_JAR)
 
-    plugin = PLUGINS_DIR / f"youtube-plugin-{YOUTUBE_PLUGIN_VERSION}.jar"
-    if not plugin.exists():
-        logger.info("Downloading YouTube Source plugin %s...", YOUTUBE_PLUGIN_VERSION)
-        await asyncio.to_thread(_download, YOUTUBE_PLUGIN_URL, plugin)
+    # Lavalink downloads the declared YouTube Source plugin into pluginsDir.
+    # Do not download a second copy here; that would waste disk space.
 
 
 async def start_lavalink(password: str) -> None:
