@@ -24,11 +24,11 @@ lavalink:
       rotation: true
       channelMix: true
       lowPass: true
-    bufferDurationMs: 400
-    frameBufferDurationMs: 5000
+    bufferDurationMs: 800
+    frameBufferDurationMs: 10000
     opusEncodingQuality: 10
     resamplingQuality: LOW
-    trackStuckThresholdMs: 10000
+    trackStuckThresholdMs: 30000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
     playerUpdateInterval: 5
@@ -47,6 +47,7 @@ plugins:
       - MUSIC
       - WEB
       - WEBEMBEDDED
+      - ANDROID
       - ANDROID_VR
       - TVHTML5EMBEDDED
 
