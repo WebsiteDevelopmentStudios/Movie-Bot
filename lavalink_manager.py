@@ -135,9 +135,18 @@ def _extract_java(archive: Path) -> None:
 def _ensure_java() -> Path:
     existing = _java_executable()
     if existing:
+        # Prefer the host's Java. If an older private runtime was downloaded
+        # by an earlier Movie-Bot release, remove it to recover disk space.
+        private_java = JAVA_DIR
+        if private_java.exists() and private_java.resolve() != existing.resolve():
+            try:
+                shutil.rmtree(private_java)
+                logger.info("Removed unused private Java runtime to recover disk space.")
+            except OSError as exc:
+                logger.warning("Could not remove old private Java runtime: %s", exc)
         return existing
 
-    logger.info("No Java runtime found. Downloading a private Java %s runtime...", JAVA_MAJOR)
+    logger.info("No Java 17+ runtime found. Downloading a private Java %s runtime...", JAVA_MAJOR)
     archive_url = _adoptium_asset_url()
     suffix = ".zip" if platform.system().lower() == "windows" else ".tar.gz"
     archive = RUNTIME_DIR / f"java-{JAVA_MAJOR}{suffix}"
@@ -156,6 +165,30 @@ def _ensure_java() -> Path:
     return java
 
 
+def _cleanup_runtime_logs() -> None:
+    """Prevent Lavalink's rolling logs from consuming the bot's disk quota."""
+    logs_dir = RUNTIME_DIR / "logs"
+    if not logs_dir.exists():
+        return
+
+    total = 0
+    for item in logs_dir.glob("*"):
+        if item.is_file():
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+
+    # Logs are diagnostic only. Never allow an old Lavalink instance to
+    # consume an entire hosting volume.
+    if total > 10 * 1024 * 1024:
+        logger.warning("Lavalink logs exceeded 10 MB; clearing old runtime logs.")
+        try:
+            shutil.rmtree(logs_dir)
+        except OSError as exc:
+            logger.warning("Could not clear Lavalink logs: %s", exc)
+
+
 def _write_config(password: str) -> None:
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
@@ -165,36 +198,47 @@ def _write_config(password: str) -> None:
   port: {LAVALINK_PORT}
 
 lavalink:
+  plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:{YOUTUBE_PLUGIN_VERSION}"
+      snapshot: false
+  pluginsDir: "./plugins"
   server:
     password: "{password}"
     sources:
       youtube: false
-      bandcamp: true
+      bandcamp: false
       soundcloud: true
-      twitch: true
-      vimeo: true
-      http: true
+      twitch: false
+      vimeo: false
+      nico: false
+      http: false
       local: false
     filters:
       volume: true
-      equalizer: true
-      karaoke: true
-      timescale: true
-      tremolo: true
-      vibrato: true
-      distortion: true
-      rotation: true
-      channelMix: true
-      lowPass: true
-    bufferDurationMs: 400
-    frameBufferDurationMs: 5000
-    opusEncodingQuality: 10
+      equalizer: false
+      karaoke: false
+      timescale: false
+      tremolo: false
+      vibrato: false
+      distortion: false
+      rotation: false
+      channelMix: false
+      lowPass: false
+    bufferDurationMs: 100
+    frameBufferDurationMs: 1000
+    opusEncodingQuality: 5
     resamplingQuality: LOW
     trackStuckThresholdMs: 10000
     useSeekGhosting: true
     playerUpdateInterval: 5
-    youtubePlaylistLoadLimit: 6
-    gc-warnings: true
+    youtubePlaylistLoadLimit: 2
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: false
+    gc-warnings: false
+    timeouts:
+      connectTimeoutMs: 3000
+      connectionRequestTimeoutMs: 3000
+      socketTimeoutMs: 3000
 
 plugins:
   youtube:
@@ -204,14 +248,19 @@ plugins:
     allowDirectPlaylistIds: true
     clients:
       - MUSIC
-      - ANDROID_VR
       - WEB
       - WEBEMBEDDED
 
 logging:
+  file:
+    path: ./logs/
   level:
-    root: INFO
-    lavalink: INFO
+    root: WARN
+    lavalink: WARN
+  logback:
+    rollingpolicy:
+      max-file-size: 2MB
+      max-history: 1
 """
     CONFIG_FILE.write_text(config, encoding="utf-8")
 
@@ -238,6 +287,7 @@ async def start_lavalink(password: str) -> None:
 
     java = await asyncio.to_thread(_ensure_java)
     await _download_runtime_files()
+    await asyncio.to_thread(_cleanup_runtime_logs)
     await asyncio.to_thread(_write_config, password)
 
     logger.info(
@@ -247,8 +297,20 @@ async def start_lavalink(password: str) -> None:
         LAVALINK_PORT,
     )
 
+    # Bot-hosting services commonly enforce tight memory/CPU quotas. Keep
+    # Lavalink deliberately small so the Discord bot and movie server retain
+    # resources. The values can be overridden for larger hosts.
+    xms = os.getenv("LAVALINK_XMS", "64m")
+    xmx = os.getenv("LAVALINK_XMX", "256m")
+    metaspace = os.getenv("LAVALINK_MAX_METASPACE", "96m")
+
     _process = await asyncio.create_subprocess_exec(
         str(java),
+        f"-Xms{xms}",
+        f"-Xmx{xmx}",
+        f"-XX:MaxMetaspaceSize={metaspace}",
+        "-XX:ActiveProcessorCount=1",
+        "-XX:+UseSerialGC",
         "-jar",
         str(LAVALINK_JAR),
         cwd=str(RUNTIME_DIR),
