@@ -1,6 +1,6 @@
 server:
   address: 0.0.0.0
-  port: ${PORT:2333}
+  port: ${PORT:10000}
 
 lavalink:
   server:
