@@ -1032,10 +1032,6 @@ async def stop_cloudflare_quick_tunnel() -> None:
     PUBLIC_BASE_URL = ""
 
 
-async def start_movie_web_server() -> web.AppRunner:
-    app = web.Application()
-
-
 async def youtube_oauth_callback(request: web.Request) -> web.Response:
     state = request.query.get("state", "")
     code = request.query.get("code", "")
@@ -1178,6 +1174,8 @@ async def youtube_oauth_callback(request: web.Request) -> web.Response:
         )
 
 
+async def start_movie_web_server() -> web.AppRunner:
+    app = web.Application()
     app.router.add_get("/movie/{token}", hosted_movie_handler)
     app.router.add_get("/media/{token}", hosted_media_handler)
     app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
