@@ -619,6 +619,12 @@ async def stream_m3u8_movie(
             "-loglevel",
             "error",
             "-y",
+            # Some HLS playlists include signed CDN segment URLs without a
+            # conventional media extension (including image/ad placeholders).
+            # Permit those URLs so FFmpeg can inspect the playlist and continue
+            # past entries that are not usable media segments.
+            "-allowed_extensions",
+            "ALL",
             "-i",
             url.strip(),
             "-map",
