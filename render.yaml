@@ -12,14 +12,6 @@ services:
         sync: false
       - key: WAKE_SECRET
         sync: false
-      - key: LAVALINK_HOST
-        sync: false
-      - key: LAVALINK_PORT
-        value: "2333"
-      - key: LAVALINK_PASSWORD
-        sync: false
-      - key: LAVALINK_SECURE
-        value: "false"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: MOVIE_HOST
