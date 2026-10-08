@@ -1600,7 +1600,7 @@ async def download_music_audio(track: dict) -> Path | None:
                         [
                             "--no-playlist",
                             "--no-warnings",
-                            "--skip-download",
+                            "--skip-download", # Keeping your structural arguments intact
                             "--get-url",
                             "--format", "bestaudio/best",
                             webpage_url,
@@ -1998,11 +1998,11 @@ async def resolve_music_stream_url(track: dict) -> str | None:
                     "--skip-download",
                     "--get-url",
                     "--format", "ba/ba*",
-                    "--extractor-args", "youtube:player_client=web",
                     webpage_url,
                 ],
                 timeout=90,
             )
+
             if code == 0:
                 urls = [
                     line.strip()
