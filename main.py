@@ -1601,20 +1601,10 @@ class MovieBot(discord.Client):
         await initialize_lavalink()
 
         try:
-            # Remove the temporary guild-scoped copies created by an earlier
-            # sync strategy. The bot now uses global application commands only.
-            for guild in self.guilds:
-                try:
-                    self.tree.clear_commands(guild=guild)
-                    await self.tree.sync(guild=guild)
-                    logger.info("Cleared old guild-scoped commands from %s.", guild.name)
-                except discord.HTTPException as exc:
-                    logger.warning("Could not clear old guild commands from %s: %s", guild.name, exc)
-
             synced = await self.tree.sync()
             logger.info("Synced %d global slash command(s).", len(synced))
         except discord.HTTPException as exc:
-            logger.error("Failed to sync slash commands: %s", exc)
+            logger.error("Failed to sync global slash commands: %s", exc)
 
 
     async def ensure_cloudflare_tunnel(self) -> bool:
@@ -1655,24 +1645,7 @@ class MovieBot(discord.Client):
         if self.user:
             logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
 
-        # Remove stale guild-scoped command copies left by the old sync
-        # strategy. Commands are now registered globally only.
-        for guild in self.guilds:
-            try:
-                self.tree.clear_commands(guild=guild)
-                await self.tree.sync(guild=guild)
-                logger.info(
-                    "Cleared old guild-scoped commands from %s (%s).",
-                    guild.name,
-                    guild.id,
-                )
-            except discord.HTTPException as exc:
-                logger.warning(
-                    "Could not clear old guild commands from %s (%s): %s",
-                    guild.name,
-                    guild.id,
-                    exc,
-                )
+
 
 
 bot = MovieBot()
@@ -2438,19 +2411,26 @@ async def sync_commands(interaction: discord.Interaction) -> None:
         return
 
     try:
-        synced = await bot.tree.sync()
+        bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await bot.tree.sync(guild=interaction.guild)
+        logger.info(
+            "Synced %d guild slash command(s) to %s (%s).",
+            len(synced),
+            interaction.guild.name,
+            interaction.guild.id,
+        )
     except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Could not sync global commands: %s", exc)
+        logger.warning("Could not sync guild commands: %s", exc)
         await send_interaction_response(
             interaction,
-            "I could not sync the commands. Please try again later.",
+            "I could not sync the commands to this server. Check the bot's application-command permissions and try again.",
             ephemeral=True,
         )
         return
 
     await send_interaction_response(
         interaction,
-        f"Synced {len(synced)} global slash command(s).",
+        f"Synced {len(synced)} slash command(s) to **{interaction.guild.name}**. They should appear shortly.",
         ephemeral=True,
     )
 
