@@ -1219,12 +1219,12 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
     # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Authenticate via OAuth token flows to register the datacenter IP safely.
+    # Route via IOS client structures to step around signature requirements completely
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
-        "--extractor-args", "youtube:oauth=1", # <-- ENABLES SECURE OAUTH HANDSHAKE
+        "--extractor-args", "youtube:player_client=ios",
         "-4",
     ]
     if shutil.which("deno"):
@@ -1233,7 +1233,9 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
     else:
         logger.info("yt-dlp: Deno not found; using yt-dlp's available extractor runtime.")
 
-    command.extend(args)
+    # Only append non-conflicting arguments from incoming download requests
+    cleaned_args = [arg for arg in args if not any(x in str(arg) for x in ["player_client", "youtube:"])]
+    command.extend(cleaned_args)
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -1248,7 +1250,6 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
         raise
 
     return process.returncode, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
-
 
 async def piped_instances() -> list[str]:
     """Return public Piped API instances for music search and audio streams."""
