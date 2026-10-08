@@ -1473,6 +1473,18 @@ async def resolve_music_source(query: str) -> dict | None:
             value += 30
         elif title_key and title_key in actual_title:
             value += 15
+
+        # Reward individual query words appearing in the result title. This
+        # helps avoid selecting a strangely translated/relabelled upload when
+        # yt-dlp returns several unrelated variants for a simple query.
+        query_words = [
+            word for word in re.findall(r"[a-z0-9]+", search_query.casefold())
+            if len(word) >= 2
+        ]
+        if query_words:
+            matched_words = sum(1 for word in query_words if word in actual_title)
+            value += matched_words * 10
+
         if artist_key and artist_key in actual_title:
             value += 15
         if artist_key and artist_key in uploader:
@@ -1826,106 +1838,158 @@ async def resolve_music_stream_url(track: dict) -> str | None:
     """
     Resolve a playable audio URL without downloading the entire song first.
 
-    This follows the same basic architecture as Lavalink-based music bots:
-    resolve the track, hand the voice player a network audio source, and let
-    FFmpeg continuously pull the audio. A local downloaded file remains the
-    final fallback for sources that cannot be streamed directly.
+    Try multiple candidates because YouTube may block one video while another
+    upload of the same song remains playable. yt-dlp is preferred, with Piped
+    used as a transport fallback when YouTube extraction is blocked.
     """
-    video_id = str(track.get("video_id") or "").strip()
-    webpage_url = str(
-        track.get("webpage_url")
-        or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
-    ).strip()
+    candidates = [track] + [
+        candidate for candidate in track.get("alternatives", [])
+        if isinstance(candidate, dict)
+    ]
 
-    if not webpage_url:
-        return None
+    async def piped_stream(video_id: str, preferred_api_base: str = "") -> str | None:
+        bases = []
+        if preferred_api_base:
+            bases.append(preferred_api_base.rstrip("/"))
 
-    # Prefer yt-dlp for the actual media URL. Piped is still useful for
-    # searching, but its public instances are not reliable enough to be the
-    # primary playback transport.
-    try:
-        code, stdout, stderr = await run_yt_dlp(
-            [
-                "--no-playlist",
-                "--no-warnings",
-                "--skip-download",
-                "--get-url",
-                "--format", "bestaudio[ext=m4a]/bestaudio/best",
-                "--extractor-args", "youtube:player_client=web",
-                webpage_url,
-            ],
-            timeout=90,
-        )
-        if code == 0:
-            urls = [
-                line.strip()
-                for line in stdout.splitlines()
-                if line.strip().startswith(("http://", "https://"))
-            ]
-            if urls:
-                return urls[-1]
-        logger.warning(
-            "Could not resolve direct audio URL for %s: %s",
-            track.get("title", "unknown"),
-            stderr[-1500:],
-        )
-    except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
-        logger.warning("Direct audio URL lookup failed: %s", exc)
-
-    # If this was resolved by Piped, try its audio proxy as a second direct
-    # stream. FFmpeg can consume this URL without creating a local music file.
-    api_base = str(track.get("api_base") or "").rstrip("/")
-    if api_base and video_id:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{api_base}/streams/{video_id}",
-                    headers={"User-Agent": "Movie-Bot/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as response:
-                    if response.status == 200:
+            for base in await piped_instances():
+                base = str(base).rstrip("/")
+                if base and base not in bases:
+                    bases.append(base)
+        except Exception as exc:
+            logger.warning("Could not load Piped instances for audio fallback: %s", exc)
+
+        async with aiohttp.ClientSession() as session:
+            for api_base in bases:
+                try:
+                    async with session.get(
+                        f"{api_base}/streams/{video_id}",
+                        headers={"User-Agent": "Movie-Bot/1.0"},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                "Piped audio fallback %s returned HTTP %s for %s",
+                                api_base,
+                                response.status,
+                                video_id,
+                            )
+                            continue
+
                         data = await response.json(content_type=None)
                         streams = data.get("audioStreams") if isinstance(data, dict) else None
-                        if isinstance(streams, list):
-                            def stream_score(item: dict) -> tuple[int, int]:
-                                fmt = str(item.get("format") or "").casefold()
-                                codec = str(item.get("codec") or "").casefold()
-                                try:
-                                    bitrate = int(item.get("bitrate") or 0)
-                                except (TypeError, ValueError):
-                                    bitrate = 0
-                                score = 0
-                                if fmt in {"m4a", "mp4"}:
-                                    score += 30
-                                elif fmt in {"opus", "webm"}:
-                                    score += 20
-                                if "aac" in codec:
-                                    score += 10
-                                return score, bitrate
+                        if not isinstance(streams, list):
+                            continue
 
-                            streams = sorted(
-                                (
-                                    item for item in streams
-                                    if isinstance(item, dict)
-                                    and str(
-                                        item.get("proxyUrl")
-                                        or item.get("proxy_url")
-                                        or item.get("url")
-                                        or ""
-                                    ).strip()
-                                ),
-                                key=stream_score,
-                                reverse=True,
-                            )
-                            if streams:
-                                return str(
-                                    streams[0].get("proxyUrl")
-                                    or streams[0].get("proxy_url")
-                                    or streams[0].get("url")
-                                ).strip()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-            logger.warning("Piped direct audio lookup failed: %s", exc)
+                        def stream_score(item: dict) -> tuple[int, int]:
+                            fmt = str(item.get("format") or "").casefold()
+                            codec = str(item.get("codec") or "").casefold()
+                            try:
+                                bitrate = int(item.get("bitrate") or 0)
+                            except (TypeError, ValueError):
+                                bitrate = 0
 
+                            score = 0
+                            if fmt in {"m4a", "mp4"}:
+                                score += 30
+                            elif fmt in {"opus", "webm"}:
+                                score += 20
+                            if "aac" in codec:
+                                score += 10
+                            return score, bitrate
+
+                        valid = [
+                            item for item in streams
+                            if isinstance(item, dict)
+                            and str(
+                                item.get("proxyUrl")
+                                or item.get("proxy_url")
+                                or item.get("url")
+                                or ""
+                            ).strip()
+                        ]
+                        valid.sort(key=stream_score, reverse=True)
+
+                        if valid:
+                            return str(
+                                valid[0].get("proxyUrl")
+                                or valid[0].get("proxy_url")
+                                or valid[0].get("url")
+                            ).strip()
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                    logger.warning(
+                        "Piped audio fallback failed for %s: %s",
+                        api_base,
+                        exc,
+                    )
+        return None
+
+    for candidate in candidates:
+        video_id = str(candidate.get("video_id") or "").strip()
+        webpage_url = str(
+            candidate.get("webpage_url")
+            or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
+        ).strip()
+        if not webpage_url:
+            continue
+
+        title = str(candidate.get("title") or track.get("title") or "unknown")
+        try:
+            code, stdout, stderr = await run_yt_dlp(
+                [
+                    "--no-playlist",
+                    "--no-warnings",
+                    "--skip-download",
+                    "--get-url",
+                    "--format", "bestaudio[ext=m4a]/bestaudio/best",
+                    "--extractor-args", "youtube:player_client=web",
+                    webpage_url,
+                ],
+                timeout=90,
+            )
+            if code == 0:
+                urls = [
+                    line.strip()
+                    for line in stdout.splitlines()
+                    if line.strip().startswith(("http://", "https://"))
+                ]
+                if urls:
+                    if candidate is not track:
+                        logger.info(
+                            "Using alternate YouTube result for %s: %s",
+                            track.get("title", "unknown"),
+                            title,
+                        )
+                    return urls[-1]
+
+            logger.warning(
+                "yt-dlp direct audio failed for %s: %s",
+                title,
+                stderr[-1200:],
+            )
+        except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
+            logger.warning("Direct audio URL lookup failed for %s: %s", title, exc)
+
+        video_id = str(candidate.get("video_id") or "").strip()
+        if video_id:
+            stream_url = await piped_stream(
+                video_id,
+                str(candidate.get("api_base") or ""),
+            )
+            if stream_url:
+                if candidate is not track:
+                    logger.info(
+                        "Using alternate Piped result for %s: %s",
+                        track.get("title", "unknown"),
+                        title,
+                    )
+                return stream_url
+
+    logger.warning(
+        "Could not resolve any direct audio source for %s.",
+        track.get("title", "unknown"),
+    )
     return None
 
 
