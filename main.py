@@ -23,6 +23,14 @@ try:
 except ImportError:
     wavelink = None
 
+from lavalink_manager import (
+    LAVALINK_HOST,
+    LAVALINK_PORT,
+    start_lavalink,
+    stop_lavalink,
+    wait_until_ready as wait_for_lavalink,
+)
+
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1126,6 +1134,7 @@ class MovieBot(discord.Client):
                 await wavelink.Pool.close()
             except Exception as exc:
                 logger.warning("Could not close Lavalink cleanly: %s", exc)
+        await stop_lavalink()
         await stop_cloudflare_quick_tunnel()
         if self.movie_web_runner is not None:
             await self.movie_web_runner.cleanup()
@@ -1164,10 +1173,10 @@ bot = MovieBot()
 # -------------------------
 
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
-LAVALINK_HOST = os.getenv("LAVALINK_HOST", "").strip()
-LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "").strip()
-LAVALINK_SECURE = os.getenv("LAVALINK_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# Lavalink is now fully managed by the bot. A fresh random password is
+# generated for the local-only Lavalink process on every bot start.
+LAVALINK_PASSWORD = secrets.token_urlsafe(32)
 
 music_states: dict[int, dict] = {}
 lavalink_ready = False
@@ -1191,10 +1200,7 @@ def get_music_state(guild_id: int) -> dict:
 
 
 def lavalink_uri() -> str:
-    host = LAVALINK_HOST.strip().rstrip("/")
-    if host.startswith(("http://", "https://")):
-        return host
-    return f"{'https' if LAVALINK_SECURE else 'http'}://{host}:{LAVALINK_PORT}"
+    return f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
 
 
 async def initialize_lavalink() -> None:
@@ -1202,17 +1208,17 @@ async def initialize_lavalink() -> None:
     if wavelink is None:
         logger.error("Wavelink is not installed; music playback is unavailable.")
         return
-    if not LAVALINK_HOST or not LAVALINK_PASSWORD:
-        logger.warning(
-            "Lavalink is not configured. Set LAVALINK_HOST and LAVALINK_PASSWORD "
-            "(LAVALINK_PORT defaults to 2333 and LAVALINK_SECURE defaults to false)."
-        )
-        return
+
     try:
+        # Start and own the Lavalink process instead of requiring a separate
+        # server or any LAVALINK_* environment variables.
+        await start_lavalink(LAVALINK_PASSWORD)
+        await wait_for_lavalink()
+
         nodes = await wavelink.Pool.connect(
             nodes=[
                 wavelink.Node(
-                    identifier="primary",
+                    identifier="local",
                     uri=lavalink_uri(),
                     password=LAVALINK_PASSWORD,
                     retries=None,
@@ -1224,11 +1230,12 @@ async def initialize_lavalink() -> None:
         )
         lavalink_ready = bool(nodes)
         if lavalink_ready:
-            logger.info("Lavalink music backend connected.")
+            logger.info("Self-hosted Lavalink music backend connected.")
         else:
-            logger.warning("Lavalink music backend is not connected yet; Wavelink will retry.")
+            logger.warning("Self-hosted Lavalink did not report a ready Wavelink node.")
     except Exception as exc:
-        logger.exception("Failed to initialize Lavalink: %s", exc)
+        lavalink_ready = False
+        logger.exception("Failed to start self-hosted Lavalink: %s", exc)
 
 
 def spotify_track_url(value: str) -> bool:
