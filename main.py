@@ -1226,6 +1226,7 @@ async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str
         sys.executable,
         "-m",
         "yt_dlp",
+        "--cookies", "cookies.txt", # <-- ADD THIS LINE HERE
     ]
     if shutil.which("deno"):
         command.extend(["--js-runtimes", "deno"])
