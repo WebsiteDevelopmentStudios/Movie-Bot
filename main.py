@@ -18,6 +18,11 @@ from discord.ext import commands
 from discord.http import handle_message_parameters
 from dotenv import load_dotenv
 
+try:
+    import wavelink
+except ImportError:
+    wavelink = None
+
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,51 +48,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("movie-bot")
-
-# ==============================================================================
-# AUTOMATED HEADLESS DENO INSTALLER FOR CLOUD PORTS
-# ==============================================================================
-import urllib.request
-import zipfile
-import platform
-
-def install_local_deno():
-    deno_bin_dir = BASE_DIR / ".deno_bin"
-    deno_exe = deno_bin_dir / "deno"
-    
-    # Register the custom binary folder directly into the script's system environment path
-    os.environ["PATH"] = f"{deno_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
-    
-    if deno_exe.exists():
-        return
-        
-    logger.info("Deno not found. Starting automatic cloud deployment...")
-    deno_bin_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Match the cloud hosting server's processing layout architecture
-    arch = platform.machine().lower()
-    if "arm" in arch or "aarch64" in arch:
-        url = "https://github.com"
-    else:
-        url = "https://github.com"
-        
-    zip_path = deno_bin_dir / "deno.zip"
-    try:
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(deno_bin_dir)
-        zip_path.unlink()
-        
-        # Grant executable file privileges inside the server workspace
-        os.chmod(deno_exe, 0o755)
-        logger.info("Deno successfully compiled and deployed to project environment paths!")
-    except Exception as e:
-        logger.warning("Automated Deno installation aborted: %s", e)
-
-# Run the installation wrapper immediately on start
-install_local_deno()
-# ==============================================================================
-
 
 def ensure_movies_dir() -> None:
     MOVIES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1128,6 +1088,7 @@ class MovieBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.movie_web_runner = await start_movie_web_server()
+        await initialize_lavalink()
 
         try:
             # Remove the temporary guild-scoped copies created by an earlier
@@ -1158,6 +1119,13 @@ class MovieBot(discord.Client):
         return tunnel_started
 
     async def close(self) -> None:
+        for guild_id in list(music_states):
+            await cancel_lyrics(guild_id)
+        if wavelink is not None:
+            try:
+                await wavelink.Pool.close()
+            except Exception as exc:
+                logger.warning("Could not close Lavalink cleanly: %s", exc)
         await stop_cloudflare_quick_tunnel()
         if self.movie_web_runner is not None:
             await self.movie_web_runner.cleanup()
@@ -1195,11 +1163,14 @@ bot = MovieBot()
 # Voice / music playback
 # -------------------------
 
-MUSIC_CACHE_DIR = BASE_DIR / ".music_cache"
-SPOTIFY_OEMBED_URL = "https://open.spotify.com/oembed"
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
+LAVALINK_HOST = os.getenv("LAVALINK_HOST", "").strip()
+LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "").strip()
+LAVALINK_SECURE = os.getenv("LAVALINK_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 music_states: dict[int, dict] = {}
+lavalink_ready = False
 
 
 def get_music_state(guild_id: int) -> dict:
@@ -1207,15 +1178,57 @@ def get_music_state(guild_id: int) -> dict:
     if state is None:
         state = {
             "queue": [],
-            "voice": None,
+            "player": None,
             "current": None,
-            "volume": 1.0,
-            "play_task": None,
+            "volume": 100,
             "lyrics_task": None,
             "lyrics_enabled": True,
+            "advance_lock": asyncio.Lock(),
+            "stopping": False,
         }
         music_states[guild_id] = state
     return state
+
+
+def lavalink_uri() -> str:
+    host = LAVALINK_HOST.strip().rstrip("/")
+    if host.startswith(("http://", "https://")):
+        return host
+    return f"{'https' if LAVALINK_SECURE else 'http'}://{host}:{LAVALINK_PORT}"
+
+
+async def initialize_lavalink() -> None:
+    global lavalink_ready
+    if wavelink is None:
+        logger.error("Wavelink is not installed; music playback is unavailable.")
+        return
+    if not LAVALINK_HOST or not LAVALINK_PASSWORD:
+        logger.warning(
+            "Lavalink is not configured. Set LAVALINK_HOST and LAVALINK_PASSWORD "
+            "(LAVALINK_PORT defaults to 2333 and LAVALINK_SECURE defaults to false)."
+        )
+        return
+    try:
+        nodes = await wavelink.Pool.connect(
+            nodes=[
+                wavelink.Node(
+                    identifier="primary",
+                    uri=lavalink_uri(),
+                    password=LAVALINK_PASSWORD,
+                    retries=None,
+                    resume_timeout=60,
+                )
+            ],
+            client=bot,
+            cache_capacity=100,
+        )
+        lavalink_ready = bool(nodes)
+        if lavalink_ready:
+            logger.info("Lavalink music backend connected.")
+        else:
+            logger.warning("Lavalink music backend is not connected yet; Wavelink will retry.")
+    except Exception as exc:
+        logger.exception("Failed to initialize Lavalink: %s", exc)
 
 
 def spotify_track_url(value: str) -> bool:
@@ -1236,505 +1249,71 @@ async def fetch_json(session, url: str, **kwargs):
             if response.status != 200:
                 return None
             return await response.json(content_type=None)
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
         return None
 
 
 async def resolve_spotify_track(value: str) -> dict | None:
     async with aiohttp.ClientSession() as session:
-        data = await fetch_json(session, SPOTIFY_OEMBED_URL, params={"url": value.strip()})
-
+        data = await fetch_json(
+            session,
+            "https://open.spotify.com/oembed",
+            params={"url": value.strip()},
+        )
     if not isinstance(data, dict):
         return None
-
     title = str(data.get("title", "")).strip()
     artist = str(data.get("author_name", "")).strip()
     if not title:
         return None
-
-    return {
-        "title": title,
-        "artist": artist or "Unknown Artist",
-        "search": f"{artist} - {title}".strip(" -"),
-        "spotify_url": value.strip(),
-    }
-
-async def run_yt_dlp(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
-    # Run yt-dlp through the exact Python interpreter hosting the bot.
-    # Route handshake queries through active public community token APIs.
-    deno_path = str(BASE_DIR / ".deno_bin" / "deno")
-    
-    command = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--extractor-args", (
-            "youtube:player_client=web,default;"
-            "pot_provider=bgutil:http;"
-            "pot_provider_args=bgutil:http?server_home=https://pnd.tl" # <-- WORKING COMMUNITY ENDPOINT
-        ),
-        "--js-runtimes", f"deno:{deno_path}",
-        "-4",
-    ]
-    
-    logger.info("yt-dlp: validated active community challenge resolver pipeline.")
-
-    # Merge remaining query paths and flags cleanly
-    command.extend(args)
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-        
-        # Scrape and print out token elements directly to the panel console output
-        combined = stdout + stderr
-        token_match = re.search(r"po_token=([a-zA-Z0-9_\-\+\.]+)", combined)
-        if token_match:
-            print(f"\n========================================\nFOUND TOKEN FOR REPO:\n{token_match.group(1)}\n========================================\n", flush=True)
-
-        return process.returncode, stdout, stderr
-        
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
-        raise
-
-async def piped_instances() -> list[str]:
-    """Return public Piped API instances for music search and audio streams."""
-    discovered: list[str] = []
-
-    for endpoint in (
-        "https://piped.video/api/v1/instances",
-        "https://pipedapi.kavin.rocks/instances",
-    ):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    endpoint,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as response:
-                    if response.status != 200:
-                        continue
-                    data = await response.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
-            continue
-
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                api_url = str(item.get("api_url") or item.get("apiUrl") or "").strip().rstrip("/")
-                if api_url.startswith("https://") and api_url not in discovered:
-                    discovered.append(api_url)
-        if discovered:
-            break
-
-    for api_url in (
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.adminforge.de",
-        "https://pipedapi.reallyaweso.me",
-    ):
-        if api_url not in discovered:
-            discovered.append(api_url)
-
-    return discovered[:8]
-
-
-async def yt_dlp_search_candidates(search_query: str, spotify_info: dict | None) -> list[dict]:
-    """Search YouTube as a fallback when public Piped instances are unavailable."""
-    search_variants = [search_query]
-    if spotify_info:
-        title = str(spotify_info.get("title") or "").strip()
-        artist = str(spotify_info.get("artist") or "").strip()
-        if title:
-            search_variants.append(f"{title} {artist} official audio".strip())
-
-    candidates: list[dict] = []
-    seen: set[str] = set()
-
-    for variant in search_variants:
-        try:
-            code, stdout, stderr = await run_yt_dlp(
-                [
-                    "--flat-playlist",
-                    "--dump-single-json",
-                    "--skip-download",
-                    "--no-warnings",
-                    "--extractor-args", "youtube:player_client=web",
-                    f"ytsearch8:{variant}",
-                ],
-                timeout=90,
-            )
-        except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
-            logger.warning("yt-dlp fallback search failed: %s", exc)
-            continue
-
-        if code != 0:
-            logger.warning("yt-dlp fallback search failed: %s", stderr[-1500:])
-            continue
-
-        try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            continue
-
-        entries = data.get("entries") if isinstance(data, dict) else None
-        if not isinstance(entries, list):
-            continue
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            video_id = str(entry.get("id") or "").strip()
-            if not video_id or video_id in seen:
-                continue
-            seen.add(video_id)
-
-            title = str(entry.get("title") or "").strip()
-            if not title:
-                continue
-
-            candidates.append({
-                "title": title,
-                "artist": str(entry.get("channel") or entry.get("uploader") or "").strip()
-                    or ((spotify_info or {}).get("artist") if spotify_info else "")
-                    or "Unknown Artist",
-                "video_id": video_id,
-                "webpage_url": str(
-                    entry.get("webpage_url")
-                    or f"https://www.youtube.com/watch?v={video_id}"
-                ),
-                "duration": entry.get("duration"),
-                "spotify_url": (spotify_info or {}).get("spotify_url"),
-                "source": "yt-dlp",
-            })
-
-    return candidates
+    return {"title": title, "artist": artist or "Unknown Artist", "spotify_url": value.strip()}
 
 
 async def resolve_music_source(query: str) -> dict | None:
-    """
-    Resolve a requested song without depending on public Piped instances.
-
-    yt-dlp is the primary search source because public Piped APIs are
-    frequently unavailable, rate-limited, or return inconsistent results.
-    Piped remains available later in the playback pipeline as an audio
-    fallback, but it is no longer required just to find a song.
-    """
-    spotify_info = await resolve_spotify_track(query) if spotify_track_url(query) else None
-    search_query = spotify_info["search"] if spotify_info else query.strip()
-    if not search_query:
+    if not lavalink_ready or wavelink is None:
+        return None
+    is_spotify = spotify_track_url(query)
+    spotify_info = await resolve_spotify_track(query) if is_spotify else None
+    if is_spotify and spotify_info is None:
         return None
 
-    logger.info("Music search: using yt-dlp for %r", search_query)
-    candidates = await yt_dlp_search_candidates(search_query, spotify_info)
-
-    if candidates:
-        logger.info(
-            "Music search: yt-dlp returned %d candidate(s); selected from YouTube results.",
-            len(candidates),
-        )
+    if spotify_info:
+        search_term = f"{spotify_info['artist']} - {spotify_info['title']}"
+        identifier = f"ytsearch:{search_term}"
     else:
-        logger.warning(
-            "Music search: yt-dlp returned no candidates for %r; trying Piped as a fallback.",
-            search_query,
-        )
+        search_term = query.strip()
+        if not search_term:
+            return None
+        identifier = search_term if search_term.startswith(("http://", "https://")) else f"ytsearch:{search_term}"
 
-        instances = await piped_instances()
-        async with aiohttp.ClientSession() as session:
-            for api_base in instances:
-                try:
-                    async with session.get(
-                        f"{api_base}/search",
-                        params={"q": search_query, "filter": "music"},
-                        headers={"User-Agent": "Movie-Bot/1.0"},
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as response:
-                        if response.status != 200:
-                            logger.warning(
-                                "Piped fallback search %s returned HTTP %s",
-                                api_base,
-                                response.status,
-                            )
-                            continue
-                        data = await response.json(content_type=None)
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-                    logger.warning("Piped fallback search failed for %s: %s", api_base, exc)
-                    continue
-
-                if not isinstance(data, list):
-                    continue
-
-                for entry in data:
-                    if not isinstance(entry, dict):
-                        continue
-
-                    video_id = str(entry.get("url") or "").strip()
-                    if video_id.startswith("/watch?v="):
-                        video_id = video_id.split("v=", 1)[1].split("&", 1)[0]
-                    if not video_id:
-                        video_id = str(entry.get("id") or "").strip()
-                    if not video_id:
-                        continue
-
-                    candidates.append({
-                        "title": str(entry.get("title") or "").strip(),
-                        "artist": str(
-                            entry.get("uploaderName")
-                            or entry.get("uploader")
-                            or ((spotify_info or {}).get("artist") if spotify_info else "")
-                            or "Unknown Artist"
-                        ).strip(),
-                        "video_id": video_id,
-                        "api_base": api_base,
-                        "duration": entry.get("duration"),
-                        "spotify_url": (spotify_info or {}).get("spotify_url"),
-                        "source": "Piped",
-                    })
-
-                if candidates:
-                    logger.info(
-                        "Music search: Piped fallback returned %d candidate(s) from %s.",
-                        len(candidates),
-                        api_base,
-                    )
-                    break
-
-    if not candidates:
-        logger.warning("Music search failed completely for %r.", search_query)
+    try:
+        results = await wavelink.Pool.fetch_tracks(identifier)
+    except Exception as exc:
+        logger.warning("Lavalink could not resolve %r: %s", search_term, exc)
+        return None
+    if not results:
+        return None
+    tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results)
+    if not tracks:
         return None
 
-    requested_title = str((spotify_info or {}).get("title") or "").casefold()
-    requested_artist = str((spotify_info or {}).get("artist") or "").casefold()
-
-    def normalize(value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", value.casefold())
-
-    title_key = normalize(requested_title)
-    artist_key = normalize(requested_artist)
-
-    def score(entry: dict) -> int:
-        title = str(entry.get("title") or "")
-        actual_title = normalize(title)
-        uploader = normalize(str(entry.get("artist") or ""))
-        value = 0
-
-        if title_key and title_key == actual_title:
-            value += 30
-        elif title_key and title_key in actual_title:
-            value += 15
-
-        # Reward individual query words appearing in the result title. This
-        # helps avoid selecting a strangely translated/relabelled upload when
-        # yt-dlp returns several unrelated variants for a simple query.
-        query_words = [
-            word for word in re.findall(r"[a-z0-9]+", search_query.casefold())
-            if len(word) >= 2
-        ]
-        if query_words:
-            matched_words = sum(1 for word in query_words if word in actual_title)
-            value += matched_words * 10
-
-        if artist_key and artist_key in actual_title:
-            value += 15
-        if artist_key and artist_key in uploader:
-            value += 8
-
-        title_lower = title.casefold()
-        if "official audio" in title_lower:
-            value += 15
-        elif "official" in title_lower:
-            value += 8
-        if "topic" in title_lower or "audio" in title_lower:
-            value += 6
-        if any(word in title_lower for word in (
-            "music video", "official video", "lyrics", "lyric video",
-            "visualizer", "edit", "intro", "extended",
-        )):
-            value -= 12
-        if any(word in title_lower for word in (
-            "live", "remix", "cover", "8d", "nightcore", "slowed", "sped up",
-        )):
-            value -= 10
-        return value
-
-    candidates.sort(key=score, reverse=True)
-    primary = candidates[0]
-    primary["alternatives"] = candidates[1:8]
-
-    logger.info(
-        "Music search selected: %s — %s [%s]",
-        primary.get("title", "Unknown"),
-        primary.get("artist", "Unknown Artist"),
-        primary.get("source", "unknown"),
+    playable = tracks[0]
+    title = str(getattr(playable, "title", "") or "").strip()
+    if not title:
+        return None
+    artist = (
+        str(spotify_info["artist"]).strip()
+        if spotify_info
+        else str(getattr(playable, "author", "") or "Unknown Artist").strip()
     )
-    return primary
-
-async def download_music_audio(track: dict) -> Path | None:
-    MUSIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    candidates = [track] + [
-        candidate for candidate in track.get("alternatives", [])
-        if isinstance(candidate, dict)
-    ]
-
-    # Prefer Piped when it is available, but allow yt-dlp search candidates
-    # to download directly when Piped is unavailable.
-    async with aiohttp.ClientSession() as session:
-        for attempt, candidate in enumerate(candidates, start=1):
-            if candidate.get("source") == "yt-dlp":
-                webpage_url = str(candidate.get("webpage_url") or "").strip()
-                if not webpage_url:
-                    continue
-
-                token = secrets.token_hex(12)
-                title = str(candidate.get("title") or track.get("title") or "unknown")
-                try:
-                    code, stdout, stderr = await run_yt_dlp(
-                        [
-                            "--no-playlist",
-                            "--no-warnings",
-                            "--skip-download", # Keeping your structural arguments intact
-                            "--get-url",
-                            "--format", "bestaudio/best",
-                            webpage_url,
-                        ],
-                        timeout=90,
-                    )
-                except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
-                    logger.warning("yt-dlp audio download failed for %s: %s", candidate.get("title", "unknown"), exc)
-                    continue
-
-                if code == 0:
-                    downloaded = next(
-                        (
-                            path for path in MUSIC_CACHE_DIR.glob(f"{token}.*")
-                            if path.is_file() and not path.name.endswith(".part")
-                        ),
-                        None,
-                    )
-                    if downloaded is not None and downloaded.stat().st_size > 0:
-                        return downloaded
-
-                logger.warning(
-                    "yt-dlp audio download failed for %s: %s",
-                    candidate.get("title", "unknown"),
-                    stderr[-1500:],
-                )
-                continue
-            api_base = str(candidate.get("api_base") or "").rstrip("/")
-            video_id = str(candidate.get("video_id") or "").strip()
-            if not api_base or not video_id:
-                continue
-
-            try:
-                async with session.get(
-                    f"{api_base}/streams/{video_id}",
-                    headers={"User-Agent": "Movie-Bot/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as response:
-                    if response.status != 200:
-                        logger.warning(
-                            "Piped stream lookup failed for %s: HTTP %s",
-                            candidate.get("title", "unknown"),
-                            response.status,
-                        )
-                        continue
-                    stream_data = await response.json(content_type=None)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-                logger.warning("Piped stream lookup failed: %s", exc)
-                continue
-
-            audio_streams = stream_data.get("audioStreams") if isinstance(stream_data, dict) else None
-            if not isinstance(audio_streams, list):
-                continue
-
-            def stream_score(item: dict) -> tuple[int, int]:
-                fmt = str(item.get("format") or "").casefold()
-                codec = str(item.get("codec") or "").casefold()
-                try:
-                    bitrate = int(item.get("bitrate") or 0)
-                except (TypeError, ValueError):
-                    bitrate = 0
-
-                value = 0
-                if fmt in {"m4a", "mp4"}:
-                    value += 30
-                elif fmt in {"opus", "webm"}:
-                    value += 20
-                if "aac" in codec:
-                    value += 10
-                return value, bitrate
-
-            valid_streams = [
-                item for item in audio_streams
-                if isinstance(item, dict)
-                and str(item.get("proxyUrl") or item.get("proxy_url") or item.get("url") or "").strip()
-            ]
-            valid_streams.sort(key=stream_score, reverse=True)
-
-            for stream in valid_streams:
-                stream_url = str(
-                    stream.get("proxyUrl")
-                    or stream.get("proxy_url")
-                    or stream.get("url")
-                    or ""
-                ).strip()
-                if not stream_url:
-                    continue
-
-                extension = str(stream.get("format") or "").casefold()
-                if extension not in {"m4a", "mp4", "webm", "opus", "aac", "wav"}:
-                    extension = "m4a"
-
-                token = secrets.token_hex(12)
-                temp_file = MUSIC_CACHE_DIR / f"{token}.{extension}.part"
-                final_file = MUSIC_CACHE_DIR / f"{token}.{extension}"
-
-                try:
-                    async with session.get(
-                        stream_url,
-                        headers={"User-Agent": "Movie-Bot/1.0"},
-                        timeout=aiohttp.ClientTimeout(total=15 * 60),
-                    ) as response:
-                        if response.status not in {200, 206}:
-                            logger.warning(
-                                "Piped audio download failed for %s: HTTP %s",
-                                candidate.get("title", "unknown"),
-                                response.status,
-                            )
-                            continue
-
-                        with temp_file.open("wb") as file:
-                            async for chunk in response.content.iter_chunked(1024 * 256):
-                                if chunk:
-                                    file.write(chunk)
-
-                    if temp_file.exists() and temp_file.stat().st_size > 0:
-                        temp_file.replace(final_file)
-                        if attempt > 1:
-                            logger.info(
-                                "Using Piped fallback candidate %d for %s",
-                                attempt,
-                                candidate.get("title", "unknown"),
-                            )
-                        return final_file
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    logger.warning(
-                        "Piped audio download failed for %s: %s",
-                        candidate.get("title", "unknown"),
-                        exc,
-                    )
-                finally:
-                    temp_file.unlink(missing_ok=True)
-
-    return None
+    return {
+        "track": playable,
+        "title": title,
+        "artist": artist or "Unknown Artist",
+        "duration": max(0, int(getattr(playable, "length", 0) or 0)),
+        "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
+        "lyrics": [],
+    }
 
 
 async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
@@ -1744,20 +1323,12 @@ async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
         return []
 
     async with aiohttp.ClientSession() as session:
-        # LRCLIB's exact lookup is much more reliable than a broad search.
         exact = await fetch_json(
             session,
             "https://lrclib.net/api/get",
-            params={
-                "artist_name": artist,
-                "track_name": title,
-            },
+            params={"artist_name": artist, "track_name": title},
         )
-
-        candidates = []
-        if isinstance(exact, dict):
-            candidates.append(exact)
-
+        candidates = [exact] if isinstance(exact, dict) else []
         if not candidates or not str(candidates[0].get("syncedLyrics") or "").strip():
             data = await fetch_json(
                 session,
@@ -1771,12 +1342,8 @@ async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
     title_key = re.sub(r"[^a-z0-9]+", "", title.casefold())
 
     def lyric_score(item: dict) -> int:
-        item_artist = re.sub(
-            r"[^a-z0-9]+", "", str(item.get("artistName") or "").casefold()
-        )
-        item_title = re.sub(
-            r"[^a-z0-9]+", "", str(item.get("trackName") or "").casefold()
-        )
+        item_artist = re.sub(r"[^a-z0-9]+", "", str(item.get("artistName") or "").casefold())
+        item_title = re.sub(r"[^a-z0-9]+", "", str(item.get("trackName") or "").casefold())
         score = 0
         if item_title == title_key:
             score += 20
@@ -1791,46 +1358,27 @@ async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
         return score
 
     candidates.sort(key=lyric_score, reverse=True)
-    best = next(
-        (item for item in candidates if str(item.get("syncedLyrics") or "").strip()),
-        None,
-    )
+    best = next((item for item in candidates if str(item.get("syncedLyrics") or "").strip()), None)
     if best is None:
         return []
 
     timestamp_re = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
     lyrics: list[tuple[float, str]] = []
-
     for raw_line in str(best.get("syncedLyrics") or "").splitlines():
         matches = list(timestamp_re.finditer(raw_line))
-        text = timestamp_re.sub("", raw_line).strip()
-        if not text:
+        text_line = timestamp_re.sub("", raw_line).strip()
+        if not text_line:
             continue
         for match in matches:
             try:
-                timestamp = int(match.group(1)) * 60 + float(match.group(2))
-                lyrics.append((timestamp, text))
+                lyrics.append((int(match.group(1)) * 60 + float(match.group(2)), text_line))
             except ValueError:
                 continue
-
     lyrics.sort(key=lambda item: item[0])
-
-    # Keep the lyric database duration so playback can automatically skip
-    # an extra intro that some YouTube uploads add before the actual song.
-    try:
-        lyric_duration = float(best.get("duration")) if best.get("duration") is not None else None
-    except (TypeError, ValueError):
-        lyric_duration = None
-    if lyric_duration is not None and lyric_duration > 0:
-        track["lyrics_duration"] = lyric_duration
-
     return lyrics
 
 
-async def send_voice_chat_message(voice_channel: discord.VoiceChannel, content: str):
-    # discord.py does not currently expose VoiceChannel.send() consistently,
-    # but Discord's message API supports messages in voice channels. Use the
-    # same message-parameter builder as discord.py's Messageable implementation.
+async def send_voice_chat_message(voice_channel: discord.abc.GuildChannel, content: str):
     try:
         with handle_message_parameters(
             content=content,
@@ -1841,392 +1389,131 @@ async def send_voice_chat_message(voice_channel: discord.VoiceChannel, content: 
         return None
 
 
-async def lyrics_loop(guild_id: int, voice_channel: discord.VoiceChannel, track: dict, started_at: float, lyrics: list[tuple[float, str]]) -> None:
-    loop = asyncio.get_running_loop()
-    for timestamp, line in lyrics:
-        wait_for = started_at + timestamp - loop.time()
-        if wait_for > 0:
-            try:
-                await asyncio.sleep(wait_for)
-            except asyncio.CancelledError:
-                raise
+async def lyrics_loop(
+    guild_id: int,
+    player,
+    voice_channel,
+    track: dict,
+    start_from_position: bool = False,
+) -> None:
+    lyrics = track.get("lyrics") or []
+    if not lyrics:
+        return
 
-        current = music_states.get(guild_id)
-        if current is None or current.get("current") is not track:
-            return
-        if not current.get("lyrics_enabled", True):
-            continue
+    last_index = -1
+    if start_from_position:
+        position_seconds = max(0, player.position) / 1000.0
+        for index, (timestamp, _) in enumerate(lyrics):
+            if timestamp <= position_seconds:
+                last_index = index
+            else:
+                break
 
+    try:
+        while True:
+            state = music_states.get(guild_id)
+            if state is None or state.get("current") is not track:
+                return
+            if not state.get("lyrics_enabled", True):
+                await asyncio.sleep(0.5)
+                continue
+
+            position_seconds = max(0, player.position) / 1000.0
+            while last_index + 1 < len(lyrics) and lyrics[last_index + 1][0] <= position_seconds:
+                last_index += 1
+                state = music_states.get(guild_id)
+                if state is None or state.get("current") is not track:
+                    return
+                await send_voice_chat_message(voice_channel, f"**{lyrics[last_index][1]}**")
+            await asyncio.sleep(0.20 if player.playing else 0.25)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Synchronized lyrics stopped for guild %s: %s", guild_id, exc)
+
+
+async def cancel_lyrics(guild_id: int) -> None:
+    state = music_states.get(guild_id)
+    if state is None:
+        return
+    task = state.get("lyrics_task")
+    state["lyrics_task"] = None
+    if task is not None:
+        task.cancel()
         try:
-            await send_voice_chat_message(voice_channel, f"**{line}**")
-        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-            return
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
-async def connect_member_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
-    if interaction.guild is None:
+async def connect_member_voice(interaction: discord.Interaction):
+    if interaction.guild is None or wavelink is None:
         return None
-
     member = interaction.user
     if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel is None:
         return None
 
     voice_channel = member.voice.channel
     state = get_music_state(interaction.guild.id)
-    voice = state.get("voice")
-
-    if voice is not None and voice.is_connected():
-        if voice.channel.id != voice_channel.id:
-            await voice.move_to(voice_channel)
-        return voice
+    player = state.get("player")
+    if player is not None:
+        try:
+            if player.connected:
+                if player.channel.id != voice_channel.id:
+                    await player.move_to(voice_channel)
+                return player
+            await player.disconnect()
+        except Exception as exc:
+            logger.warning("Existing Lavalink player for guild %s was stale: %s", interaction.guild.id, exc)
+        state["player"] = None
 
     try:
-        voice = await voice_channel.connect()
-    except (discord.ClientException, discord.Forbidden, discord.HTTPException):
+        player = await voice_channel.connect(cls=wavelink.Player, self_deaf=True)
+    except Exception as exc:
+        logger.warning("Could not connect Lavalink player to guild %s: %s", interaction.guild.id, exc)
         return None
-
-    state["voice"] = voice
-    return voice
-
-
-async def resolve_music_stream_url(track: dict) -> str | None:
-    """
-    Resolve a playable audio URL without downloading the entire song first.
-
-    Try multiple candidates because YouTube may block one video while another
-    upload of the same song remains playable. yt-dlp is preferred, with Piped
-    used as a transport fallback when YouTube extraction is blocked.
-    """
-    candidates = [track] + [
-        candidate for candidate in track.get("alternatives", [])
-        if isinstance(candidate, dict)
-    ]
-
-    async def piped_stream(video_id: str, preferred_api_base: str = "") -> str | None:
-        bases = []
-        if preferred_api_base:
-            bases.append(preferred_api_base.rstrip("/"))
-
-        try:
-            for base in await piped_instances():
-                base = str(base).rstrip("/")
-                if base and base not in bases:
-                    bases.append(base)
-        except Exception as exc:
-            logger.warning("Could not load Piped instances for audio fallback: %s", exc)
-
-        async with aiohttp.ClientSession() as session:
-            for api_base in bases:
-                try:
-                    async with session.get(
-                        f"{api_base}/streams/{video_id}",
-                        headers={"User-Agent": "Movie-Bot/1.0"},
-                        timeout=aiohttp.ClientTimeout(total=20),
-                    ) as response:
-                        if response.status != 200:
-                            logger.warning(
-                                "Piped audio fallback %s returned HTTP %s for %s",
-                                api_base,
-                                response.status,
-                                video_id,
-                            )
-                            continue
-
-                        data = await response.json(content_type=None)
-                        streams = data.get("audioStreams") if isinstance(data, dict) else None
-                        if not isinstance(streams, list):
-                            continue
-
-                        def stream_score(item: dict) -> tuple[int, int]:
-                            fmt = str(item.get("format") or "").casefold()
-                            codec = str(item.get("codec") or "").casefold()
-                            try:
-                                bitrate = int(item.get("bitrate") or 0)
-                            except (TypeError, ValueError):
-                                bitrate = 0
-
-                            score = 0
-                            if fmt in {"m4a", "mp4"}:
-                                score += 30
-                            elif fmt in {"opus", "webm"}:
-                                score += 20
-                            if "aac" in codec:
-                                score += 10
-                            return score, bitrate
-
-                        valid = [
-                            item for item in streams
-                            if isinstance(item, dict)
-                            and str(
-                                item.get("proxyUrl")
-                                or item.get("proxy_url")
-                                or item.get("url")
-                                or ""
-                            ).strip()
-                        ]
-                        valid.sort(key=stream_score, reverse=True)
-
-                        if valid:
-                            return str(
-                                valid[0].get("proxyUrl")
-                                or valid[0].get("proxy_url")
-                                or valid[0].get("url")
-                            ).strip()
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-                    logger.warning(
-                        "Piped audio fallback failed for %s: %s",
-                        api_base,
-                        exc,
-                    )
-        return None
-
-    for candidate in candidates:
-        video_id = str(candidate.get("video_id") or "").strip()
-        webpage_url = str(
-            candidate.get("webpage_url")
-            or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
-        ).strip()
-        if not webpage_url:
-            continue
-
-        title = str(candidate.get("title") or track.get("title") or "unknown")
-        try:
-            code, stdout, stderr = await run_yt_dlp(
-                [
-                    "--no-playlist",
-                    "--no-warnings",
-                    "--skip-download",
-                    "--get-url",
-                    "--format", "ba/ba*",
-                    webpage_url,
-                ],
-                timeout=90,
-            )
-
-            if code == 0:
-                urls = [
-                    line.strip()
-                    for line in stdout.splitlines()
-                    if line.strip().startswith(("http://", "https://"))
-                ]
-                if urls:
-                    if candidate is not track:
-                        logger.info(
-                            "Using alternate YouTube result for %s: %s",
-                            track.get("title", "unknown"),
-                            title,
-                        )
-                    return urls[-1]
-
-            logger.warning(
-                "yt-dlp direct audio failed for %s: %s",
-                title,
-                stderr[-1200:],
-            )
-        except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
-            logger.warning("Direct audio URL lookup failed for %s: %s", title, exc)
-
-        video_id = str(candidate.get("video_id") or "").strip()
-        if video_id:
-            stream_url = await piped_stream(
-                video_id,
-                str(candidate.get("api_base") or ""),
-            )
-            if stream_url:
-                if candidate is not track:
-                    logger.info(
-                        "Using alternate Piped result for %s: %s",
-                        track.get("title", "unknown"),
-                        title,
-                    )
-                return stream_url
-
-    logger.warning(
-        "Could not resolve any direct audio source for %s.",
-        track.get("title", "unknown"),
-    )
-    return None
+    state["player"] = player
+    return player
 
 
-async def start_track(guild_id: int) -> None:
+async def play_next(guild_id: int) -> bool:
     state = get_music_state(guild_id)
+    player = state.get("player")
+    if player is None:
+        return False
 
-    while state["queue"]:
-        voice = state.get("voice")
-        if voice is None or not voice.is_connected():
-            state["current"] = None
-            return
+    async with state["advance_lock"]:
+        if state.get("stopping"):
+            return False
+        while state["queue"]:
+            player = state.get("player")
+            if player is None or not player.connected:
+                return False
+            if player.playing or state.get("current") is not None:
+                return False
 
-        track = state["queue"].pop(0)
-        state["current"] = track
-        source_path = track.get("path")
-        stream_url = str(track.get("stream_url") or "").strip()
-
-        if not stream_url:
-            # Resolve the remote source at playback time so signed media URLs
-            # are fresh even when the track spent time waiting in the queue.
-            stream_url = await resolve_music_stream_url(track)
-
-        if not stream_url and (source_path is None or not source_path.exists()):
-            # Direct streaming failed. Fall back to the existing downloader.
+            track = state["queue"].pop(0)
+            state["current"] = track
             try:
-                source_path = await download_music_audio(track)
-                if source_path is not None:
-                    track["path"] = source_path
-            except (asyncio.TimeoutError, OSError, FileNotFoundError) as exc:
-                logger.warning(
-                    "Fallback music download failed for %s: %s",
-                    track.get("title", "unknown"),
-                    exc,
-                )
-
-        if not stream_url and (source_path is None or not source_path.exists()):
-            state["current"] = None
-            continue
-
-        # Fetch lyrics before starting the audio. Previously this happened
-        # after voice.play(), so a slow lyrics API could make the first line late.
-        try:
-            lyrics = await fetch_lyrics(track)
-        except Exception as exc:
-            logger.warning("Lyrics lookup failed: %s", exc)
-            lyrics = []
-
-        # Some YouTube uploads contain a short instrumental/video intro
-        # before the standard track begins. LRCLIB's timestamps are aligned
-        # to the standard track, so use the duration difference as a safe
-        # automatic intro offset when it is small and positive.
-        intro_offset = 0.0
-        source_duration = track.get("duration")
-        lyric_duration = track.get("lyrics_duration")
-        try:
-            if source_duration is not None and lyric_duration is not None:
-                difference = float(source_duration) - float(lyric_duration)
-                if 1.5 <= difference <= 20.0:
-                    intro_offset = difference
-                    logger.info(
-                        "Skipping %.2fs of extra intro for %s",
-                        intro_offset,
-                        track.get("title", "unknown"),
-                    )
-        except (TypeError, ValueError):
-            intro_offset = 0.0
-
-        try:
-            before_options = "-nostdin"
-            if intro_offset > 0:
-                before_options += f" -ss {intro_offset:.3f}"
-            if stream_url:
-                # Keep FFmpeg connected to the remote source instead of
-                # importing/downloading the entire track first. These
-                # reconnect flags are important for long songs and transient
-                # network interruptions.
-                stream_input = stream_url
-                reconnect_options = (
-                    "-reconnect 1 "
-                    "-reconnect_streamed 1 "
-                    "-reconnect_at_eof 1 "
-                    "-reconnect_delay_max 5 "
-                    "-nostdin"
-                )
-                if intro_offset > 0:
-                    reconnect_options += f" -ss {intro_offset:.3f}"
-                before_options = reconnect_options
-                source = discord.FFmpegPCMAudio(
-                    stream_input,
-                    before_options=before_options,
-                    options="-vn -loglevel warning",
-                )
-            else:
-                source = discord.FFmpegPCMAudio(
-                    str(source_path),
-                    before_options=before_options,
-                    options="-vn",
-                )
-            source = discord.PCMVolumeTransformer(source, volume=float(state["volume"]))
-        except (discord.ClientException, OSError) as exc:
-            logger.warning("Could not create audio source: %s", exc)
-            state["current"] = None
-            continue
-
-        finished = asyncio.Event()
-
-        def after_play(error):
-            if error:
-                logger.warning("Voice playback error: %s", error)
-            loop = getattr(bot, "loop", None)
-            if loop is not None and not loop.is_closed():
-                loop.call_soon_threadsafe(finished.set)
-
-        voice.play(source, after=after_play)
-        # Start the lyric clock at playback start. Lyrics were fetched before
-        # voice.play(), so network latency cannot delay the first line.
-        started_at = asyncio.get_running_loop().time() - 0.15
-        lyrics_task = (
-            asyncio.create_task(
-                lyrics_loop(guild_id, voice.channel, track, started_at, lyrics)
-            )
-            if lyrics and state.get("lyrics_enabled", True) else None
-        )
-        state["lyrics_task"] = lyrics_task
-
-        try:
-            await finished.wait()
-        finally:
-            if lyrics_task is not None and state.get("lyrics_task") is lyrics_task:
-                lyrics_task.cancel()
-                try:
-                    await lyrics_task
-                except asyncio.CancelledError:
-                    pass
-                state["lyrics_task"] = None
-
-        state["current"] = None
-
-    state["current"] = None
-
-
-async def ensure_music_player(guild_id: int) -> None:
-    state = get_music_state(guild_id)
-    task = state.get("play_task")
-    if task is None or task.done():
-        state["play_task"] = asyncio.create_task(start_track(guild_id))
-
-
-async def cleanup_music_state(guild_id: int) -> None:
-    state = music_states.get(guild_id)
-    if state is None:
-        return
-
-    lyrics_task = state.get("lyrics_task")
-    if lyrics_task is not None:
-        lyrics_task.cancel()
-
-    play_task = state.get("play_task")
-    if play_task is not None and play_task is not asyncio.current_task():
-        play_task.cancel()
-
-    voice = state.get("voice")
-    if voice is not None and voice.is_connected():
-        try:
-            await voice.disconnect()
-        except (discord.ClientException, discord.HTTPException):
-            pass
-
-    state["voice"] = None
-    state["current"] = None
-    state["queue"].clear()
-    state["play_task"] = None
-    state["lyrics_task"] = None
+                track["lyrics"] = await fetch_lyrics(track)
+                await player.play(track["track"], volume=int(state.get("volume", 100)))
+                return True
+            except Exception as exc:
+                logger.warning("Lavalink playback failed for %s: %s", track.get("title", "unknown"), exc)
+                state["current"] = None
+    return False
 
 
 @bot.tree.command(name="join", description="Join your current voice channel.")
 async def voice_join(interaction: discord.Interaction) -> None:
-    voice = await connect_member_voice(interaction)
-    if voice is None:
+    if not lavalink_ready:
+        await interaction.response.send_message("The music backend is currently unavailable.", ephemeral=True)
+        return
+    player = await connect_member_voice(interaction)
+    if player is None:
         await interaction.response.send_message("Join a voice channel first, then use /join.", ephemeral=True)
         return
-    await interaction.response.send_message(f"Joined **{voice.channel.name}**.", ephemeral=True)
+    await interaction.response.send_message(f"Joined **{player.channel.name}**.", ephemeral=True)
 
 
 @bot.tree.command(name="leave", description="Leave the voice channel and clear the music queue.")
@@ -2234,14 +1521,22 @@ async def voice_leave(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-
     state = get_music_state(interaction.guild.id)
-    voice = state.get("voice")
-    if voice is None or not voice.is_connected():
+    player = state.get("player")
+    if player is None or not player.connected:
         await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
         return
 
-    await cleanup_music_state(interaction.guild.id)
+    state["stopping"] = True
+    state["queue"].clear()
+    await cancel_lyrics(interaction.guild.id)
+    try:
+        await player.disconnect()
+    except Exception as exc:
+        logger.warning("Lavalink player disconnect failed for guild %s: %s", interaction.guild.id, exc)
+    state["player"] = None
+    state["current"] = None
+    state["stopping"] = False
     await interaction.response.send_message("Left the voice channel and cleared the queue.", ephemeral=True)
 
 
@@ -2249,21 +1544,9 @@ async def voice_leave(interaction: discord.Interaction) -> None:
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
     if interaction.guild is None:
-        try:
-            await interaction.response.send_message(
-                "This command only works in a server.",
-                ephemeral=True,
-            )
-        except discord.HTTPException:
-            pass
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
 
-    # A voice connection can take several seconds. A Discord interaction only
-    # has a short acknowledgement window, so defer before doing any network or
-    # voice work. Discord can occasionally report 40060 if the same interaction
-    # was acknowledged by another handler/dispatch path. In that case the
-    # interaction is already acknowledged, so continue using the followup
-    # webhook instead of turning a working music request into a command error.
     try:
         await interaction.response.defer(ephemeral=True)
     except discord.HTTPException as exc:
@@ -2271,104 +1554,42 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
             raise
         logger.warning("Music /play interaction was already acknowledged; continuing with followups.")
 
-    voice = await connect_member_voice(interaction)
-    if voice is None:
-        await interaction.edit_original_response(
-            content="Join a voice channel first. I can then play the song there."
-        )
+    if not lavalink_ready:
+        await interaction.edit_original_response(content="The music backend is currently unavailable.")
+        return
+
+    player = await connect_member_voice(interaction)
+    if player is None:
+        await interaction.edit_original_response(content="Join a voice channel first. I can then play the song there.")
         return
 
     try:
         track = await resolve_music_source(song)
-        if track is None:
-            await interaction.followup.send(
-                "I could not find that song. Spotify track links and normal song searches are supported.",
-                ephemeral=True,
-            )
-            return
-
-        # Use the already-deferred interaction only for a quick status
-        # update. If Discord invalidates the interaction webhook, do not let
-        # that turn a successfully resolved song into a command error.
-        try:
-            await interaction.edit_original_response(
-                content=f"Queueing **{track['title']}** for direct playback..."
-            )
-        except discord.NotFound as exc:
-            logger.warning(
-                "Could not update /play interaction after resolving %s: %r",
-                track.get("title", "unknown"),
-                exc,
-            )
-        except discord.HTTPException as exc:
-            logger.warning(
-                "Could not update /play interaction after resolving %s: %s",
-                track.get("title", "unknown"),
-                exc,
-            )
-
-        # Do not resolve an expiring media URL while the song is waiting in
-        # the queue. Resolve it immediately before playback instead, just as
-        # a Lavalink player resolves/loads the source when it is about to play.
-        # The old local downloader remains available as a fallback inside
-        # start_track().
-        state = get_music_state(interaction.guild.id)
-        was_playing = (
-            state.get("current") is not None
-            or bool(state.get("play_task") and not state["play_task"].done())
-        )
-        state["queue"].append(track)
-        position = len(state["queue"])
-
-        await ensure_music_player(interaction.guild.id)
-
-        if was_playing:
-            message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
-
-        else:
-            message = f"Playing **{track['title']}** by **{track['artist']}**."
-
-        try:
-            await interaction.followup.send(message, ephemeral=True)
-        except discord.NotFound as exc:
-            # The music task should continue even if Discord has already
-            # invalidated the interaction webhook.
-            logger.warning(
-                "Could not send /play confirmation for %s: %r",
-                track.get("title", "unknown"),
-                exc,
-            )
-        except discord.HTTPException as exc:
-            logger.warning(
-                "Could not send /play confirmation for %s: %s",
-                track.get("title", "unknown"),
-                exc,
-            )
-    except FileNotFoundError:
-        try:
-            await interaction.followup.send(
-                "yt-dlp is not installed. Install the requirements and restart the bot.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as response_error:
-            logger.warning("Could not send /play yt-dlp error response: %s", response_error)
-    except asyncio.TimeoutError:
-        try:
-            await interaction.followup.send(
-                "The song download took too long and was cancelled.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as response_error:
-            logger.warning("Could not send /play timeout response: %s", response_error)
     except Exception as exc:
-        logger.exception("Music play failed: %s", exc)
-        try:
-            await interaction.followup.send(
-                "Something went wrong while preparing that song.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as response_error:
-            logger.warning("Could not send /play failure response: %s", response_error)
+        logger.exception("Music source resolution failed: %s", exc)
+        track = None
+
+    if track is None:
+        await interaction.edit_original_response(content="I couldn't find or load that song from the music backend.")
+        return
+
+    state = get_music_state(interaction.guild.id)
+    was_playing = state.get("current") is not None or bool(player.playing) or bool(state.get("queue"))
+    state["queue"].append(track)
+    position = len(state["queue"])
+    started = await play_next(interaction.guild.id)
+
+    if not was_playing and not started and state.get("current") is None:
+        await interaction.edit_original_response(
+            content="I couldn't load that audio source from the music backend."
+        )
+        return
+
+    if was_playing:
+        message = f"Queued **{track['title']}** by **{track['artist']}** at position {position}."
+    else:
+        message = f"Playing **{track['title']}** by **{track['artist']}**."
+    await interaction.edit_original_response(content=message)
 
 
 @bot.tree.command(name="pause", description="Pause the current song.")
@@ -2377,11 +1598,16 @@ async def music_pause(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
-    voice = state.get("voice")
-    if voice is None or not voice.is_playing():
+    player = state.get("player")
+    if player is None or not player.playing or player.paused:
         await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
         return
-    voice.pause()
+    try:
+        await player.pause(True)
+    except Exception as exc:
+        logger.warning("Could not pause music: %s", exc)
+        await interaction.response.send_message("I couldn't pause the current song.", ephemeral=True)
+        return
     await interaction.response.send_message("Paused the current song.", ephemeral=True)
 
 
@@ -2391,11 +1617,16 @@ async def music_resume(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     state = get_music_state(interaction.guild.id)
-    voice = state.get("voice")
-    if voice is None or not voice.is_paused():
+    player = state.get("player")
+    if player is None or not player.paused:
         await interaction.response.send_message("The song is not paused.", ephemeral=True)
         return
-    voice.resume()
+    try:
+        await player.pause(False)
+    except Exception as exc:
+        logger.warning("Could not resume music: %s", exc)
+        await interaction.response.send_message("I couldn't resume the current song.", ephemeral=True)
+        return
     await interaction.response.send_message("Resumed the current song.", ephemeral=True)
 
 
@@ -2409,6 +1640,20 @@ async def music_lyrics(interaction: discord.Interaction, enabled: bool | None = 
     if enabled is None:
         enabled = not state.get("lyrics_enabled", True)
     state["lyrics_enabled"] = bool(enabled)
+    if state["lyrics_enabled"] and state.get("current") is not None:
+        await cancel_lyrics(interaction.guild.id)
+        player = state.get("player")
+        current = state.get("current")
+        if player is not None and current is not None and current.get("lyrics"):
+            state["lyrics_task"] = asyncio.create_task(
+                lyrics_loop(
+                    interaction.guild.id,
+                    player,
+                    player.channel,
+                    current,
+                    start_from_position=True,
+                )
+            )
     status = "enabled" if enabled else "disabled"
     await interaction.response.send_message(f"Synchronized lyrics are now **{status}**.", ephemeral=True)
 
@@ -2418,14 +1663,18 @@ async def music_skip(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-
     state = get_music_state(interaction.guild.id)
-    voice = state.get("voice")
-    if voice is None or not voice.is_playing():
+    player = state.get("player")
+    if player is None or not player.playing:
         await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
         return
-
-    voice.stop()
+    await cancel_lyrics(interaction.guild.id)
+    try:
+        await player.stop()
+    except Exception as exc:
+        logger.warning("Could not skip current track: %s", exc)
+        await interaction.response.send_message("I couldn't skip the current song.", ephemeral=True)
+        return
     await interaction.response.send_message("Skipped the current song.", ephemeral=True)
 
 
@@ -2434,23 +1683,18 @@ async def music_queue(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-
     state = get_music_state(interaction.guild.id)
     current = state.get("current")
     queue = state.get("queue", [])
-    lines = []
-
+    lines: list[str] = []
     if current is not None:
-        lines.append(f"**Now playing:** {current['title']} — {current['artist']}")
-    if queue:
-        lines.append("")
-        lines.extend(
-            f"**{index}.** {track['title']} — {track['artist']}"
-            for index, track in enumerate(queue, 1)
-        )
+        seconds = current.get("duration", 0) / 1000
+        lines.append(f"**Now playing:** {current['title']} — {current['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
+    for index, track in enumerate(queue, 1):
+        seconds = track.get("duration", 0) / 1000
+        lines.append(f"**{index}.** {track['title']} — {track['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
     if not lines:
         lines = ["The music queue is empty."]
-
     await interaction.response.send_message("\n".join(lines[:51]), ephemeral=True)
 
 
@@ -2460,14 +1704,16 @@ async def music_volume(interaction: discord.Interaction, level: app_commands.Ran
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-
     state = get_music_state(interaction.guild.id)
-    state["volume"] = int(level) / 100
-
-    voice = state.get("voice")
-    if voice is not None and isinstance(voice.source, discord.PCMVolumeTransformer):
-        voice.source.volume = state["volume"]
-
+    state["volume"] = int(level)
+    player = state.get("player")
+    if player is not None and player.connected:
+        try:
+            await player.set_volume(int(level))
+        except Exception as exc:
+            logger.warning("Could not change Lavalink volume: %s", exc)
+            await interaction.response.send_message("I couldn't change the current volume.", ephemeral=True)
+            return
     await interaction.response.send_message(f"Volume set to **{level}%**.", ephemeral=True)
 
 
@@ -2476,13 +1722,100 @@ async def music_stop(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-
     state = get_music_state(interaction.guild.id)
     state["queue"].clear()
-    voice = state.get("voice")
-    if voice is not None and voice.is_playing():
-        voice.stop()
+    await cancel_lyrics(interaction.guild.id)
+    player = state.get("player")
+    if player is not None and player.playing:
+        state["stopping"] = True
+        try:
+            await player.stop()
+        except Exception as exc:
+            logger.warning("Could not stop Lavalink playback: %s", exc)
+        finally:
+            state["stopping"] = False
+    state["current"] = None
     await interaction.response.send_message("Stopped playback and cleared the queue.", ephemeral=True)
+
+
+@bot.event
+async def on_wavelink_node_ready(payload) -> None:
+    global lavalink_ready
+    lavalink_ready = True
+    logger.info("Lavalink node ready: %s (resumed=%s)", payload.node.identifier, payload.resumed)
+
+
+@bot.event
+async def on_wavelink_node_disconnected(payload) -> None:
+    global lavalink_ready
+    lavalink_ready = False
+    logger.warning("Lavalink node disconnected: %s", getattr(getattr(payload, "node", None), "identifier", "unknown"))
+
+
+@bot.event
+async def on_wavelink_node_closed(node, disconnected) -> None:
+    global lavalink_ready
+    lavalink_ready = False
+    logger.warning(
+        "Lavalink node closed: %s; disconnected players=%d",
+        getattr(node, "identifier", "unknown"),
+        len(disconnected or []),
+    )
+
+
+@bot.event
+async def on_wavelink_track_start(payload) -> None:
+    player = getattr(payload, "player", None)
+    if player is None or player.guild is None:
+        return
+    state = music_states.get(player.guild.id)
+    if state is None or state.get("current") is None:
+        return
+    await cancel_lyrics(player.guild.id)
+    track = state["current"]
+    if track.get("lyrics") and state.get("lyrics_enabled", True):
+        state["lyrics_task"] = asyncio.create_task(
+            lyrics_loop(player.guild.id, player, player.channel, track)
+        )
+
+
+@bot.event
+async def on_wavelink_track_end(payload) -> None:
+    player = getattr(payload, "player", None)
+    if player is None or player.guild is None:
+        return
+    state = music_states.get(player.guild.id)
+    if state is None:
+        return
+    await cancel_lyrics(player.guild.id)
+    state["current"] = None
+    if state.get("stopping"):
+        return
+    await play_next(player.guild.id)
+
+
+@bot.event
+async def on_wavelink_track_exception(payload) -> None:
+    player = getattr(payload, "player", None)
+    if player is None or player.guild is None:
+        return
+    logger.warning(
+        "Lavalink track exception in guild %s for %s: %s",
+        player.guild.id,
+        getattr(getattr(payload, "track", None), "title", "unknown"),
+        getattr(getattr(payload, "exception", None), "message", "unknown error"),
+    )
+
+
+@bot.event
+async def on_wavelink_websocket_closed(payload) -> None:
+    logger.warning(
+        "Discord voice websocket closed through Lavalink: guild=%s code=%s reason=%s remote=%s",
+        getattr(getattr(payload, "player", None), "guild", None),
+        getattr(payload, "code", "unknown"),
+        getattr(payload, "reason", "unknown"),
+        getattr(payload, "by_remote", "unknown"),
+    )
 
 channel_group = app_commands.Group(
     name="channel",

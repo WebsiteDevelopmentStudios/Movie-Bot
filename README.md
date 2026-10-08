@@ -70,26 +70,48 @@ From the repository directory:
 
 ## Voice music
 
-The bot also includes a voice music player. The available commands are:
+The bot uses Lavalink as its music transport. The Discord bot does not directly download or stream YouTube audio from the WispByte/Render process, which keeps the music transport separate from the movie system and avoids depending on public Piped instances.
+
+Commands:
 
     /join
     /play <song>
     /queue
     /skip
+    /pause
+    /resume
     /volume <level>
+    /lyrics
     /leave
 
-Run /join while you are in a voice channel, or use /play while you are already in one. /play accepts a Spotify track URL such as https://open.spotify.com/track/... as well as a normal song search.
+Run /join while you are in a voice channel, or use /play while you are already in one. /play accepts normal song searches and Spotify track URLs.
 
-Spotify does not provide Discord bots with a direct playable audio stream. For Spotify links, the bot reads the track metadata from Spotify and resolves a playable audio source separately with yt-dlp. It does not log into a user's Spotify account or request their Spotify password.
+Spotify does not provide Discord bots with unrestricted full-track audio. For a Spotify URL, the bot uses Spotify oEmbed only for title/artist metadata and then asks Lavalink to resolve a playable source separately. The bot never requests a user's Spotify password or stores Spotify credentials.
 
-When synced lyrics are available, the bot follows their timestamps and sends one lyric line at a time to the voice channel's chat when the installed discord.py version exposes voice-channel chat messaging. If Discord.py cannot send messages to that voice-channel chat, music playback continues normally.
+### Lavalink configuration
 
-The queue command shows the current track and queued tracks. /skip advances to the next track. /volume accepts 0-100 and changes the current player volume. /leave stops playback, clears the queue, and disconnects the bot.
+A Lavalink v4 server is required for music playback. It should be reachable by the WispByte bot over the network.
 
-Music audio is cached locally in .music_cache/ while the bot is running. The cache is ignored by Git.
+Set these environment variables:
 
-The bot syncs its slash commands when it starts. It also starts a Cloudflare Quick Tunnel automatically so the movie web player can be reached from the internet without owning a domain or configuring DNS.
+    LAVALINK_HOST=your-lavalink-host.example.com
+    LAVALINK_PORT=2333
+    LAVALINK_PASSWORD=your_lavalink_password
+    LAVALINK_SECURE=false
+
+Set LAVALINK_SECURE=true when the Lavalink endpoint is exposed through HTTPS/TLS.
+
+The Lavalink server must have a working audio source configured for the searches used by this bot. The bot deliberately does not implement a collection of public Piped-instance fallbacks or YouTube anti-bot workarounds. If the Lavalink node cannot resolve the requested source, /play reports that the music backend could not load it.
+
+Lavalink and the bot may be hosted separately. This is recommended when the WispByte bot container has a shared outbound IP that is frequently challenged by a media provider.
+
+The music queue is maintained independently for each Discord guild. Lavalink owns the actual audio transport while the bot owns queue state, commands, lyrics, and user-facing messages.
+
+Synchronized lyrics are fetched from LRCLIB. The lyrics task reads Lavalink's actual player position instead of using a separate wall-clock timer. Lavalink reports the same position while playback is paused, so pausing the song also pauses lyric progression. Skipping or leaving immediately cancels the old lyric task.
+
+Volume is changed through Lavalink's player volume control; the audio pipeline is not restarted.
+
+The bot acknowledges /play before connecting to voice or performing network resolution, preventing long source lookups from causing Discord interaction timeout errors.
 
 ## Link the movie channel
 
