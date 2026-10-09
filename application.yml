@@ -54,6 +54,7 @@ plugins:
       - TVHTML5_SIMPLY
       - ANDROID_MUSIC
       - IOS
+      - TV
 
 logging:
   level:
