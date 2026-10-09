@@ -1552,67 +1552,18 @@ class VidNestSearchView(discord.ui.View):
 
 
 class VidNestPlaybackView(discord.ui.View):
-    """Provides movie page links and a lightweight stream lookup."""
+    """Provides a direct link to the provider page; does not inspect or extract media."""
 
     def __init__(self, owner_id: int, vidnest_url: str):
         super().__init__(timeout=180)
         self.owner_id = owner_id
-        self.vidnest_url = vidnest_url
         self.add_item(
             discord.ui.Button(
-                label="Open VidNest",
+                label="Open movie page",
                 style=discord.ButtonStyle.link,
                 url=vidnest_url,
             )
         )
-        # Cineby is more scraper-friendly; offer a direct link too.
-        try:
-            movie_id = vidnest_url.rstrip("/").split("/")[-1]
-            int(movie_id)
-            self.add_item(
-                discord.ui.Button(
-                    label="Open on Cineby",
-                    style=discord.ButtonStyle.link,
-                    url=f"https://cineby.tech/movie/{movie_id}/watch",
-                )
-            )
-        except ValueError:
-            pass
-
-    @discord.ui.button(label="Find Stream", style=discord.ButtonStyle.secondary)
-    async def check_m3u8(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        async def progress(message: str) -> None:
-            try:
-                await interaction.edit_original_response(content=message)
-            except discord.HTTPException:
-                pass
-
-        try:
-            playlist_url = await resolve_vidnest_playlist(self.vidnest_url, progress)
-        except (aiohttp.ClientError, RuntimeError, ValueError) as exc:
-            await interaction.followup.send(f"Stream lookup failed: {escape(str(exc))}", ephemeral=True)
-            return
-
-        if playlist_url:
-            safe_url = discord.utils.escape_markdown(playlist_url)
-            await interaction.followup.send(
-                "I found a playable stream for this movie.\n\n"
-                f"<{safe_url}>\n\n"
-                "Use `/movie play` with this playlist URL to download and host it, "
-                "or use the link directly in an HLS-capable player.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(
-                "I could not find a playable stream for this title right now. "
-                "Try the **Open on Cineby** button and use that page with "
-                "`/movie play`, or open the page in your browser.",
-                ephemeral=True,
-            )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
