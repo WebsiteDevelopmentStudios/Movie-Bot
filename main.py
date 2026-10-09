@@ -1699,6 +1699,21 @@ async def movie_list(interaction: discord.Interaction) -> None:
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     await acknowledge_command(interaction)
     if is_m3u8_url(movie):
+        if shutil.which(FFMPEG_BIN) is None:
+            await send_interaction_response(
+                interaction,
+                "FFmpeg is unavailable on this host. Install FFmpeg or set FFMPEG_BIN to its executable path, then restart the bot.",
+                ephemeral=True,
+            )
+            return
+        if shutil.which(FFPROBE_BIN) is None:
+            await send_interaction_response(
+                interaction,
+                "ffprobe is unavailable on this host. Install FFmpeg (including ffprobe) or set FFPROBE_BIN to its executable path, then restart the bot.",
+                ephemeral=True,
+            )
+            return
+
         async def progress(message: str) -> None:
             try:
                 await interaction.edit_original_response(content=message)
