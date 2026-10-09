@@ -1402,6 +1402,12 @@ async def detect_vidnest_m3u8(movie_url: str) -> str | None:
                 final = urlparse(str(response.url))
                 if final.scheme != "https" or final.hostname not in {"vidnest.fun", "www.vidnest.fun"}:
                     raise ValueError("VidNest redirected to a different host; the check was stopped.")
+                if response.status == 403:
+                    raise RuntimeError(
+                        "VidNest blocked the bot's HTTP request (403 Forbidden). "
+                        "This does not mean the movie has no HLS stream; the page may require "
+                        "browser-side access or load its playlist through JavaScript."
+                    )
                 response.raise_for_status()
                 html = await response.text(errors="replace")
     except asyncio.TimeoutError:
