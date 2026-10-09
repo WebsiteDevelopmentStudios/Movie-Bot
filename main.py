@@ -34,6 +34,7 @@ from lavalink_manager import (
 )
 from youtube_extractor import extract_youtube_audio
 from vidnest_scraper import is_vidnest_url, resolve_vidnest_playlist
+from cineby_scraper import is_cineby_url, resolve_cineby_playlist
 
 load_dotenv()
 
@@ -53,10 +54,17 @@ WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://wisp.uno").strip().rstrip("/")
-# Downloaded VidNest/M3U8 movies are deleted after this long to keep the
-# 512 MB disk quota from filling up. Hosting works from the HLS cache
+# Downloaded VidNest/M3U8/Cineby movies are deleted after this long to keep
+# the 512 MB disk quota from filling up. Hosting works from the HLS cache
 # while a movie plays, so deleting later is safe.
 DOWNLOAD_LIFETIME_SECONDS = 24 * 3600
+# Browser identity used when downloading streams; many CDNs reject ffmpeg's
+# default User-Agent.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+)
+CINEBY_REFERER = "https://cineby.tech/"
 
 # TMDB provides movie search results; VidNest accepts TMDB IDs in its player URL.
 TMDB_API_KEY = os.getenv(
@@ -628,6 +636,7 @@ def is_m3u8_url(value: str) -> bool:
 async def stream_m3u8_movie(
     url: str,
     progress=None,
+    referer: str | None = None,
 ) -> tuple[bool, str | None, Path | None]:
     """Download an M3U8 stream to Movies, then prepare the normal hosted player."""
     if not is_m3u8_url(url):
@@ -648,33 +657,46 @@ async def stream_m3u8_movie(
     if progress is not None:
         await progress("Downloading the M3U8 movie...")
 
+    download_command = [
+        FFMPEG_BIN,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        # Present as a browser; many stream CDNs reject ffmpeg's default UA.
+        "-user_agent",
+        BROWSER_USER_AGENT,
+        # Some HLS playlists include signed CDN segment URLs without a
+        # conventional media extension (including image/ad placeholders).
+        # Permit those URLs so FFmpeg can inspect the playlist and continue
+        # past entries that are not usable media segments.
+        "-allowed_extensions",
+        "ALL",
+    ]
+    if referer:
+        # Some providers require an origin/referer that matches the page
+        # the stream was discovered on.
+        download_command += ["-headers", f"Referer: {referer}\r\n"]
+    download_command += [
+        "-i",
+        url.strip(),
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(temporary),
+    ]
+
     try:
         process = await asyncio.create_subprocess_exec(
-            FFMPEG_BIN,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            # Some HLS playlists include signed CDN segment URLs without a
-            # conventional media extension (including image/ad placeholders).
-            # Permit those URLs so FFmpeg can inspect the playlist and continue
-            # past entries that are not usable media segments.
-            "-allowed_extensions",
-            "ALL",
-            "-i",
-            url.strip(),
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            str(temporary),
+            *download_command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -731,11 +753,15 @@ async def stream_m3u8_movie(
     return True, player_url, downloaded
 
 
-async def _play_m3u8_movie(interaction: discord.Interaction, m3u8_url: str) -> None:
+async def _play_m3u8_movie(
+    interaction: discord.Interaction,
+    m3u8_url: str,
+    referer: str | None = None,
+) -> None:
     """Download an M3U8 playlist and announce the hosted player in the movie channel.
 
-    Shared by direct .m3u8 links and resolved VidNest movie pages.
-    Assumes the interaction has already been acknowledged/deferred.
+    Shared by direct .m3u8 links, resolved VidNest pages, and resolved Cineby
+    pages. Assumes the interaction has already been acknowledged/deferred.
     """
     async def progress(message: str) -> None:
         try:
@@ -743,7 +769,7 @@ async def _play_m3u8_movie(interaction: discord.Interaction, m3u8_url: str) -> N
         except discord.HTTPException:
             pass
 
-    success, player_url, downloaded = await stream_m3u8_movie(m3u8_url, progress)
+    success, player_url, downloaded = await stream_m3u8_movie(m3u8_url, progress, referer=referer)
 
     if not success or player_url is None:
         await interaction.followup.send(
@@ -1390,7 +1416,7 @@ async def start_movie_web_server() -> web.AppRunner:
 
 @tasks.loop(hours=6)
 async def prune_movie_downloads() -> None:
-    """Disk-safety task: delete aged VidNest/M3U8 downloads and stale caches.
+    """Disk-safety task: delete aged M3U8/Cineby downloads and stale caches.
 
     Runs once at startup, then every six hours. Skips the currently hosted
     movie so an in-progress hosting session is never deleted out from under
@@ -1449,7 +1475,7 @@ async def prune_movie_downloads() -> None:
 
 
 class VidNestSearchView(discord.ui.View):
-    """A private title picker for VidNest movie results."""
+    """A private title picker for movie results."""
 
     def __init__(self, owner_id: int, results: list[dict]):
         super().__init__(timeout=180)
@@ -1528,7 +1554,7 @@ class VidNestSearchView(discord.ui.View):
 
 
 class VidNestPlaybackView(discord.ui.View):
-    """Provides the VidNest player link and a stream lookup."""
+    """Provides movie page links and a lightweight stream lookup."""
 
     def __init__(self, owner_id: int, vidnest_url: str):
         super().__init__(timeout=180)
@@ -1541,6 +1567,19 @@ class VidNestPlaybackView(discord.ui.View):
                 url=vidnest_url,
             )
         )
+        # Cineby is more scraper-friendly; offer a direct link too.
+        try:
+            movie_id = vidnest_url.rstrip("/").split("/")[-1]
+            int(movie_id)
+            self.add_item(
+                discord.ui.Button(
+                    label="Open on Cineby",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://cineby.tech/movie/{movie_id}/watch",
+                )
+            )
+        except ValueError:
+            pass
 
     @discord.ui.button(label="Find Stream", style=discord.ButtonStyle.secondary)
     async def check_m3u8(
@@ -1572,8 +1611,8 @@ class VidNestPlaybackView(discord.ui.View):
         else:
             await interaction.followup.send(
                 "I could not find a playable stream for this title right now. "
-                "The player may load it through JavaScript or a provider the "
-                "scraper cannot reach. Try again later or open the VidNest page directly.",
+                "Try the **Open on Cineby** button and use that page with "
+                "`/movie play`, or open the page in your browser.",
                 ephemeral=True,
             )
 
@@ -1589,7 +1628,7 @@ class VidNestPlaybackView(discord.ui.View):
 
 
 async def search_movies(query: str) -> list[dict]:
-    """Search TMDB; VidNest uses the returned TMDB movie IDs."""
+    """Search TMDB; the results use TMDB movie IDs."""
     if not TMDB_API_KEY:
         raise RuntimeError("TMDB_API_KEY is not configured.")
 
@@ -1706,7 +1745,7 @@ async def channel_link(interaction: discord.Interaction) -> None:
     )
 
 
-@movie_group.command(name="search", description="Search for a movie title and open it on VidNest.")
+@movie_group.command(name="search", description="Search for a movie title.")
 @app_commands.describe(title="The movie title to search for.")
 @app_commands.guild_only()
 async def movie_search(interaction: discord.Interaction, title: str) -> None:
@@ -1783,22 +1822,61 @@ async def movie_list(interaction: discord.Interaction) -> None:
 
 
 
-@movie_group.command(name="play", description="Send a local movie, download an M3U8 movie, or host a VidNest page.")
-@app_commands.describe(movie="Movie name, an HTTP/HTTPS .m3u8 URL, or a vidnest.fun/movie/<id> URL.")
+@movie_group.command(
+    name="play",
+    description="Send a local movie, download an M3U8 movie, or host a Cineby/VidNest page.",
+)
+@app_commands.describe(
+    movie="Movie name, an HTTP/HTTPS .m3u8 URL, a cineby.tech/movie/<id>/watch URL, or a vidnest.fun/movie/<id> URL.",
+)
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     await acknowledge_command(interaction)
 
-    # VidNest movie page: resolve the playlist first, then host it like any M3U8.
-    if is_vidnest_url(movie):
-        if shutil.which(FFMPEG_BIN) is None:
+    # Cineby watch page: resolve the playlist, then host it like any M3U8.
+    if is_cineby_url(movie):
+        if shutil.which(FFMPEG_BIN) is None or shutil.which(FFPROBE_BIN) is None:
             await interaction.followup.send(
-                "FFmpeg is unavailable on this host. Install FFmpeg or set FFMPEG_BIN to its executable path, then restart the bot.",
+                "FFmpeg/ffprobe is unavailable on this host. Install FFmpeg or set "
+                "FFMPEG_BIN/FFPROBE_BIN to their executable paths, then restart the bot.",
                 ephemeral=True,
             )
             return
-        if shutil.which(FFPROBE_BIN) is None:
+
+        async def cineby_progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message)
+            except discord.HTTPException:
+                pass
+
+        try:
+            playlist_url = await resolve_cineby_playlist(movie, cineby_progress)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("Cineby lookup failed for %r: %s", movie, exc)
             await interaction.followup.send(
-                "ffprobe is unavailable on this host. Install FFmpeg (including ffprobe) or set FFPROBE_BIN to its executable path, then restart the bot.",
+                f"Cineby lookup failed: {escape(str(exc))}",
+                ephemeral=True,
+            )
+            return
+
+        if playlist_url is None:
+            await interaction.followup.send(
+                "I could not find a playable stream on that Cineby page. "
+                "The provider may only expose its stream through JavaScript; "
+                "try another movie or use the page in your browser.",
+                ephemeral=True,
+            )
+            return
+
+        await cineby_progress("Stream found. Downloading the M3U8 movie...")
+        await _play_m3u8_movie(interaction, playlist_url, referer=CINEBY_REFERER)
+        return
+
+    # VidNest movie page: resolve the playlist first, then host it like any M3U8.
+    if is_vidnest_url(movie):
+        if shutil.which(FFMPEG_BIN) is None or shutil.which(FFPROBE_BIN) is None:
+            await interaction.followup.send(
+                "FFmpeg/ffprobe is unavailable on this host. Install FFmpeg or set "
+                "FFMPEG_BIN/FFPROBE_BIN to their executable paths, then restart the bot.",
                 ephemeral=True,
             )
             return
@@ -1822,8 +1900,8 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         if playlist_url is None:
             await interaction.followup.send(
                 "I could not find a playable stream on that VidNest page. "
-                "Try again later or open it directly at "
-                f"<https://vidnest.fun/movie/{urlparse(movie).path.split('/')[-1]}>.",
+                f"Try again later, or use the Cineby page: "
+                f"<https://cineby.tech/movie/{urlparse(movie).path.split('/')[-1]}/watch>.",
                 ephemeral=True,
             )
             return
@@ -1851,7 +1929,6 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
         await _play_m3u8_movie(interaction, movie)
         return
 
-
     if not get_movie_files():
         await send_interaction_response(interaction, 
             "No movies are currently available.",
@@ -1862,7 +1939,8 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     selected = find_movie(movie)
     if selected is None:
         await send_interaction_response(interaction, 
-            "That movie is not available. Use /movie list, provide an HTTP/HTTPS .m3u8 URL, or a vidnest.fun movie link.",
+            "That movie is not available. Use /movie list, provide an HTTP/HTTPS .m3u8 URL, "
+            "or a cineby.tech movie link.",
             ephemeral=True,
         )
         return
