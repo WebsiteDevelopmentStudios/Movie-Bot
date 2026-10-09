@@ -1303,6 +1303,41 @@ async def start_movie_web_server() -> web.AppRunner:
     return runner
 
 
+async def resolve_cineby_direct_m3u8(movie_id: int) -> str | None:
+    """Look for an HLS URL directly exposed in Cineby's public watch-page HTML.
+
+    This does not execute page JavaScript, decrypt player payloads, or extract
+    streams from third-party embedded providers.
+    """
+    watch_url = f"https://cineby.tech/movie/{int(movie_id)}/watch"
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; Movie-Bot/1.0)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(watch_url, allow_redirects=True) as response:
+            response.raise_for_status()
+            if response.url.scheme != "https" or response.url.host not in {
+                "cineby.tech", "www.cineby.tech"
+            }:
+                raise RuntimeError("Cineby redirected to an unexpected host.")
+            html = await response.text(errors="replace")
+
+    candidates = re.findall(
+        r"""https://[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?""",
+        html,
+        flags=re.IGNORECASE,
+    )
+    for candidate in candidates:
+        candidate = candidate.rstrip("),;]")
+        parsed = urlparse(candidate)
+        if parsed.scheme == "https" and parsed.path.lower().endswith(".m3u8"):
+            return candidate
+    return None
+
+
 class CinebySearchView(discord.ui.View):
     """A private title picker for Cineby movie search results."""
 
@@ -1334,20 +1369,20 @@ class CinebySearchView(discord.ui.View):
         self.add_item(self.movie_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await send_interaction_response(
-                interaction,
-                "This movie selector belongs to the person who ran /movie search.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    async def movie_selected(self, interaction: discord.Interaction) -> None:
-        item = self.results_by_id.get(self.movie_select.values[0])
-        if item is None:
-            await send_interaction_response(
-                interaction,
+        if in        embed.add_field(
+            name="Next step",
+            value=(
+                f"[Open this title on Cineby]({cineby_url})\\n"
+                "Use **Try direct HLS** to check whether a direct .m3u8 URL is exposed in the public page HTML."
+            ),
+            inline=False,
+        )
+        await interaction.response.edit_message(
+            content=f"Selected **{title}**" + (f" ({year})" if year else "") + ".",
+            embed=embed,
+            view=CinebyPlaybackView(self.owner_id, movie_id, title, year, cineby_url),
+        )
+        self.stop()          interaction,
                 "I couldn't find that selection. Run /movie search again.",
                 ephemeral=True,
             )
@@ -1383,6 +1418,93 @@ class CinebySearchView(discord.ui.View):
             view=None,
         )
         self.stop()
+
+
+class CinebyPlaybackView(discord.ui.View):
+    """Offers a direct-HLS check for a selected Cineby title."""
+
+    def __init__(self, owner_id: int, movie_id: int, title: str, year: str, cineby_url: str):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.movie_id = movie_id
+        self.title = title
+        self.year = year
+        self.cineby_url = cineby_url
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await send_interaction_response(
+            interaction,
+            "This movie selection belongs to the person who ran /movie search.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="Try direct HLS", style=discord.ButtonStyle.primary)
+    async def try_direct_hls(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            playlist_url = await resolve_cineby_direct_m3u8(self.movie_id)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
+            logger.warning("Cineby direct-HLS check failed for movie %s: %s", self.movie_id, exc)
+            await interaction.followup.send(
+                "I couldn't inspect Cineby's public page right now. Try opening the title on Cineby directly.",
+                ephemeral=True,
+            )
+            return
+
+        if not playlist_url:
+            await interaction.followup.send(
+                "No direct .m3u8 URL was exposed in Cineby's public HTML. The page may load its player through JavaScript or a third-party provider; this check deliberately doesn't decrypt or extract a protected provider stream. No download was started.",
+                ephemeral=True,
+            )
+            return
+
+        async def progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message, view=self)
+            except discord.HTTPException:
+                pass
+
+        await progress(f"Found a direct HLS playlist for **{self.title}**. Starting the existing movie pipeline...")
+        success, player_url, downloaded = await stream_m3u8_movie(playlist_url, progress)
+        if not success or player_url is None:
+            await interaction.followup.send(
+                "A direct playlist was found, but FFmpeg could not prepare it. Check the bot host logs for details.",
+                ephemeral=True,
+            )
+            return
+
+        channel = await get_movie_channel()
+        if channel is None:
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.followup.send(
+                "The stream was prepared, but no movie channel is configured. Ask an administrator to run /channel link.",
+                ephemeral=True,
+            )
+            return
+
+        media_url = f"{PUBLIC_BASE_URL}/media/{active_host['token']}" if active_host else player_url
+        try:
+            await channel.send(
+                content=f"Now Playing: {self.title}" + (f" ({self.year})" if self.year else "") + f"\\n{media_url}"
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await clear_hosted_movie(active_host["token"] if active_host else "")
+            await interaction.followup.send(
+                "The stream was prepared, but I couldn't post it in the configured movie channel.",
+                ephemeral=True,
+            )
+            return
+
+        button.disabled = True
+        await interaction.edit_original_response(
+            content=f"Now hosting **{self.title}** in {channel.mention}.",
+            view=self,
+        )
 
 
 async def search_cineby_movies(query: str) -> list[dict]:
