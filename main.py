@@ -1505,7 +1505,6 @@ async def channel_link(interaction: discord.Interaction) -> None:
 
 @movie_group.command(name="search", description="Search Cineby for a movie by title.")
 @app_commands.describe(title="The movie title to search for.")
-@app_commands.rename(title="title")
 @app_commands.guild_only()
 async def movie_search(interaction: discord.Interaction, title: str) -> None:
     await acknowledge_command(interaction)
