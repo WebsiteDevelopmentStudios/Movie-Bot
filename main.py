@@ -50,7 +50,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://wisp.uno").strip().rstri
 # TMDB provides movie search results; VidNest accepts TMDB IDs in its player URL.
 TMDB_API_KEY = os.getenv(
     "TMDB_API_KEY",
-    os.getenv("TMDB_API_KEY", "8871b4dba1715cd776c063a458ae8795"),
+    os.getenv("CINEBY_TMDB_API_KEY", "8871b4dba1715cd776c063a458ae8795"),
 ).strip()
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
@@ -1411,7 +1411,7 @@ class VidNestPlaybackView(discord.ui.View):
 
 
 async def search_movies(query: str) -> list[dict]:
-    """Search the movie catalog by TMDB ID, which Cineby uses in movie URLs."""
+    """Search TMDB; VidNest uses the returned TMDB movie IDs."""
     if not TMDB_API_KEY:
         raise RuntimeError("TMDB_API_KEY is not configured.")
 
