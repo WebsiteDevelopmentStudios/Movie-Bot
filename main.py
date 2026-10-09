@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import shutil
+import time
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from html import escape
@@ -14,7 +15,7 @@ import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord.http import handle_message_parameters
 from dotenv import load_dotenv
 
@@ -52,6 +53,10 @@ WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://wisp.uno").strip().rstrip("/")
+# Downloaded VidNest/M3U8 movies are deleted after this long to keep the
+# 512 MB disk quota from filling up. Hosting works from the HLS cache
+# while a movie plays, so deleting later is safe.
+DOWNLOAD_LIFETIME_SECONDS = 24 * 3600
 
 # TMDB provides movie search results; VidNest accepts TMDB IDs in its player URL.
 TMDB_API_KEY = os.getenv(
@@ -549,7 +554,8 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
                 "6",
                 "-hls_list_size",
                 "0",
-                "-hls_playlist_type",                "vod",
+                "-hls_playlist_type",
+                "vod",
                 "-hls_flags",
                 "independent_segments",
                 "-f",
@@ -1382,6 +1388,66 @@ async def start_movie_web_server() -> web.AppRunner:
     return runner
 
 
+@tasks.loop(hours=6)
+async def prune_movie_downloads() -> None:
+    """Disk-safety task: delete aged VidNest/M3U8 downloads and stale caches.
+
+    Runs once at startup, then every six hours. Skips the currently hosted
+    movie so an in-progress hosting session is never deleted out from under
+    the player.
+    """
+    ensure_movies_dir()
+    cutoff = time.time() - DOWNLOAD_LIFETIME_SECONDS
+
+    hosted_paths: list[Path] = []
+    if active_host is not None:
+        try:
+            hosted_paths.append(active_host["movie"].resolve())
+        except OSError:
+            pass
+
+    for pattern in ("M3U8-*.mp4", "M3U8-*.mp3"):
+        for path in MOVIES_DIR.glob(pattern):
+            try:
+                if path.resolve() in hosted_paths:
+                    continue
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    logger.info("Pruned old downloaded movie: %s", path.name)
+            except OSError:
+                continue
+
+    # Remove abandoned partial downloads (crash leftovers).
+    for path in MOVIES_DIR.glob(".*.part.mp4"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                logger.info("Pruned partial download: %s", path.name)
+        except OSError:
+            continue
+
+    # Remove stale HLS cache folders that no active host is using.
+    if HLS_CACHE_DIR.is_dir():
+        active_hls: list[Path] = []
+        if active_host is not None:
+            try:
+                active_hls.append(active_host["hls_dir"].resolve())
+            except OSError:
+                pass
+        for hls_dir in list(HLS_CACHE_DIR.iterdir()):
+            try:
+                if not hls_dir.is_dir() or hls_dir.resolve() in active_hls:
+                    continue
+                if hls_dir.stat().st_mtime < cutoff:
+                    for entry in hls_dir.rglob("*"):
+                        if entry.is_file():
+                            entry.unlink(missing_ok=True)
+                    hls_dir.rmdir()
+                    logger.info("Pruned stale HLS cache: %s", hls_dir.name)
+            except OSError:
+                continue
+
+
 class VidNestSearchView(discord.ui.View):
     """A private title picker for VidNest movie results."""
 
@@ -2037,6 +2103,11 @@ class MovieBot(discord.Client):
                 name="lavalink-render-keepalive",
             )
 
+        # Disk safety: prune aged movie downloads once immediately, then
+        # every six hours. Cheap to run and protects the 512 MB quota.
+        await prune_movie_downloads()
+        prune_movie_downloads.start()
+
         await initialize_lavalink()
 
         try:
@@ -2058,6 +2129,7 @@ class MovieBot(discord.Client):
         return tunnel_started
 
     async def close(self) -> None:
+        prune_movie_downloads.cancel()
         for guild_id in list(music_states):
             await cancel_lyrics(guild_id)
         if self.lavalink_keepalive_task is not None:
