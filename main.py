@@ -2193,13 +2193,11 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 
 async def resolve_music_source(query: str) -> dict | None:
-    """Resolve a song and hand Lavalink a direct, short-lived audio URL.
+    """Resolve a Spotify link or search query to a Lavalink-playable track.
 
-    YouTube's current playback API can return SABR-only formats that the
-    youtube-source plugin cannot always turn into a playable Lavalink track.
-    We therefore use yt-dlp as an extractor and let Lavalink's HTTP source
-    handle the resulting audio URL. YouTube authentication/cookies stay in
-    the extractor environment and are never sent to Discord.
+    Spotify oEmbed provides metadata only, not audio. Prefer Lavalink's own
+    source search so it can manage source-specific playback details. Retain
+    yt-dlp as a compatibility fallback for hosts with HTTP audio support.
     """
     if not lavalink_ready or wavelink is None:
         return None
@@ -2207,66 +2205,70 @@ async def resolve_music_source(query: str) -> dict | None:
     is_spotify = spotify_track_url(query)
     spotify_info = await resolve_spotify_track(query) if is_spotify else None
     if is_spotify and spotify_info is None:
+        logger.warning("Could not resolve Spotify metadata for %r.", query)
         return None
 
-    if spotify_info:
-        search_term = f"{spotify_info['artist']} - {spotify_info['title']}"
-    else:
-        search_term = query.strip()
-        if not search_term:
-            return None
+    search_term = (
+        f"{spotify_info['artist']} - {spotify_info['title']}"
+        if spotify_info
+        else query.strip()
+    )
+    if not search_term:
+        return None
 
+    search_errors: list[str] = []
+    for source_query in (f"ytsearch:{search_term}", f"scsearch:{search_term}"):
+        try:
+            results = await wavelink.Pool.fetch_tracks(source_query)
+            tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results or [])
+            if tracks:
+                playable = tracks[0]
+                title = str(getattr(playable, "title", "") or search_term).strip()
+                artist = (
+                    str(spotify_info["artist"]).strip()
+                    if spotify_info
+                    else str(getattr(playable, "author", "") or "Unknown Artist").strip()
+                )
+                return {
+                    "track": playable,
+                    "title": title,
+                    "artist": artist or "Unknown Artist",
+                    "duration": max(0, int(getattr(playable, "length", 0) or 0)),
+                    "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
+                    "youtube_url": getattr(playable, "uri", None),
+                    "lyrics": [],
+                }
+        except Exception as exc:
+            search_errors.append(f"{source_query.split(':', 1)[0]}: {exc}")
+            logger.warning("Lavalink search failed for %r: %s", source_query, exc)
+
+    # Some deployments enable Lavalink's HTTP source and rely on the old
+    # direct-audio path. Keep it as a fallback, not the only strategy.
     try:
         extracted = await extract_youtube_audio(search_term)
+        if extracted and extracted.get("url"):
+            results = await wavelink.Pool.fetch_tracks(str(extracted["url"]))
+            tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results or [])
+            if tracks:
+                playable = tracks[0]
+                return {
+                    "track": playable,
+                    "title": str(extracted.get("title") or getattr(playable, "title", "") or search_term).strip(),
+                    "artist": str(
+                        spotify_info["artist"] if spotify_info
+                        else extracted.get("artist") or getattr(playable, "author", "") or "Unknown Artist"
+                    ).strip(),
+                    "duration": max(0, int(extracted.get("duration_ms") or getattr(playable, "length", 0) or 0)),
+                    "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
+                    "youtube_url": extracted.get("webpage_url"),
+                    "lyrics": [],
+                }
     except Exception as exc:
-        logger.warning("YouTube extractor failed for %r: %s", search_term, exc)
-        return None
+        logger.warning("Direct-audio fallback failed for %r: %s", search_term, exc)
 
-    if not extracted or not extracted.get("url"):
-        return None
-
-    audio_url = str(extracted["url"])
-    try:
-        results = await wavelink.Pool.fetch_tracks(audio_url)
-    except Exception as exc:
-        logger.warning("Lavalink could not load extracted audio for %r: %s", search_term, exc)
-        return None
-
-    if not results:
-        return None
-
-    tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results)
-    if not tracks:
-        return None
-
-    playable = tracks[0]
-    title = str(extracted.get("title") or getattr(playable, "title", "") or "").strip()
-    if not title:
-        return None
-
-    artist = (
-        str(spotify_info["artist"]).strip()
-        if spotify_info
-        else str(extracted.get("artist") or getattr(playable, "author", "") or "Unknown Artist").strip()
-    )
-
-    return {
-        "track": playable,
-        "title": title,
-        "artist": artist or "Unknown Artist",
-        "duration": max(
-            0,
-            int(
-                extracted.get("duration_ms")
-                or getattr(playable, "length", 0)
-                or 0
-            ),
-        ),
-        "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
-        "youtube_url": extracted.get("webpage_url"),
-        "lyrics": [],
-    }
-
+    if search_errors:
+        logger.warning("No playable source found for %r. Search errors: %s", search_term, "; ".join(search_errors))
+    return None
 
 async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
     artist = str(track.get("artist", "")).strip()
@@ -2409,6 +2411,25 @@ async def connect_member_voice(interaction: discord.Interaction):
     voice_channel = member.voice.channel
     state = get_music_state(interaction.guild.id)
 
+    # Check permissions before beginning the voice handshake, and log the
+    # exact missing permissions for easier hosting/server troubleshooting.
+    me = interaction.guild.me
+    if me is not None:
+        permissions = voice_channel.permissions_for(me)
+        missing = [
+            name for name, allowed in (
+                ("View Channel", permissions.view_channel),
+                ("Connect", permissions.connect),
+                ("Speak", permissions.speak),
+            ) if not allowed
+        ]
+        if missing:
+            logger.warning(
+                "Missing voice permissions in guild %s channel %s: %s",
+                interaction.guild.id, voice_channel.id, ", ".join(missing),
+            )
+            return None
+
     # Serialize voice connection attempts. Two /play or /join commands arriving
     # together must never race and create a second Discord voice connection.
     async with state["voice_lock"]:
@@ -2520,7 +2541,13 @@ async def music_play(interaction: discord.Interaction, song: str) -> None:
 
     player = await connect_member_voice(interaction)
     if player is None:
-        await interaction.edit_original_response(content="Join a voice channel first. I can then play the song there.")
+        member = interaction.user
+        if isinstance(member, discord.Member) and member.voice and member.voice.channel:
+            await interaction.edit_original_response(
+                content="I couldn't join that voice channel. Check that I have View Channel, Connect, and Speak permissions, and that the channel isn't full."
+            )
+        else:
+            await interaction.edit_original_response(content="Join a voice channel first. I can then play the song there.")
         return
 
     try:
@@ -2771,12 +2798,24 @@ async def on_wavelink_track_exception(payload) -> None:
     player = getattr(payload, "player", None)
     if player is None or player.guild is None:
         return
+    guild_id = player.guild.id
     logger.warning(
         "Lavalink track exception in guild %s for %s: %s",
-        player.guild.id,
+        guild_id,
         getattr(getattr(payload, "track", None), "title", "unknown"),
         getattr(getattr(payload, "exception", None), "message", "unknown error"),
     )
+
+    # A failed track may not emit track_end. Clear it and continue the queue
+    # so one unavailable stream does not stall all later tracks.
+    state = music_states.get(guild_id)
+    if state is None:
+        return
+    await cancel_lyrics(guild_id)
+    async with state["advance_lock"]:
+        state["current"] = None
+    if not state.get("stopping"):
+        await play_next(guild_id)
 
 
 @bot.event
