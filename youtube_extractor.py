@@ -10,12 +10,20 @@ logger = logging.getLogger("movie-bot.youtube")
 
 
 def _youtube_cookies_file() -> str | None:
+    # Match main.py's import destination when no explicit environment path is
+    # configured. Previously, cookies were saved to this default path but the
+    # extractor ignored them unless YOUTUBE_COOKIES_FILE was also set.
     value = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
-    if not value:
-        return None
-    path = Path(value).expanduser()
+    path = (
+        Path(value).expanduser()
+        if value
+        else Path(__file__).resolve().parent / "youtube-cookies.txt"
+    )
     if not path.is_file():
-        logger.warning("YOUTUBE_COOKIES_FILE is set but the file does not exist: %s", path)
+        if value:
+            logger.warning("YOUTUBE_COOKIES_FILE is set but the file does not exist: %s", path)
+        else:
+            logger.info("No YouTube cookies file found at the default path: %s", path)
         return None
     return str(path)
 
