@@ -1529,6 +1529,7 @@ class VidNestSearchView(discord.ui.View):
         overview = str(item.get("overview") or "No description is available.")
         poster_path = str(item.get("poster_path") or "")
         vidnest_url = f"https://vidnest.fun/movie/{movie_id}"
+        cineby_url = f"https://cineby.tech/movie/{movie_id}/watch"
 
         embed = discord.Embed(
             title=f"{title} ({year})" if year else title,
@@ -1539,29 +1540,41 @@ class VidNestSearchView(discord.ui.View):
         if poster_path.startswith("/"):
             embed.set_thumbnail(url=f"https://image.tmdb.org/t/p/w500{poster_path}")
         embed.add_field(
-            name="Watch",
+            name="Watch option 1 — VidNest",
             value=f"[Open this title on VidNest]({vidnest_url})",
             inline=False,
         )
+        embed.add_field(
+            name="Watch option 2 — Cineby",
+            value=f"[Open this title on Cineby]({cineby_url})",
+            inline=False,
+        )
         await interaction.response.edit_message(
-            content=f"Selected **{title}**" + (f" ({year})" if year else "") + ".",
+            content=f"Selected **{title}**" + (f" ({year})" if year else "") + ". Choose either provider below.",
             embed=embed,
-            view=VidNestPlaybackView(self.owner_id, vidnest_url),
+            view=MoviePlaybackView(self.owner_id, vidnest_url, cineby_url),
         )
         self.stop()
 
 
-class VidNestPlaybackView(discord.ui.View):
-    """Provides a direct link to the provider page; does not inspect or extract media."""
+class MoviePlaybackView(discord.ui.View):
+    """Offers provider page links only; it does not inspect or extract media."""
 
-    def __init__(self, owner_id: int, vidnest_url: str):
+    def __init__(self, owner_id: int, vidnest_url: str, cineby_url: str):
         super().__init__(timeout=180)
         self.owner_id = owner_id
         self.add_item(
             discord.ui.Button(
-                label="Open movie page",
+                label="Watch on VidNest",
                 style=discord.ButtonStyle.link,
                 url=vidnest_url,
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="Watch on Cineby",
+                style=discord.ButtonStyle.link,
+                url=cineby_url,
             )
         )
 
