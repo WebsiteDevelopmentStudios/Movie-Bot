@@ -41,6 +41,10 @@ MOVIES_DIR = BASE_DIR / "Movies"
 CONFIG_FILE = BASE_DIR / "config.json"
 SUPPORTED_EXTENSIONS = {".mp4", ".mp3"}
 M3U8_SUFFIX = ".m3u8"
+# Allow hosts to provide system-installed media tools at nonstandard paths.
+# These executables are deliberately not downloaded by the bot at startup.
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe").strip() or "ffprobe"
 DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
 HOST_EXPIRY_BUFFER_SECONDS = 30
 WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
@@ -400,7 +404,7 @@ async def send_movie(movie: Path, requester: discord.abc.User) -> tuple[bool, st
 async def get_media_duration(movie: Path) -> float | None:
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
+            FFPROBE_BIN, "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(movie),
@@ -495,9 +499,20 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
     if progress is not None:
         await progress("Preparing HLS stream...")
 
+    if shutil.which(FFPROBE_BIN) is None:
+        return False, (
+            "ffprobe is unavailable. Install FFmpeg (including ffprobe) on the host, "
+            "or set FFPROBE_BIN to the ffprobe executable path, then restart the bot."
+        )
+    if shutil.which(FFMPEG_BIN) is None:
+        return False, (
+            "FFmpeg is unavailable. Install FFmpeg on the host, or set FFMPEG_BIN "
+            "to the ffmpeg executable path, then restart the bot."
+        )
+
     duration = await get_media_duration(resolved)
     if duration is None:
-        return False, "I could not determine the movie length. Make sure FFmpeg/ffprobe is installed."
+        return False, "ffprobe could not read this file or determine a valid duration."
 
     async with host_lock:
         if active_host is not None:
@@ -514,7 +529,7 @@ async def host_movie(movie: Path, progress=None) -> tuple[bool, str]:
 
         try:
             ffmpeg_process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -611,6 +626,13 @@ async def stream_m3u8_movie(
     if not is_m3u8_url(url):
         return False, None, None
 
+    if shutil.which(FFMPEG_BIN) is None:
+        logger.error("Cannot process M3U8 input: FFmpeg executable %r was not found.", FFMPEG_BIN)
+        return False, None, None
+    if shutil.which(FFPROBE_BIN) is None:
+        logger.error("Cannot validate M3U8 output: ffprobe executable %r was not found.", FFPROBE_BIN)
+        return False, None, None
+
     ensure_movies_dir()
     filename = f"M3U8-{secrets.token_hex(5)}.mp4"
     downloaded = MOVIES_DIR / filename
@@ -621,7 +643,7 @@ async def stream_m3u8_movie(
 
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
+            FFMPEG_BIN,
             "-nostdin",
             "-hide_banner",
             "-loglevel",
