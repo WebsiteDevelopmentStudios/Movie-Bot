@@ -46,6 +46,10 @@ WEB_HOST = os.getenv("MOVIE_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://wisp.uno").strip().rstrip("/")
+
+# Cineby uses TMDB IDs for its movie catalog. This key is publicly exposed by the site.
+CINEBY_TMDB_API_KEY = os.getenv("CINEBY_TMDB_API_KEY", "8871b4dba1715cd776c063a458ae8795").strip()
+CINEBY_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
 active_host = None
@@ -1299,6 +1303,117 @@ async def start_movie_web_server() -> web.AppRunner:
     return runner
 
 
+class CinebySearchView(discord.ui.View):
+    """A private title picker for Cineby movie search results."""
+
+    def __init__(self, owner_id: int, results: list[dict]):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.results_by_id = {str(item["id"]): item for item in results}
+        options = []
+        for item in results[:25]:
+            title = str(item.get("title") or "Untitled movie")
+            year = str(item.get("release_date") or "")[:4]
+            label = f"{title} ({year})" if year else title
+            overview = " ".join(str(item.get("overview") or "").split())
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    description=(overview or "No description available.")[:100],
+                    value=str(item["id"]),
+                )
+            )
+
+        self.movie_select = discord.ui.Select(
+            placeholder="Choose a movie...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.movie_select.callback = self.movie_selected
+        self.add_item(self.movie_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await send_interaction_response(
+                interaction,
+                "This movie selector belongs to the person who ran /movie search.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def movie_selected(self, interaction: discord.Interaction) -> None:
+        item = self.results_by_id.get(self.movie_select.values[0])
+        if item is None:
+            await send_interaction_response(
+                interaction,
+                "I couldn't find that selection. Run /movie search again.",
+                ephemeral=True,
+            )
+            return
+
+        title = str(item.get("title") or "Untitled movie")
+        release_date = str(item.get("release_date") or "")
+        year = release_date[:4]
+        movie_id = int(item["id"])
+        overview = str(item.get("overview") or "No description is available.")
+        poster_path = str(item.get("poster_path") or "")
+        cineby_url = f"https://cineby.tech/movie/{movie_id}/watch"
+
+        embed = discord.Embed(
+            title=f"{title} ({year})" if year else title,
+            description=overview[:4000],
+            url=cineby_url,
+            color=discord.Color.blurple(),
+        )
+        if poster_path.startswith("/"):
+            embed.set_thumbnail(url=f"https://image.tmdb.org/t/p/w500{poster_path}")
+        embed.add_field(
+            name="Next step",
+            value=(
+                f"[Open this title on Cineby]({cineby_url})\n"
+                "The search and selection flow is ready. Automatic stream resolution is not connected yet."
+            ),
+            inline=False,
+        )
+        await interaction.response.edit_message(
+            content=f"Selected **{title}**" + (f" ({year})" if year else "") + ".",
+            embed=embed,
+            view=None,
+        )
+        self.stop()
+
+
+async def search_cineby_movies(query: str) -> list[dict]:
+    """Search the movie catalog by TMDB ID, which Cineby uses in movie URLs."""
+    if not CINEBY_TMDB_API_KEY:
+        raise RuntimeError("CINEBY_TMDB_API_KEY is not configured.")
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"User-Agent": "Movie-Bot/1.0 (+https://cineby.tech)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(
+            CINEBY_SEARCH_URL,
+            params={
+                "api_key": CINEBY_TMDB_API_KEY,
+                "query": query,
+                "include_adult": "false",
+                "page": "1",
+            },
+        ) as response:
+            if response.status == 401:
+                raise RuntimeError("The movie catalog API key was rejected.")
+            response.raise_for_status()
+            data = await response.json(content_type=None)
+
+    results = data.get("results", []) if isinstance(data, dict) else []
+    return [
+        item for item in results
+        if isinstance(item, dict) and isinstance(item.get("id"), int)
+    ][:25]
+
+
 class ChannelLinkView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=120)
@@ -1384,6 +1499,63 @@ async def channel_link(interaction: discord.Interaction) -> None:
     await send_interaction_response(interaction, 
         "Choose the Discord text channel where movies should be sent:",
         view=ChannelLinkView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@movie_group.command(name="search", description="Search Cineby for a movie by title.")
+@app_commands.describe(title="The movie title to search for.")
+@app_commands.rename(title="title")
+@app_commands.guild_only()
+async def movie_search(interaction: discord.Interaction, title: str) -> None:
+    await acknowledge_command(interaction)
+    query = " ".join(title.split()).strip()
+    if len(query) < 2:
+        await send_interaction_response(
+            interaction,
+            "Enter at least two characters to search for a movie.",
+            ephemeral=True,
+        )
+        return
+    if len(query) > 100:
+        await send_interaction_response(
+            interaction,
+            "Movie searches must be 100 characters or fewer.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        results = await search_cineby_movies(query)
+    except asyncio.TimeoutError:
+        await send_interaction_response(
+            interaction,
+            "The movie catalog search timed out. Please try again.",
+            ephemeral=True,
+        )
+        return
+    except (aiohttp.ClientError, ValueError, RuntimeError) as exc:
+        logger.warning("Cineby movie search failed for %r: %s", query, exc)
+        await send_interaction_response(
+            interaction,
+            "I couldn't search Cineby right now. Please try again later.",
+            ephemeral=True,
+        )
+        return
+
+    if not results:
+        await send_interaction_response(
+            interaction,
+            f"No movies found for **{escape(query)}**.",
+            ephemeral=True,
+        )
+        return
+
+    view = CinebySearchView(interaction.user.id, results)
+    await send_interaction_response(
+        interaction,
+        content=f"Search results for **{escape(query)}** — choose a movie below.",
+        view=view,
         ephemeral=True,
     )
 
