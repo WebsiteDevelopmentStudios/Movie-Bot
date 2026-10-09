@@ -1446,8 +1446,8 @@ class VidNestPlaybackView(discord.ui.View):
         if playlist_url:
             safe_url = discord.utils.escape_markdown(playlist_url)
             await interaction.followup.send(
-                "Found an absolute M3U8 URL in VidNest's initial HTML:\\n"
-                f"<{safe_url}>\\n\\n"
+                "Found an absolute M3U8 URL in VidNest's initial HTML:\n"
+                f"<{safe_url}>\n\n"
                 "This is only a detection result; it has not been downloaded or tested for playback.",
                 ephemeral=True,
             )
