@@ -32,6 +32,7 @@ from lavalink_manager import (
     wait_until_ready as wait_for_lavalink,
 )
 from youtube_extractor import extract_youtube_audio
+from vidnest_scraper import is_vidnest_url, resolve_vidnest_playlist
 
 load_dotenv()
 
@@ -724,6 +725,58 @@ async def stream_m3u8_movie(
     return True, player_url, downloaded
 
 
+async def _play_m3u8_movie(interaction: discord.Interaction, m3u8_url: str) -> None:
+    """Download an M3U8 playlist and announce the hosted player in the movie channel.
+
+    Shared by direct .m3u8 links and resolved VidNest movie pages.
+    Assumes the interaction has already been acknowledged/deferred.
+    """
+    async def progress(message: str) -> None:
+        try:
+            await interaction.edit_original_response(content=message)
+        except discord.HTTPException:
+            pass
+
+    success, player_url, downloaded = await stream_m3u8_movie(m3u8_url, progress)
+
+    if not success or player_url is None:
+        await interaction.followup.send(
+            "I could not start that M3U8 movie.",
+            ephemeral=True,
+        )
+        return
+
+    channel = await get_movie_channel()
+    if channel is None:
+        await clear_hosted_movie(active_host["token"] if active_host else "")
+        await interaction.followup.send(
+            "The movie stream started, but the configured movie channel is unavailable.",
+            ephemeral=True,
+        )
+        return
+
+    movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
+    try:
+        # Keep the Discord message simple for now. The player/embed
+        # presentation can be improved separately later.
+        # M3U8 playback starts immediately through the HLS player. Once
+        # the download is complete, the same URL exposes the direct MP4
+        # preview through its Open Graph metadata.
+        await channel.send(
+            content=f"▶ **Now Playing:** {movie_name}\n{player_url}"
+        )
+        await interaction.followup.send(
+            f"Now streaming {movie_name} in {channel.mention}.",
+            ephemeral=True,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await clear_hosted_movie(active_host["token"] if active_host else "")
+        await interaction.followup.send(
+            "The movie stream started, but I could not post the movie player.",
+            ephemeral=True,
+        )
+
+
 async def _get_active_host(token: str):
     async with host_lock:
         current = active_host
@@ -1408,46 +1461,8 @@ class VidNestSearchView(discord.ui.View):
         self.stop()
 
 
-async def detect_vidnest_m3u8(movie_url: str) -> str | None:
-    """Detect an HLS playlist URL plainly exposed in VidNest's public page HTML.
-
-    This does not execute page JavaScript or inspect browser-only network traffic.
-    """
-    parsed_input = urlparse(movie_url)
-    if parsed_input.scheme != "https" or parsed_input.hostname not in {"vidnest.fun", "www.vidnest.fun"}:
-        raise ValueError("Only VidNest HTTPS movie pages can be checked.")
-
-    timeout = aiohttp.ClientTimeout(total=12, connect=5, sock_read=8)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; Movie-Bot/1.0)"}
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(movie_url, allow_redirects=True) as response:
-                final = urlparse(str(response.url))
-                if final.scheme != "https" or final.hostname not in {"vidnest.fun", "www.vidnest.fun"}:
-                    raise ValueError("VidNest redirected to a different host; the check was stopped.")
-                if response.status == 403:
-                    raise RuntimeError(
-                        "VidNest blocked the bot's HTTP request (403 Forbidden). "
-                        "This does not mean the movie has no HLS stream; the page may require "
-                        "browser-side access or load its playlist through JavaScript."
-                    )
-                response.raise_for_status()
-                html = await response.text(errors="replace")
-    except asyncio.TimeoutError:
-        raise RuntimeError("VidNest took too long to respond.") from None
-
-    # Only absolute playlist URLs plainly present in the returned HTML are detected.
-    candidates = re.findall(r"""https://[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?""", html, flags=re.IGNORECASE)
-    for candidate in candidates:
-        candidate = candidate.rstrip("),;]")
-        parsed = urlparse(candidate)
-        if parsed.scheme == "https" and parsed.path.lower().endswith(".m3u8"):
-            return candidate
-    return None
-
-
 class VidNestPlaybackView(discord.ui.View):
-    """Provides the VidNest player link and a lightweight public-HTML HLS check."""
+    """Provides the VidNest player link and a stream lookup."""
 
     def __init__(self, owner_id: int, vidnest_url: str):
         super().__init__(timeout=180)
@@ -1461,30 +1476,38 @@ class VidNestPlaybackView(discord.ui.View):
             )
         )
 
-    @discord.ui.button(label="Check for M3U8", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Find Stream", style=discord.ButtonStyle.secondary)
     async def check_m3u8(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        async def progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message)
+            except discord.HTTPException:
+                pass
+
         try:
-            playlist_url = await detect_vidnest_m3u8(self.vidnest_url)
+            playlist_url = await resolve_vidnest_playlist(self.vidnest_url, progress)
         except (aiohttp.ClientError, RuntimeError, ValueError) as exc:
-            await interaction.followup.send(f"HLS check failed: {escape(str(exc))}", ephemeral=True)
+            await interaction.followup.send(f"Stream lookup failed: {escape(str(exc))}", ephemeral=True)
             return
 
         if playlist_url:
             safe_url = discord.utils.escape_markdown(playlist_url)
             await interaction.followup.send(
-                "Found an absolute M3U8 URL in VidNest's initial HTML:\n"
+                "I found a playable stream for this movie.\n\n"
                 f"<{safe_url}>\n\n"
-                "This is only a detection result; it has not been downloaded or tested for playback.",
+                "Use `/movie play` with this playlist URL to download and host it, "
+                "or use the link directly in an HLS-capable player.",
                 ephemeral=True,
             )
         else:
             await interaction.followup.send(
-                "No absolute M3U8 URL was exposed in VidNest's initial HTML. "
-                "The player may load its playlist later through JavaScript or a separate provider request, "
-                "which this lightweight check does not inspect.",
+                "I could not find a playable stream for this title right now. "
+                "The player may load it through JavaScript or a provider the "
+                "scraper cannot reach. Try again later or open the VidNest page directly.",
                 ephemeral=True,
             )
 
@@ -1694,10 +1717,55 @@ async def movie_list(interaction: discord.Interaction) -> None:
 
 
 
-@movie_group.command(name="play", description="Send a local movie or download an M3U8 movie.")
-@app_commands.describe(movie="Movie name, or an HTTP/HTTPS .m3u8 URL.")
+@movie_group.command(name="play", description="Send a local movie, download an M3U8 movie, or host a VidNest page.")
+@app_commands.describe(movie="Movie name, an HTTP/HTTPS .m3u8 URL, or a vidnest.fun/movie/<id> URL.")
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     await acknowledge_command(interaction)
+
+    # VidNest movie page: resolve the playlist first, then host it like any M3U8.
+    if is_vidnest_url(movie):
+        if shutil.which(FFMPEG_BIN) is None:
+            await interaction.followup.send(
+                "FFmpeg is unavailable on this host. Install FFmpeg or set FFMPEG_BIN to its executable path, then restart the bot.",
+                ephemeral=True,
+            )
+            return
+        if shutil.which(FFPROBE_BIN) is None:
+            await interaction.followup.send(
+                "ffprobe is unavailable on this host. Install FFmpeg (including ffprobe) or set FFPROBE_BIN to its executable path, then restart the bot.",
+                ephemeral=True,
+            )
+            return
+
+        async def vidnest_progress(message: str) -> None:
+            try:
+                await interaction.edit_original_response(content=message)
+            except discord.HTTPException:
+                pass
+
+        try:
+            playlist_url = await resolve_vidnest_playlist(movie, vidnest_progress)
+        except (aiohttp.ClientError, RuntimeError, ValueError) as exc:
+            logger.warning("VidNest lookup failed for %r: %s", movie, exc)
+            await interaction.followup.send(
+                f"VidNest lookup failed: {escape(str(exc))}",
+                ephemeral=True,
+            )
+            return
+
+        if playlist_url is None:
+            await interaction.followup.send(
+                "I could not find a playable stream on that VidNest page. "
+                "Try again later or open it directly at "
+                f"<https://vidnest.fun/movie/{urlparse(movie).path.split('/')[-1]}>.",
+                ephemeral=True,
+            )
+            return
+
+        await vidnest_progress("Stream found. Downloading the M3U8 movie...")
+        await _play_m3u8_movie(interaction, playlist_url)
+        return
+
     if is_m3u8_url(movie):
         if shutil.which(FFMPEG_BIN) is None:
             await send_interaction_response(
@@ -1714,50 +1782,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
             )
             return
 
-        async def progress(message: str) -> None:
-            try:
-                await interaction.edit_original_response(content=message)
-            except discord.HTTPException:
-                pass
-
-        success, player_url, downloaded = await stream_m3u8_movie(movie, progress)
-
-        if not success or player_url is None:
-            await interaction.followup.send(
-                "I could not start that M3U8 movie.",
-                ephemeral=True,
-            )
-            return
-
-        channel = await get_movie_channel()
-        if channel is None:
-            await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send(
-                "The movie stream started, but the configured movie channel is unavailable.",
-                ephemeral=True,
-            )
-            return
-
-        movie_name = downloaded.stem if downloaded is not None else "M3U8 Movie"
-        try:
-            # Keep the Discord message simple for now. The player/embed
-            # presentation can be improved separately later.
-            # M3U8 playback starts immediately through the HLS player. Once
-            # the download is complete, the same URL exposes the direct MP4
-            # preview through its Open Graph metadata.
-            await channel.send(
-                content=f"▶ **Now Playing:** {movie_name}\n{player_url}"
-            )
-            await interaction.followup.send(
-                f"Now streaming {movie_name} in {channel.mention}.",
-                ephemeral=True,
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send(
-                "The movie stream started, but I could not post the movie player.",
-                ephemeral=True,
-            )
+        await _play_m3u8_movie(interaction, movie)
         return
 
 
@@ -1771,7 +1796,7 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     selected = find_movie(movie)
     if selected is None:
         await send_interaction_response(interaction, 
-            "That movie is not available. Use /movie list or provide an HTTP/HTTPS .m3u8 URL.",
+            "That movie is not available. Use /movie list, provide an HTTP/HTTPS .m3u8 URL, or a vidnest.fun movie link.",
             ephemeral=True,
         )
         return
@@ -1866,7 +1891,7 @@ async def save_youtube_cookies(attachment: discord.Attachment) -> tuple[bool, st
         return False, "I could not save the YouTube cookies file."
 
     logger.info("YouTube cookies were updated by the bot owner.")
-    return True, "YouTube cookies imported successfully. /play can now use the linked account."
+    return True, "YouTube cookies imported successfully. /play can now use the linked account"
 
 
 async def install_youtube_cookies(
