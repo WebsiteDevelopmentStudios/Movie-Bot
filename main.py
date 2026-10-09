@@ -47,9 +47,12 @@ WEB_PORT = int(os.getenv("MOVIE_PORT", "8080"))
 HLS_CACHE_DIR = BASE_DIR / ".movie_hls"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://wisp.uno").strip().rstrip("/")
 
-# Cineby uses TMDB IDs for its movie catalog. This key is publicly exposed by the site.
-CINEBY_TMDB_API_KEY = os.getenv("CINEBY_TMDB_API_KEY", "8871b4dba1715cd776c063a458ae8795").strip()
-CINEBY_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
+# TMDB provides movie search results; VidNest accepts TMDB IDs in its player URL.
+TMDB_API_KEY = os.getenv(
+    "TMDB_API_KEY",
+    os.getenv("TMDB_API_KEY", "8871b4dba1715cd776c063a458ae8795"),
+).strip()
+TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
 
 active_host = None
@@ -1303,43 +1306,8 @@ async def start_movie_web_server() -> web.AppRunner:
     return runner
 
 
-async def resolve_cineby_direct_m3u8(movie_id: int) -> str | None:
-    """Look for an HLS URL directly exposed in Cineby's public watch-page HTML.
-
-    This does not execute site JavaScript, decrypt player payloads, or extract
-    streams from third-party embedded providers.
-    """
-    watch_url = f"https://cineby.tech/movie/{int(movie_id)}/watch"
-    timeout = aiohttp.ClientTimeout(total=20)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Movie-Bot/1.0)",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(watch_url, allow_redirects=True) as response:
-            response.raise_for_status()
-            if response.url.scheme != "https" or response.url.host not in {
-                "cineby.tech", "www.cineby.tech"
-            }:
-                raise RuntimeError("Cineby redirected to an unexpected host.")
-            html = await response.text(errors="replace")
-
-    candidates = re.findall(
-        r"""https://[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?""",
-        html,
-        flags=re.IGNORECASE,
-    )
-    for candidate in candidates:
-        candidate = candidate.rstrip("),;]")
-        parsed = urlparse(candidate)
-        if parsed.scheme == "https" and parsed.path.lower().endswith(".m3u8"):
-            return candidate
-    return None
-
-
-class CinebySearchView(discord.ui.View):
-    """A private title picker for Cineby movie search results."""
+class VidNestSearchView(discord.ui.View):
+    """A private title picker for VidNest movie results."""
 
     def __init__(self, owner_id: int, results: list[dict]):
         super().__init__(timeout=180)
@@ -1394,42 +1362,42 @@ class CinebySearchView(discord.ui.View):
         movie_id = int(item["id"])
         overview = str(item.get("overview") or "No description is available.")
         poster_path = str(item.get("poster_path") or "")
-        cineby_url = f"https://cineby.tech/movie/{movie_id}/watch"
+        vidnest_url = f"https://vidnest.fun/movie/{movie_id}"
 
         embed = discord.Embed(
             title=f"{title} ({year})" if year else title,
             description=overview[:4000],
-            url=cineby_url,
+            url=vidnest_url,
             color=discord.Color.blurple(),
         )
         if poster_path.startswith("/"):
             embed.set_thumbnail(url=f"https://image.tmdb.org/t/p/w500{poster_path}")
         embed.add_field(
-            name="Next step",
-            value=(
-                f"[Open this title on Cineby]({cineby_url})\n"
-                "Use **Try direct HLS** to check whether a direct .m3u8 URL is exposed in the public page HTML."
-            ),
+            name="Watch",
+            value=f"[Open this title on VidNest]({vidnest_url})",
             inline=False,
         )
         await interaction.response.edit_message(
             content=f"Selected **{title}**" + (f" ({year})" if year else "") + ".",
             embed=embed,
-            view=CinebyPlaybackView(self.owner_id, movie_id, title, year, cineby_url),
+            view=VidNestPlaybackView(self.owner_id, vidnest_url),
         )
         self.stop()
 
 
-class CinebyPlaybackView(discord.ui.View):
-    """Offers a direct-HLS check for a selected Cineby title."""
+class VidNestPlaybackView(discord.ui.View):
+    """Provides a direct link to the selected VidNest player page."""
 
-    def __init__(self, owner_id: int, movie_id: int, title: str, year: str, cineby_url: str):
+    def __init__(self, owner_id: int, vidnest_url: str):
         super().__init__(timeout=180)
         self.owner_id = owner_id
-        self.movie_id = movie_id
-        self.title = title
-        self.year = year
-        self.cineby_url = cineby_url
+        self.add_item(
+            discord.ui.Button(
+                label="Open VidNest",
+                style=discord.ButtonStyle.link,
+                url=vidnest_url,
+            )
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -1441,84 +1409,19 @@ class CinebyPlaybackView(discord.ui.View):
         )
         return False
 
-    @discord.ui.button(label="Try direct HLS", style=discord.ButtonStyle.primary)
-    async def try_direct_hls(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            playlist_url = await resolve_cineby_direct_m3u8(self.movie_id)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
-            logger.warning("Cineby direct-HLS check failed for movie %s: %s", self.movie_id, exc)
-            await interaction.followup.send(
-                "I couldn't inspect Cineby's public page right now. Try opening the title on Cineby directly.",
-                ephemeral=True,
-            )
-            return
 
-        if not playlist_url:
-            await interaction.followup.send(
-                "No direct .m3u8 URL was exposed in Cineby's public HTML. The page may load its player through JavaScript or a third-party provider; this check deliberately doesn't decrypt or extract a protected provider stream. No download was started.",
-                ephemeral=True,
-            )
-            return
-
-        async def progress(message: str) -> None:
-            try:
-                await interaction.edit_original_response(content=message, view=self)
-            except discord.HTTPException:
-                pass
-
-        await progress(f"Found a direct HLS playlist for **{self.title}**. Starting the existing movie pipeline...")
-        success, player_url, downloaded = await stream_m3u8_movie(playlist_url, progress)
-        if not success or player_url is None:
-            await interaction.followup.send(
-                "A direct playlist was found, but FFmpeg could not prepare it. Check the bot host logs for details.",
-                ephemeral=True,
-            )
-            return
-
-        channel = await get_movie_channel()
-        if channel is None:
-            await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send(
-                "The stream was prepared, but no movie channel is configured. Ask an administrator to run /channel link.",
-                ephemeral=True,
-            )
-            return
-
-        media_url = f"{PUBLIC_BASE_URL}/media/{active_host['token']}" if active_host else player_url
-        try:
-            await channel.send(
-                content=f"Now Playing: {self.title}" + (f" ({self.year})" if self.year else "") + f"\n{media_url}"
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            await clear_hosted_movie(active_host["token"] if active_host else "")
-            await interaction.followup.send(
-                "The stream was prepared, but I couldn't post it in the configured movie channel.",
-                ephemeral=True,
-            )
-            return
-
-        button.disabled = True
-        await interaction.edit_original_response(
-            content=f"Now hosting **{self.title}** in {channel.mention}.",
-            view=self,
-        )
-
-
-async def search_cineby_movies(query: str) -> list[dict]:
+async def search_movies(query: str) -> list[dict]:
     """Search the movie catalog by TMDB ID, which Cineby uses in movie URLs."""
-    if not CINEBY_TMDB_API_KEY:
-        raise RuntimeError("CINEBY_TMDB_API_KEY is not configured.")
+    if not TMDB_API_KEY:
+        raise RuntimeError("TMDB_API_KEY is not configured.")
 
     timeout = aiohttp.ClientTimeout(total=15)
-    headers = {"User-Agent": "Movie-Bot/1.0 (+https://cineby.tech)"}
+    headers = {"User-Agent": "Movie-Bot/1.0 (+https://vidnest.fun)"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(
-            CINEBY_SEARCH_URL,
+            TMDB_SEARCH_URL,
             params={
-                "api_key": CINEBY_TMDB_API_KEY,
+                "api_key": TMDB_API_KEY,
                 "query": query,
                 "include_adult": "false",
                 "page": "1",
@@ -1625,7 +1528,7 @@ async def channel_link(interaction: discord.Interaction) -> None:
     )
 
 
-@movie_group.command(name="search", description="Search Cineby for a movie by title.")
+@movie_group.command(name="search", description="Search for a movie title and open it on VidNest.")
 @app_commands.describe(title="The movie title to search for.")
 @app_commands.guild_only()
 async def movie_search(interaction: discord.Interaction, title: str) -> None:
@@ -1647,7 +1550,7 @@ async def movie_search(interaction: discord.Interaction, title: str) -> None:
         return
 
     try:
-        results = await search_cineby_movies(query)
+        results = await search_movies(query)
     except asyncio.TimeoutError:
         await send_interaction_response(
             interaction,
@@ -1656,10 +1559,10 @@ async def movie_search(interaction: discord.Interaction, title: str) -> None:
         )
         return
     except (aiohttp.ClientError, ValueError, RuntimeError) as exc:
-        logger.warning("Cineby movie search failed for %r: %s", query, exc)
+        logger.warning("TMDB movie search failed for %r: %s", query, exc)
         await send_interaction_response(
             interaction,
-            "I couldn't search Cineby right now. Please try again later.",
+            "I couldn't search the movie catalog right now. Please try again later.",
             ephemeral=True,
         )
         return
@@ -1672,7 +1575,7 @@ async def movie_search(interaction: discord.Interaction, title: str) -> None:
         )
         return
 
-    view = CinebySearchView(interaction.user.id, results)
+    view = VidNestSearchView(interaction.user.id, results)
     await send_interaction_response(
         interaction,
         content=f"Search results for **{escape(query)}** — choose a movie below.",
