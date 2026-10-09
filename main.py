@@ -1306,7 +1306,7 @@ async def start_movie_web_server() -> web.AppRunner:
 async def resolve_cineby_direct_m3u8(movie_id: int) -> str | None:
     """Look for an HLS URL directly exposed in Cineby's public watch-page HTML.
 
-    This does not execute page JavaScript, decrypt player payloads, or extract
+    This does not execute site JavaScript, decrypt player payloads, or extract
     streams from third-party embedded providers.
     """
     watch_url = f"https://cineby.tech/movie/{int(movie_id)}/watch"
@@ -1369,20 +1369,20 @@ class CinebySearchView(discord.ui.View):
         self.add_item(self.movie_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if in        embed.add_field(
-            name="Next step",
-            value=(
-                f"[Open this title on Cineby]({cineby_url})\\n"
-                "Use **Try direct HLS** to check whether a direct .m3u8 URL is exposed in the public page HTML."
-            ),
-            inline=False,
+        if interaction.user.id == self.owner_id:
+            return True
+        await send_interaction_response(
+            interaction,
+            "This movie selector belongs to the person who ran /movie search.",
+            ephemeral=True,
         )
-        await interaction.response.edit_message(
-            content=f"Selected **{title}**" + (f" ({year})" if year else "") + ".",
-            embed=embed,
-            view=CinebyPlaybackView(self.owner_id, movie_id, title, year, cineby_url),
-        )
-        self.stop()          interaction,
+        return False
+
+    async def movie_selected(self, interaction: discord.Interaction) -> None:
+        item = self.results_by_id.get(self.movie_select.values[0])
+        if item is None:
+            await send_interaction_response(
+                interaction,
                 "I couldn't find that selection. Run /movie search again.",
                 ephemeral=True,
             )
@@ -1408,14 +1408,14 @@ class CinebySearchView(discord.ui.View):
             name="Next step",
             value=(
                 f"[Open this title on Cineby]({cineby_url})\n"
-                "The search and selection flow is ready. Automatic stream resolution is not connected yet."
+                "Use **Try direct HLS** to check whether a direct .m3u8 URL is exposed in the public page HTML."
             ),
             inline=False,
         )
         await interaction.response.edit_message(
             content=f"Selected **{title}**" + (f" ({year})" if year else "") + ".",
             embed=embed,
-            view=None,
+            view=CinebyPlaybackView(self.owner_id, movie_id, title, year, cineby_url),
         )
         self.stop()
 
@@ -1490,7 +1490,7 @@ class CinebyPlaybackView(discord.ui.View):
         media_url = f"{PUBLIC_BASE_URL}/media/{active_host['token']}" if active_host else player_url
         try:
             await channel.send(
-                content=f"Now Playing: {self.title}" + (f" ({self.year})" if self.year else "") + f"\\n{media_url}"
+                content=f"Now Playing: {self.title}" + (f" ({self.year})" if self.year else "") + f"\n{media_url}"
             )
         except (discord.Forbidden, discord.HTTPException):
             await clear_hosted_movie(active_host["token"] if active_host else "")
