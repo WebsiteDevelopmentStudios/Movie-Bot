@@ -2508,10 +2508,13 @@ async def connect_member_voice(interaction: discord.Interaction):
                         pass
                     return player
 
-            logger.warning(
-                "Could not connect Lavalink player to guild %s: %s",
+            logger.exception(
+                "Voice connection failed for guild %s, channel %s (%s); "
+                "exception_type=%s",
                 interaction.guild.id,
-                exc,
+                voice_channel.id,
+                voice_channel.name,
+                type(exc).__name__,
             )
             return None
 
