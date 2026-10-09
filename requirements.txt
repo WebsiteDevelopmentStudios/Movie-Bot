@@ -6,3 +6,4 @@ davey>=0.1.0
 wavelink>=3.5.2,<4
 yt-dlp[default]>=2026.9.26
 bgutil-ytdlp-pot-provider>=2.0.2,<3
+playwright>=1.49,<2
