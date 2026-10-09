@@ -45,6 +45,8 @@ plugins:
     allowDirectPlaylistIds: true
     oauth:
       enabled: true
+      refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN}"
+      skipInitialization: true
     clients:
       - MUSIC
       - ANDROID_VR
