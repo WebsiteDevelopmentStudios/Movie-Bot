@@ -15,7 +15,7 @@ A Python Discord bot with music commands and link-only movie sharing. Movie sear
 - Movie page links are shared as links only; the bot does not extract or download the video
 - Graceful Discord upload and permission errors
 - Voice music playback with /play, /skip, /queue, /join, /leave, and /volume
-- Spotify track-link resolution and song search through yt-dlp
+- Spotify track-link metadata resolution followed by Lavalink source search (YouTube/SoundCloud), with the existing yt-dlp direct-audio fallback retained
 - Synchronized lyrics lookup with one lyric line sent at a time in supported voice-channel chat
 
 ## Requirements
@@ -97,7 +97,7 @@ Commands:
 
 Run /join while you are in a voice channel, or use /play while you are already in one. /play accepts normal song searches and Spotify track URLs.
 
-Spotify does not provide Discord bots with unrestricted full-track audio. For a Spotify URL, the bot uses Spotify oEmbed only for title/artist metadata and then asks the local Lavalink YouTube Source backend to resolve a playable source separately. The bot never requests a user's Spotify password or stores Spotify credentials.
+Spotify does not provide Discord bots with unrestricted full-track audio, and Spotify OAuth does not grant a bot a playable audio stream. For a Spotify URL, the bot uses Spotify oEmbed only for title/artist metadata, then asks Lavalink to search supported music sources for a matching playable track. If those searches fail, the existing yt-dlp direct-audio fallback is attempted where the Lavalink host supports HTTP audio URLs. The bot never requests a user's Spotify password or stores Spotify credentials.
 
 ### Self-hosted Lavalink
 
