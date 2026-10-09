@@ -1385,12 +1385,45 @@ class VidNestSearchView(discord.ui.View):
         self.stop()
 
 
+async def detect_vidnest_m3u8(movie_url: str) -> str | None:
+    """Detect an HLS playlist URL plainly exposed in VidNest's public page HTML.
+
+    This does not execute page JavaScript or inspect browser-only network traffic.
+    """
+    parsed_input = urlparse(movie_url)
+    if parsed_input.scheme != "https" or parsed_input.hostname not in {"vidnest.fun", "www.vidnest.fun"}:
+        raise ValueError("Only VidNest HTTPS movie pages can be checked.")
+
+    timeout = aiohttp.ClientTimeout(total=12, connect=5, sock_read=8)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; Movie-Bot/1.0)"}
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(movie_url, allow_redirects=True) as response:
+                final = urlparse(str(response.url))
+                if final.scheme != "https" or final.hostname not in {"vidnest.fun", "www.vidnest.fun"}:
+                    raise ValueError("VidNest redirected to a different host; the check was stopped.")
+                response.raise_for_status()
+                html = await response.text(errors="replace")
+    except asyncio.TimeoutError:
+        raise RuntimeError("VidNest took too long to respond.") from None
+
+    # Only absolute playlist URLs plainly present in the returned HTML are detected.
+    candidates = re.findall(r"""https://[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?""", html, flags=re.IGNORECASE)
+    for candidate in candidates:
+        candidate = candidate.rstrip("),;]")
+        parsed = urlparse(candidate)
+        if parsed.scheme == "https" and parsed.path.lower().endswith(".m3u8"):
+            return candidate
+    return None
+
+
 class VidNestPlaybackView(discord.ui.View):
-    """Provides a direct link to the selected VidNest player page."""
+    """Provides the VidNest player link and a lightweight public-HTML HLS check."""
 
     def __init__(self, owner_id: int, vidnest_url: str):
         super().__init__(timeout=180)
         self.owner_id = owner_id
+        self.vidnest_url = vidnest_url
         self.add_item(
             discord.ui.Button(
                 label="Open VidNest",
@@ -1398,6 +1431,33 @@ class VidNestPlaybackView(discord.ui.View):
                 url=vidnest_url,
             )
         )
+
+    @discord.ui.button(label="Check for M3U8", style=discord.ButtonStyle.secondary)
+    async def check_m3u8(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            playlist_url = await detect_vidnest_m3u8(self.vidnest_url)
+        except (aiohttp.ClientError, RuntimeError, ValueError) as exc:
+            await interaction.followup.send(f"HLS check failed: {escape(str(exc))}", ephemeral=True)
+            return
+
+        if playlist_url:
+            safe_url = discord.utils.escape_markdown(playlist_url)
+            await interaction.followup.send(
+                "Found an absolute M3U8 URL in VidNest's initial HTML:\\n"
+                f"<{safe_url}>\\n\\n"
+                "This is only a detection result; it has not been downloaded or tested for playback.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "No absolute M3U8 URL was exposed in VidNest's initial HTML. "
+                "The player may load its playlist later through JavaScript or a separate provider request, "
+                "which this lightweight check does not inspect.",
+                ephemeral=True,
+            )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
