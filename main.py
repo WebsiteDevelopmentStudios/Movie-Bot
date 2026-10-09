@@ -33,8 +33,6 @@ from lavalink_manager import (
     wait_until_ready as wait_for_lavalink,
 )
 from youtube_extractor import extract_youtube_audio
-from vidnest_scraper import is_vidnest_url, resolve_vidnest_playlist
-from cineby_scraper import is_cineby_url, resolve_cineby_playlist
 
 load_dotenv()
 
@@ -1824,157 +1822,53 @@ async def movie_list(interaction: discord.Interaction) -> None:
 
 @movie_group.command(
     name="play",
-    description="Send a local movie, download an M3U8 movie, or host a Cineby/VidNest page.",
+    description="Post a movie link without downloading or extracting media.",
 )
 @app_commands.describe(
-    movie="Movie name, an HTTP/HTTPS .m3u8 URL, a cineby.tech/movie/<id>/watch URL, or a vidnest.fun/movie/<id> URL.",
+    movie="A direct movie page URL or a title to look up with /movie search.",
 )
 async def movie_play(interaction: discord.Interaction, movie: str) -> None:
+    """Post a user-provided movie page URL. Never scrape, extract, or download media."""
     await acknowledge_command(interaction)
 
-    # Cineby watch page: resolve the playlist, then host it like any M3U8.
-    if is_cineby_url(movie):
-        if shutil.which(FFMPEG_BIN) is None or shutil.which(FFPROBE_BIN) is None:
-            await interaction.followup.send(
-                "FFmpeg/ffprobe is unavailable on this host. Install FFmpeg or set "
-                "FFMPEG_BIN/FFPROBE_BIN to their executable paths, then restart the bot.",
-                ephemeral=True,
-            )
-            return
-
-        async def cineby_progress(message: str) -> None:
-            try:
-                await interaction.edit_original_response(content=message)
-            except discord.HTTPException:
-                pass
-
-        try:
-            playlist_url = await resolve_cineby_playlist(movie, cineby_progress)
-        except (RuntimeError, ValueError) as exc:
-            logger.warning("Cineby lookup failed for %r: %s", movie, exc)
-            await interaction.followup.send(
-                f"Cineby lookup failed: {escape(str(exc))}",
-                ephemeral=True,
-            )
-            return
-
-        if playlist_url is None:
-            await interaction.followup.send(
-                "I could not find a playable stream on that Cineby page. "
-                "The provider may only expose its stream through JavaScript; "
-                "try another movie or use the page in your browser.",
-                ephemeral=True,
-            )
-            return
-
-        await cineby_progress("Stream found. Downloading the M3U8 movie...")
-        await _play_m3u8_movie(interaction, playlist_url, referer=CINEBY_REFERER)
-        return
-
-    # VidNest movie page: resolve the playlist first, then host it like any M3U8.
-    if is_vidnest_url(movie):
-        if shutil.which(FFMPEG_BIN) is None or shutil.which(FFPROBE_BIN) is None:
-            await interaction.followup.send(
-                "FFmpeg/ffprobe is unavailable on this host. Install FFmpeg or set "
-                "FFMPEG_BIN/FFPROBE_BIN to their executable paths, then restart the bot.",
-                ephemeral=True,
-            )
-            return
-
-        async def vidnest_progress(message: str) -> None:
-            try:
-                await interaction.edit_original_response(content=message)
-            except discord.HTTPException:
-                pass
-
-        try:
-            playlist_url = await resolve_vidnest_playlist(movie, vidnest_progress)
-        except (aiohttp.ClientError, RuntimeError, ValueError) as exc:
-            logger.warning("VidNest lookup failed for %r: %s", movie, exc)
-            await interaction.followup.send(
-                f"VidNest lookup failed: {escape(str(exc))}",
-                ephemeral=True,
-            )
-            return
-
-        if playlist_url is None:
-            await interaction.followup.send(
-                "I could not find a playable stream on that VidNest page. "
-                f"Try again later, or use the Cineby page: "
-                f"<https://cineby.tech/movie/{urlparse(movie).path.split('/')[-1]}/watch>.",
-                ephemeral=True,
-            )
-            return
-
-        await vidnest_progress("Stream found. Downloading the M3U8 movie...")
-        await _play_m3u8_movie(interaction, playlist_url)
-        return
-
-    if is_m3u8_url(movie):
-        if shutil.which(FFMPEG_BIN) is None:
-            await send_interaction_response(
-                interaction,
-                "FFmpeg is unavailable on this host. Install FFmpeg or set FFMPEG_BIN to its executable path, then restart the bot.",
-                ephemeral=True,
-            )
-            return
-        if shutil.which(FFPROBE_BIN) is None:
-            await send_interaction_response(
-                interaction,
-                "ffprobe is unavailable on this host. Install FFmpeg (including ffprobe) or set FFPROBE_BIN to its executable path, then restart the bot.",
-                ephemeral=True,
-            )
-            return
-
-        await _play_m3u8_movie(interaction, movie)
-        return
-
-    if not get_movie_files():
-        await send_interaction_response(interaction, 
-            "No movies are currently available.",
+    value = movie.strip()
+    parsed = urlparse(value)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        movie_url = value
+        display_name = parsed.netloc
+    else:
+        await interaction.followup.send(
+            "I don't search or extract movie streams. Use **/movie search** to find a title "
+            "and open its listed provider page, then use **/movie play** with that page URL "
+            "to share the link here.",
             ephemeral=True,
         )
-        return
-
-    selected = find_movie(movie)
-    if selected is None:
-        await send_interaction_response(interaction, 
-            "That movie is not available. Use /movie list, provide an HTTP/HTTPS .m3u8 URL, "
-            "or a cineby.tech movie link.",
-            ephemeral=True,
-        )
-        return
-
-    async def progress(message: str) -> None:
-        try:
-            await interaction.edit_original_response(content=message)
-        except discord.HTTPException:
-            pass
-
-    await progress("Embedding movie...")
-    success, message = await host_movie(selected, progress)
-    if not success:
-        await interaction.followup.send(message, ephemeral=True)
         return
 
     channel = await get_movie_channel()
     if channel is None:
-        await clear_hosted_movie(active_host["token"] if active_host else "")
-        await interaction.followup.send("The configured movie channel is unavailable.", ephemeral=True)
+        await interaction.followup.send(
+            "The configured movie channel is unavailable. Check the movie channel configuration.",
+            ephemeral=True,
+        )
         return
 
     try:
-        # Plain URL for now. Discord's native media preview can be revisited
-        # later without changing the hosting/player architecture.
         await channel.send(
-            content=f"▶ **Now Playing:** {selected.stem}\n{message}"
+            f"▶ **Movie link**\n{movie_url}",
+            allowed_mentions=discord.AllowedMentions.none(),
         )
-        await interaction.followup.send(f"Now hosting {selected.stem} in {channel.mention}.", ephemeral=True)
     except (discord.Forbidden, discord.HTTPException):
-        await clear_hosted_movie(active_host["token"] if active_host else "")
-        await interaction.followup.send("I could not post the movie player in the configured channel.", ephemeral=True)
+        await interaction.followup.send(
+            "I couldn't post the movie link in the configured channel.",
+            ephemeral=True,
+        )
+        return
 
-
+    await interaction.followup.send(
+        f"Posted the movie link in {channel.mention}. No media was downloaded.",
+        ephemeral=True,
+    )
 
 
 # -------------------------
