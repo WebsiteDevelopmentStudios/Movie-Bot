@@ -2,18 +2,18 @@
 
 A Python Discord bot that lets members browse media files stored locally in the repository's Movies folder and send selected files to a configured Discord text channel.
 
-The bot can send manually stored movies, search Cineby's movie catalog by title, and download a user-provided HTTP/HTTPS M3U8 stream into Movies. Cineby search currently provides title selection and a link to the selected Cineby page; automatic M3U8 resolution is not connected yet.
+The bot can send manually stored movies, search TMDB's movie catalog by title, and open the matching title on VidNest using its TMDB movie ID. It can also download a user-provided HTTP/HTTPS M3U8 stream into Movies.
 
 ## Features
 
 - /channel link <channel> for administrators
 - Persistent movie-channel configuration
 - /movie list with a private ephemeral movie browser
-- /movie search <title> with a private Cineby movie search and selection menu
+- /movie search <title> with a private TMDB movie search and selection menu
 - Pagination for large movie libraries
 - Select This Movie confirmation button
 - /movie play <movie>
-- Search results use TMDB movie IDs to open the matching Cineby title page
+- Search results use TMDB movie IDs to open the matching VidNest page at https://vidnest.fun/movie/{movie_id}
 - Case-insensitive movie-name matching
 - Supports .mp4 and .mp3
 - Automatically detects added and removed files without restarting
