@@ -32,6 +32,7 @@ The bot can send manually stored movies, search TMDB's movie catalog by title, a
 - The bot must be able to view and send messages in the configured movie channel
 - The bot needs Send Messages and Attach Files permissions in that channel
 - PyNaCl for Discord voice support
+- FFmpeg and ffprobe installed by the hosting environment for movie streaming and M3U8 processing
 
 ## Installation
 
@@ -43,6 +44,8 @@ Clone the repository and enter it:
 Install dependencies:
 
     pip install -r requirements.txt
+
+Movie streaming also requires the host to provide the `ffmpeg` and `ffprobe` executables. They are system programs, not installed by `requirements.txt`, and the bot intentionally does not download large binaries at startup. On hosts that support system packages, install FFmpeg using that host's package manager. If the executables are not on `PATH`, set `FFMPEG_BIN` and/or `FFPROBE_BIN` to their executable paths. You can verify availability with `ffmpeg -version` and `ffprobe -version` in the host terminal.
 
 ## Configure the bot token
 
