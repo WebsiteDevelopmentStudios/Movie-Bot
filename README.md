@@ -1,8 +1,6 @@
 # Movie Bot
 
-A Python Discord bot that lets members browse media files stored locally in the repository's Movies folder and send selected files to a configured Discord text channel.
-
-The bot can send manually stored movies, search TMDB's movie catalog by title, and open the matching title on VidNest using its TMDB movie ID. It can also download a user-provided HTTP/HTTPS M3U8 stream into Movies.
+A Python Discord bot with music commands and link-only movie sharing. Movie search uses TMDB to find titles and provides a link to the provider page. The bot does not scrape movie websites, extract media URLs, or download movie streams.
 
 ## Features
 
@@ -12,14 +10,9 @@ The bot can send manually stored movies, search TMDB's movie catalog by title, a
 - /movie search <title> with a private TMDB movie search and selection menu
 - Pagination for large movie libraries
 - Select This Movie confirmation button
-- /movie play <movie>
+- /movie play <URL> to share a movie page link without downloading media
 - Search results use TMDB movie IDs to open the matching VidNest page at https://vidnest.fun/movie/{movie_id}
-- Case-insensitive movie-name matching
-- Supports .mp4 and .mp3
-- Automatically detects added and removed files without restarting
-- Rejects filesystem paths and path traversal
-- Expiring web video/audio player for large files
-- Only one movie is hosted at a time; the player expires automatically when the movie ends
+- Movie page links are shared as links only; the bot does not extract or download the video
 - Graceful Discord upload and permission errors
 - Voice music playback with /play, /skip, /queue, /join, /leave, and /volume
 - Spotify track-link resolution and song search through yt-dlp
@@ -30,9 +23,8 @@ The bot can send manually stored movies, search TMDB's movie catalog by title, a
 - Python 3.10 or newer
 - A Discord bot application/token
 - The bot must be able to view and send messages in the configured movie channel
-- The bot needs Send Messages and Attach Files permissions in that channel
+- The bot needs Send Messages permission in that channel
 - PyNaCl for Discord voice support
-- FFmpeg and ffprobe installed by the hosting environment for movie streaming and M3U8 processing
 
 ## Installation
 
@@ -45,7 +37,6 @@ Install dependencies:
 
     pip install -r requirements.txt
 
-Movie streaming also requires the host to provide the `ffmpeg` and `ffprobe` executables. They are system programs, not installed by `requirements.txt`, and the bot intentionally does not download large binaries at startup. On hosts that support system packages, install FFmpeg using that host's package manager. If the executables are not on `PATH`, set `FFMPEG_BIN` and/or `FFPROBE_BIN` to their executable paths. You can verify availability with `ffmpeg -version` and `ffprobe -version` in the host terminal.
 
 ## Configure the bot token
 
@@ -153,7 +144,7 @@ Example:
 
 Do not put movie files in subfolders. Do not commit copyrighted or otherwise unauthorized media to a public repository.
 
-The bot does not search for media or automatically discover downloads. User-provided M3U8 URLs are downloaded on request. Movies are never executed.
+The bot does not scrape movie pages, resolve hidden stream URLs, or download movie media. `/movie play` only posts a user-provided HTTP/HTTPS link to the configured movie channel.
 
 ## List movies
 
@@ -167,41 +158,9 @@ Choose a movie from the dropdown and press Select This Movie to send it.
 
 The Movies folder is scanned when the command is used, so newly added or removed files are detected without restarting the bot.
 
-## Play a movie directly
+## Share a movie link
 
-Use the movie name without its extension:
-
-    /movie play Avatar
-
-For example, Avatar matches Movies/Avatar.mp4.
-
-Movie names are matched case-insensitively. The requested movie must exist in Movies; the bot never searches the internet or downloads a missing movie.
-
-## Large movie streaming
-
-Large movies do not need to be uploaded to Discord. The bot can host one local movie at a time through its built-in HLS web player and posts an embed with a Watch Movie link.
-
-The hosted player prepares the movie as HLS segments instead of serving one giant download. The browser requests the playlist and individual short segments as playback progresses, similar to the basic streaming model used by services such as YouTube. MP4 playback uses hls.js when the browser does not provide native HLS support.
-
-The hosted link uses a random, unguessable token and expires automatically after the detected media duration plus a small safety buffer. When it expires, the movie is no longer available, the temporary HLS segments are deleted, and another movie can be hosted.
-
-The bot automatically starts a Cloudflare Quick Tunnel for the built-in web server. You do not need to own a domain or add DNS records.
-
-The tunnel creates a temporary HTTPS address such as:
-
-    https://random-words.trycloudflare.com
-
-That address is detected automatically and used for movie player links. The tunnel forwards to the local MOVIE_PORT (8080 by default).
-
-Install Cloudflare's `cloudflared` command and make sure it is available in PATH before running the bot. You can override the executable name/path with:
-
-    CLOUDFLARED_BIN=cloudflared
-
-Quick Tunnel URLs are temporary and normally change when the bot is restarted. If cloudflared is unavailable, Discord commands still start, but web movie hosting will be unavailable until cloudflared is installed and the bot is restarted.
-
-Only one movie is intentionally hosted at a time. If someone tries to start another movie while one is active, the bot tells them to wait until the current movie expires.
-
-The HLS player requests individual media segments as needed rather than requiring the complete movie before playback can begin. The temporary HLS cache is kept outside the Movies folder and is removed when the hosted movie expires.
+Use `/movie search <title>` to find a title. Select a result to get a provider-page link. To share another movie page, use `/movie play <URL>` with its HTTP/HTTPS page URL. This command posts the URL to the configured movie channel; it does not scrape the page, extract a stream, or download any media.
 
 ## Discord upload limits
 
@@ -232,5 +191,4 @@ config.json contains only the linked channel ID. The Discord token is never stor
 - .env is ignored by Git.
 - Movie commands cannot select arbitrary filesystem paths.
 - Only files directly inside Movies with supported extensions are considered.
-- Movie files are opened only for upload; they are never executed.
-- External downloads are not used.
+- Movie links are shared as provided; the bot does not scrape provider pages or download movie streams.
