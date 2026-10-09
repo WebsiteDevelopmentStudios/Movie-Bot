@@ -1786,7 +1786,6 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     parsed = urlparse(value)
     if parsed.scheme in ("http", "https") and parsed.netloc:
         movie_url = value
-        display_name = parsed.netloc
     else:
         await interaction.followup.send(
             "I don't search or extract movie streams. Use **/movie search** to find a title "
