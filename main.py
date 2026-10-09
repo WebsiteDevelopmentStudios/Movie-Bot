@@ -2206,11 +2206,12 @@ async def resolve_spotify_track(value: str) -> dict | None:
 
 
 async def resolve_music_source(query: str) -> dict | None:
-    """Resolve a Spotify link or search query to a Lavalink-playable track.
+    """Resolve a Spotify link or search query, preferring the bot's yt-dlp extractor.
 
-    Spotify oEmbed provides metadata only, not audio. Prefer Lavalink's own
-    source search so it can manage source-specific playback details. Retain
-    yt-dlp as a compatibility fallback for hosts with HTTP audio support.
+    The extractor runs in the bot container and can use its imported cookies.
+    Lavalink's YouTube plugin runs separately and may time out even when the bot
+    has valid cookies, so try direct audio first and use Lavalink searches only
+    as fallbacks.
     """
     if not lavalink_ready or wavelink is None:
         return None
@@ -2230,6 +2231,36 @@ async def resolve_music_source(query: str) -> dict | None:
         return None
 
     search_errors: list[str] = []
+
+    # Resolve YouTube in the bot container first so the imported cookie file
+    # is actually used instead of relying immediately on Lavalink's plugin.
+    try:
+        extracted = await extract_youtube_audio(search_term)
+        if extracted and extracted.get("url"):
+            results = await wavelink.Pool.fetch_tracks(str(extracted["url"]))
+            tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results or [])
+            if tracks:
+                playable = tracks[0]
+                return {
+                    "track": playable,
+                    "title": str(extracted.get("title") or getattr(playable, "title", "") or search_term).strip(),
+                    "artist": str(
+                        spotify_info["artist"] if spotify_info
+                        else extracted.get("artist") or getattr(playable, "author", "") or "Unknown Artist"
+                    ).strip(),
+                    "duration": max(0, int(extracted.get("duration_ms") or getattr(playable, "length", 0) or 0)),
+                    "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
+                    "youtube_url": extracted.get("webpage_url"),
+                    "lyrics": [],
+                }
+            logger.warning(
+                "yt-dlp extracted audio for %r, but Lavalink could not load the direct URL; trying source search.",
+                search_term,
+            )
+    except Exception as exc:
+        search_errors.append(f"yt-dlp: {exc}")
+        logger.warning("Direct-audio resolution failed for %r: %s", search_term, exc)
+
     for source_query in (f"ytsearch:{search_term}", f"scsearch:{search_term}"):
         try:
             results = await wavelink.Pool.fetch_tracks(source_query)
@@ -2255,32 +2286,8 @@ async def resolve_music_source(query: str) -> dict | None:
             search_errors.append(f"{source_query.split(':', 1)[0]}: {exc}")
             logger.warning("Lavalink search failed for %r: %s", source_query, exc)
 
-    # Some deployments enable Lavalink's HTTP source and rely on the old
-    # direct-audio path. Keep it as a fallback, not the only strategy.
-    try:
-        extracted = await extract_youtube_audio(search_term)
-        if extracted and extracted.get("url"):
-            results = await wavelink.Pool.fetch_tracks(str(extracted["url"]))
-            tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results or [])
-            if tracks:
-                playable = tracks[0]
-                return {
-                    "track": playable,
-                    "title": str(extracted.get("title") or getattr(playable, "title", "") or search_term).strip(),
-                    "artist": str(
-                        spotify_info["artist"] if spotify_info
-                        else extracted.get("artist") or getattr(playable, "author", "") or "Unknown Artist"
-                    ).strip(),
-                    "duration": max(0, int(extracted.get("duration_ms") or getattr(playable, "length", 0) or 0)),
-                    "spotify_url": spotify_info.get("spotify_url") if spotify_info else None,
-                    "youtube_url": extracted.get("webpage_url"),
-                    "lyrics": [],
-                }
-    except Exception as exc:
-        logger.warning("Direct-audio fallback failed for %r: %s", search_term, exc)
-
     if search_errors:
-        logger.warning("No playable source found for %r. Search errors: %s", search_term, "; ".join(search_errors))
+        logger.warning("No playable source found for %r. Resolution errors: %s", search_term, "; ".join(search_errors))
     return None
 
 async def fetch_lyrics(track: dict) -> list[tuple[float, str]]:
