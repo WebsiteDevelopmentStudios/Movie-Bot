@@ -17,7 +17,6 @@ from discord import app_commands
 from discord.ext import commands
 from discord.http import handle_message_parameters
 from dotenv import load_dotenv
-import static_ffmpeg
 
 try:
     import wavelink
@@ -36,8 +35,6 @@ from youtube_extractor import extract_youtube_audio
 
 load_dotenv()
 
-# Add the package-managed FFmpeg and ffprobe executables to PATH for movie processing.
-static_ffmpeg.add_paths()
 
 BASE_DIR = Path(__file__).resolve().parent
 MOVIES_DIR = BASE_DIR / "Movies"
