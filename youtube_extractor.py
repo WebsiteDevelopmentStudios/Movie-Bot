@@ -76,7 +76,10 @@ def _extract_sync(query: str) -> dict | None:
     # bgutil-ytdlp-pot-provider is the preferred PO-token backend. The
     # provider runs separately from the bot so this container does not need
     # Chromium, Node.js, or browser automation.
-    pot_provider = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip().rstrip("/")
+    pot_provider = os.getenv(
+        "YOUTUBE_POT_PROVIDER_URL",
+        "https://movie-bot-pot-provider.onrender.com",
+    ).strip().rstrip("/")
     if pot_provider:
         opts["extractor_args"] = {
             "youtubepot-bgutilhttp": {
