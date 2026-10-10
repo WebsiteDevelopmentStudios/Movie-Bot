@@ -1255,147 +1255,6 @@ async def stop_cloudflare_quick_tunnel() -> None:
     PUBLIC_BASE_URL = ""
 
 
-async def youtube_oauth_callback(request: web.Request) -> web.Response:
-    state = request.query.get("state", "")
-    code = request.query.get("code", "")
-    oauth_error = request.query.get("error", "")
-
-    state_info = youtube_oauth_states.pop(state, None)
-    if not state_info:
-        return web.Response(
-            text="This YouTube login link is invalid or has expired.",
-            status=400,
-            content_type="text/plain",
-        )
-
-    created = float(state_info.get("created", 0))
-    if asyncio.get_running_loop().time() - created > 600:
-        return web.Response(
-            text="This YouTube login link expired. Run /login youtube again.",
-            status=400,
-            content_type="text/plain",
-        )
-
-    if oauth_error:
-        return web.Response(
-            text=f"YouTube login was cancelled or denied: {oauth_error}",
-            status=400,
-            content_type="text/plain",
-        )
-
-    if not code:
-        return web.Response(
-            text="Google did not return an authorization code.",
-            status=400,
-            content_type="text/plain",
-        )
-
-    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
-    redirect_uri = os.getenv("YOUTUBE_OAUTH_REDIRECT_URI", "").strip()
-
-    if not client_id or not client_secret or not redirect_uri:
-        return web.Response(
-            text="YouTube OAuth is not configured on the bot.",
-            status=500,
-            content_type="text/plain",
-        )
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://oauth2.googleapis.com/token",
-                data={
-                    "code": code,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "redirect_uri": redirect_uri,
-                    "grant_type": "authorization_code",
-                },
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as response:
-                token_data = await response.json(content_type=None)
-
-            if response.status != 200 or not isinstance(token_data, dict):
-                logger.warning("Google OAuth token exchange failed: HTTP %s", response.status)
-                return web.Response(
-                    text="Google could not complete the YouTube login.",
-                    status=502,
-                    content_type="text/plain",
-                )
-
-            access_token = str(token_data.get("access_token", "")).strip()
-            refresh_token = str(token_data.get("refresh_token", "")).strip()
-
-            if not access_token:
-                return web.Response(
-                    text="Google did not return an access token.",
-                    status=502,
-                    content_type="text/plain",
-                )
-
-            async with session.get(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as user_response:
-                user_data = await user_response.json(content_type=None)
-
-        token_file = BASE_DIR / "youtube-oauth.json"
-        existing = {}
-        if token_file.exists():
-            try:
-                existing = json.loads(token_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-
-        existing.update(
-            {
-                "user_id": state_info["user_id"],
-                "access_token": access_token,
-                "token_type": token_data.get("token_type", "Bearer"),
-                "expires_in": token_data.get("expires_in"),
-                "scope": token_data.get("scope", ""),
-                "updated_at": int(asyncio.get_running_loop().time()),
-            }
-        )
-        if refresh_token:
-            existing["refresh_token"] = refresh_token
-
-        temp_file = token_file.with_suffix(".json.tmp")
-        temp_file.write_text(
-            json.dumps(existing, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temp_file.replace(token_file)
-
-        email = ""
-        if isinstance(user_data, dict):
-            email = str(user_data.get("email", "")).strip()
-
-        logger.info(
-            "YouTube Google OAuth account linked for Discord user %s%s.",
-            state_info["user_id"],
-            f" ({email})" if email else "",
-        )
-
-        return web.Response(
-            text=(
-                "YouTube login successful.\n\n"
-                "Your Google/YouTube account is now linked to Movie-Bot. "
-                "You can close this page and return to Discord."
-            ),
-            content_type="text/plain",
-        )
-
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-        logger.warning("YouTube OAuth callback failed: %s", exc)
-        return web.Response(
-            text="The YouTube login could not be completed. Please try again.",
-            status=502,
-            content_type="text/plain",
-        )
-
 
 async def start_movie_web_server() -> web.AppRunner:
     app = web.Application()
@@ -1403,7 +1262,6 @@ async def start_movie_web_server() -> web.AppRunner:
     app.router.add_get("/media/{token}", hosted_media_handler)
     app.router.add_get("/parts/{token}/{filename}", hosted_part_handler)
     app.router.add_get("/hls/{token}/{filename}", hosted_hls_handler)
-    app.router.add_get("/oauth/youtube/callback", youtube_oauth_callback)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
@@ -1833,273 +1691,6 @@ async def movie_play(interaction: discord.Interaction, movie: str) -> None:
     )
 
 
-# -------------------------
-# YouTube account login
-# -------------------------
-
-YOUTUBE_COOKIE_DEFAULT = BASE_DIR / "youtube-cookies.txt"
-
-
-def youtube_cookie_path() -> Path:
-    return Path(
-        os.getenv("YOUTUBE_COOKIES_FILE", str(YOUTUBE_COOKIE_DEFAULT))
-    ).expanduser()
-
-
-def is_bot_owner(user: discord.abc.User) -> bool:
-    owner_id = os.getenv("OWNER_ID", "").strip()
-    if owner_id:
-        try:
-            return user.id == int(owner_id)
-        except ValueError:
-            logger.warning("OWNER_ID is not a valid Discord user ID.")
-            return False
-    return bot.application.owner_id == user.id if bot.application else False
-
-
-async def save_youtube_cookies(attachment: discord.Attachment) -> tuple[bool, str]:
-    filename = (attachment.filename or "").lower()
-    if not filename.endswith(".txt"):
-        return False, "Upload the exported Netscape-format cookies.txt file."
-
-    if attachment.size and attachment.size > 10 * 1024 * 1024:
-        return False, "That cookies file is too large. The limit is 10 MB."
-
-    try:
-        data = await attachment.read()
-    except (discord.HTTPException, OSError) as exc:
-        logger.warning("Could not download YouTube cookies attachment: %s", exc)
-        return False, "I could not download that cookies file from Discord."
-
-    header = data[:4096]
-    if b"# Netscape HTTP Cookie File" not in header and b"# HTTP Cookie File" not in header:
-        return False, "That file does not look like a Netscape-format cookies.txt export."
-
-    target = youtube_cookie_path()
-    temp = target.with_name(target.name + ".tmp")
-
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp.write_bytes(data)
-        temp.replace(target)
-    except OSError as exc:
-        logger.warning("Could not save YouTube cookies: %s", exc)
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False, "I could not save the YouTube cookies file."
-
-    logger.info("YouTube cookies were updated by the bot owner.")
-    return True, "YouTube cookies imported successfully. /play can now use the linked account"
-
-
-async def install_youtube_cookies(
-    interaction: discord.Interaction,
-    cookies: discord.Attachment,
-) -> None:
-    filename = Path(cookies.filename or "").name
-    if not filename.lower().endswith(".txt"):
-        await send_interaction_response(
-            interaction,
-            "Please upload a .txt cookies export in Netscape format.",
-            ephemeral=True,
-        )
-        return
-
-    if cookies.size > 10 * 1024 * 1024:
-        await send_interaction_response(
-            interaction,
-            "That cookies file is too large. The maximum size is 10 MB.",
-            ephemeral=True,
-        )
-        return
-
-    cookie_path = Path(
-        os.getenv("YOUTUBE_COOKIES_FILE", str(BASE_DIR / "youtube-cookies.txt"))
-    ).expanduser()
-
-    try:
-        data = await cookies.read()
-        text_data = data.decode("utf-8-sig", errors="replace")
-    except (discord.HTTPException, OSError, UnicodeError) as exc:
-        logger.warning("Could not download YouTube cookies attachment: %s", exc)
-        await send_interaction_response(
-            interaction,
-            "I could not read that cookies file from Discord.",
-            ephemeral=True,
-        )
-        return
-    lines = [line.strip() for line in text_data.splitlines() if line.strip()]
-    if not lines or not any(
-        line == "# Netscape HTTP Cookie File"
-        or line == "# HTTP Cookie File"
-        or line.startswith("# Netscape HTTP Cookie File")
-        for line in lines[:5]
-    ):
-        await send_interaction_response(
-            interaction,
-            "That file does not look like a Netscape-format YouTube cookies export.",
-            ephemeral=True,
-        )
-        return
-
-    try:
-        cookie_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = cookie_path.with_name(cookie_path.name + ".tmp")
-        temp_path.write_bytes(data)
-        temp_path.replace(cookie_path)
-    except OSError as exc:
-        logger.error("Could not save YouTube cookies: %s", exc)
-        await send_interaction_response(
-            interaction,
-            "I could not save the YouTube cookies on the bot host.",
-            ephemeral=True,
-        )
-        return
-
-    logger.info("YouTube cookies updated by Discord user %s from %s.", interaction.user.id, filename)
-    await send_interaction_response(
-        interaction,
-        "YouTube cookies were imported successfully. The music extractor will use them for future /play requests.",
-        ephemeral=True,
-    )
-
-
-login_group = app_commands.Group(
-    name="login",
-    description="Manage the account used by the music system.",
-)
-
-
-@login_group.command(
-    name="youtube",
-    description="Choose YouTube cookies or Google login for the music system.",
-)
-@app_commands.describe(
-    cookies="Optional exported YouTube cookies.txt file in Netscape format.",
-)
-async def youtube_login(
-    interaction: discord.Interaction,
-    cookies: discord.Attachment | None = None,
-) -> None:
-    await acknowledge_command(interaction)
-
-    if interaction.guild is None:
-        await send_interaction_response(
-            interaction,
-            "This command can only be used in a server.",
-            ephemeral=True,
-        )
-        return
-
-    if not interaction.user.guild_permissions.administrator:
-        await send_interaction_response(
-            interaction,
-            "You need administrator permissions to configure the bot's YouTube account.",
-            ephemeral=True,
-        )
-        return
-
-    if cookies is not None:
-        await install_youtube_cookies(interaction, cookies)
-        return
-
-    await send_interaction_response(
-        interaction,
-        "YouTube account setup\n\n"
-        "To import cookies, run /login youtube again and attach your exported "
-        "Netscape-format cookies.txt file in the `cookies` option. "
-        "The Google OAuth callback currently does not provide the browser session "
-        "cookies yt-dlp needs for YouTube audio playback, so I have not exposed a "
-        "Google Login button that would appear to fix music playback.",
-        ephemeral=True,
-    )
-
-
-class MovieBot(discord.Client):
-    def __init__(self) -> None:
-        self.movie_web_runner: web.AppRunner | None = None
-        self.lavalink_keepalive_task: asyncio.Task | None = None
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-
-    async def setup_hook(self) -> None:
-        self.movie_web_runner = await start_movie_web_server()
-
-        # Render free web services can suspend after a period without inbound
-        # HTTP traffic. Start the keep-alive before connecting so a sleeping
-        # Lavalink service is woken while initialize_lavalink waits for it.
-        if LAVALINK_URI and LAVALINK_PASSWORD:
-            self.lavalink_keepalive_task = asyncio.create_task(
-                keep_lavalink_awake(),
-                name="lavalink-render-keepalive",
-            )
-
-        # Disk safety: prune aged movie downloads once immediately, then
-        # every six hours. Cheap to run and protects the 512 MB quota.
-        await prune_movie_downloads()
-        prune_movie_downloads.start()
-
-        await initialize_lavalink()
-
-        try:
-            synced = await self.tree.sync()
-            logger.info("Synced %d global slash command(s).", len(synced))
-        except discord.HTTPException as exc:
-            logger.error("Failed to sync global slash commands: %s", exc)
-
-
-    async def ensure_cloudflare_tunnel(self) -> bool:
-        if PUBLIC_BASE_URL:
-            return True
-
-        tunnel_started = await start_cloudflare_quick_tunnel()
-        if not tunnel_started:
-            logger.warning(
-                "Movie web hosting is unavailable until cloudflared is installed and running."
-            )
-        return tunnel_started
-
-    async def close(self) -> None:
-        prune_movie_downloads.cancel()
-        for guild_id in list(music_states):
-            await cancel_lyrics(guild_id)
-        if self.lavalink_keepalive_task is not None:
-            self.lavalink_keepalive_task.cancel()
-            try:
-                await self.lavalink_keepalive_task
-            except asyncio.CancelledError:
-                pass
-            self.lavalink_keepalive_task = None
-
-        if wavelink is not None:
-            try:
-                await wavelink.Pool.close()
-            except Exception as exc:
-                logger.warning("Could not close Lavalink cleanly: %s", exc)
-        await stop_lavalink()
-        await stop_cloudflare_quick_tunnel()
-        if self.movie_web_runner is not None:
-            await self.movie_web_runner.cleanup()
-            self.movie_web_runner = None
-        await super().close()
-
-    async def on_ready(self) -> None:
-        if self.user:
-            logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
-
-
-
-
-bot = MovieBot()
-
-
-# -------------------------
-# Voice / music playback
-# -------------------------
 
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 
@@ -2107,7 +1698,6 @@ LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 # hosting environment to match the external Lavalink server.
 music_states: dict[int, dict] = {}
 lavalink_ready = False
-youtube_oauth_states: dict[str, dict] = {}
 
 
 def get_music_state(guild_id: int) -> dict:
@@ -2879,7 +2469,6 @@ async def on_message(message: discord.Message) -> None:
                 "`/movie search <title>` — search the movie collection\n"
                 "`/movie play <movie>` — play a movie\n"
                 "`/channel link` — choose the movie channel\n"
-                "`/login youtube` — configure YouTube login",
                 mention_author=False,
             )
             return
@@ -3069,7 +2658,7 @@ async def bot_commands(interaction: discord.Interaction) -> None:
         "**Other slash commands**\n"
         "`/uptime` · `/update` · `/commands` · `/say <message>`\n"
         "`/channel link` · `/movie list` · `/movie search <title>` · `/movie play <movie>`\n"
-        "`/login youtube` · `/sync` (administrator)\n"
+        "`/sync` (administrator)\n"
         "Movie features are slash commands; they do not currently have `-mb` text equivalents.\n\n"
         "**Text command equivalents**\n"
         "`-mb play <song>` · `-mb pause` · `-mb resume` · `-mb skip` · `-mb queue`\n"
@@ -3344,10 +2933,6 @@ async def sync_commands(interaction: discord.Interaction) -> None:
 bot.tree.add_command(channel_group)
 bot.tree.add_command(movie_group)
 
-# Remove any stale top-level /login command/group left by an older version,
-# then register exactly one current /login group.
-bot.tree.remove_command("login")
-bot.tree.add_command(login_group)
 
 
 @bot.tree.error
