@@ -12,6 +12,9 @@
 • Sending `-mb` by itself now points you to `-mb commands`.
 • Music text commands use the same queue and player as slash commands.
 
+𝗔𝗨𝗧𝗛𝗘𝗡𝗧𝗜𝗖𝗔𝗧𝗜𝗢𝗡
+• Removed the obsolete YouTube login and cookie-import commands.
+
 𝗠𝗨𝗦𝗜𝗖 𝗣𝗟𝗔𝗬𝗕𝗔𝗖𝗞
 • Added playback-stall and stuck-track diagnostics to help identify playback problems.
 
