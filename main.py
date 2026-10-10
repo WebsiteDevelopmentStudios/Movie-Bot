@@ -7,7 +7,7 @@ import re
 import secrets
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
@@ -2148,7 +2148,7 @@ def get_next_halloween() -> datetime:
 def build_halloween_embed() -> discord.Embed:
     now = datetime.now(HALLOWEEN_TZ)
     target = get_next_halloween()
-    remaining_seconds = max(0, int((target - now).total_seconds()))
+    remaining_seconds = max(0, int((target.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()))
     days_remaining = (target.date() - now.date()).days
     total_hours, remainder = divmod(remaining_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -2174,7 +2174,7 @@ def load_statuses() -> list[str]:
     except OSError as exc:
         logger.warning("Could not read %s: %s", STATUS_FILE.name, exc)
         return ["Watching the days until Halloween"]
-    return [entry.strip() for entry in entries if entry.strip()][:100] or [
+    return [entry.strip()[:128] for entry in entries if entry.strip()][:100] or [
         "Watching the days until Halloween"
     ]
 
