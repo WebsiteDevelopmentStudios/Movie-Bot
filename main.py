@@ -2022,6 +2022,7 @@ class MovieBot(discord.Client):
         self.movie_web_runner: web.AppRunner | None = None
         self.lavalink_keepalive_task: asyncio.Task | None = None
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -2386,11 +2387,11 @@ async def cancel_lyrics(guild_id: int) -> None:
             pass
 
 
-async def connect_member_voice(interaction: discord.Interaction):
+async def connect_member_voice(interaction: discord.Interaction, member_override=None):
     if interaction.guild is None or wavelink is None:
         return None
 
-    member = interaction.user
+    member = member_override if member_override is not None else interaction.user
     if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel is None:
         return None
 
@@ -2725,6 +2726,193 @@ async def music_stop(interaction: discord.Interaction) -> None:
             state["stopping"] = False
     state["current"] = None
     await send_interaction_response(interaction, "Stopped playback and cleared the queue.", ephemeral=True)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    # Text command prefix is intentionally "-mb"; slash commands remain enabled.
+    if message.author.bot or message.guild is None:
+        return
+    if not message.content.lower().startswith("-mb"):
+        return
+
+    raw = message.content[3:].strip()
+    if not raw:
+        await message.reply(
+            "Usage: `-mb play <song>`, `-mb pause`, `-mb resume`, `-mb skip`, "
+            "`-mb queue`, `-mb volume <0-100>`, `-mb lyrics [on|off]`, "
+            "`-mb stop`, `-mb join`, `-mb leave`.",
+            mention_author=False,
+        )
+        return
+
+    parts = raw.split(maxsplit=1)
+    command_name = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    guild_id = message.guild.id
+    state = get_music_state(guild_id)
+    player = state.get("player")
+
+    try:
+        if command_name in {"help", "commands"}:
+            await message.reply(
+                "**Movie Bot text commands**\n"
+                "`-mb play <song>` — play or queue a song\n"
+                "`-mb pause` / `-mb resume`\n"
+                "`-mb skip` / `-mb stop`\n"
+                "`-mb queue`\n"
+                "`-mb volume <0-100>`\n"
+                "`-mb lyrics [on|off]`\n"
+                "`-mb join` / `-mb leave`",
+                mention_author=False,
+            )
+            return
+
+        if command_name == "play":
+            if not argument:
+                await message.reply("Usage: `-mb play <song>`", mention_author=False)
+                return
+            if not lavalink_ready:
+                await message.reply("The music backend is currently unavailable.", mention_author=False)
+                return
+            player = await connect_member_voice(message, member_override=message.author)
+            if player is None:
+                await message.reply("Join a voice channel first, and make sure I have permission to connect and speak.", mention_author=False)
+                return
+            track = await resolve_music_source(argument)
+            if track is None:
+                await message.reply("I couldn't find that song. Try another search.", mention_author=False)
+                return
+            state = get_music_state(guild_id)
+            if player.playing or state.get("current") is not None:
+                state["queue"].append(track)
+                await message.reply(f"Added **{track['title']} — {track['artist']}** to the queue.", mention_author=False)
+            else:
+                state["queue"].append(track)
+                started = await play_next(guild_id)
+                if started:
+                    await message.reply(f"Now playing **{track['title']} — {track['artist']}**.", mention_author=False)
+                else:
+                    await message.reply("I found the song, but couldn't start playback.", mention_author=False)
+            return
+
+        if command_name == "join":
+            if not lavalink_ready:
+                await message.reply("The music backend is currently unavailable.", mention_author=False)
+                return
+            player = await connect_member_voice(message, member_override=message.author)
+            if player is None:
+                await message.reply("Join a voice channel first, and make sure I have permission to connect and speak.", mention_author=False)
+            else:
+                await message.reply(f"Joined **{player.channel.name}**.", mention_author=False)
+            return
+
+        if command_name == "leave":
+            if player is None or not player.connected:
+                await message.reply("I am not in a voice channel.", mention_author=False)
+                return
+            state["stopping"] = True
+            state["queue"].clear()
+            await cancel_lyrics(guild_id)
+            try:
+                await player.disconnect()
+            finally:
+                state["player"] = None
+                state["current"] = None
+                state["stopping"] = False
+            await message.reply("Left the voice channel and cleared the music queue.", mention_author=False)
+            return
+
+        if command_name == "pause":
+            if player is None or not player.playing or player.paused:
+                await message.reply("Nothing is currently playing.", mention_author=False)
+                return
+            await player.pause(True)
+            await message.reply("Paused the current song.", mention_author=False)
+            return
+
+        if command_name == "resume":
+            if player is None or not player.paused:
+                await message.reply("The song is not paused.", mention_author=False)
+                return
+            await player.pause(False)
+            await message.reply("Resumed the current song.", mention_author=False)
+            return
+
+        if command_name == "skip":
+            if player is None or not player.playing:
+                await message.reply("Nothing is currently playing.", mention_author=False)
+                return
+            await cancel_lyrics(guild_id)
+            await player.stop()
+            await message.reply("Skipped the current song.", mention_author=False)
+            return
+
+        if command_name == "queue":
+            current = state.get("current")
+            lines = []
+            if current is not None:
+                seconds = current.get("duration", 0) / 1000
+                lines.append(f"**Now playing:** {current['title']} — {current['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
+            for index, queued in enumerate(state.get("queue", []), 1):
+                seconds = queued.get("duration", 0) / 1000
+                lines.append(f"**{index}.** {queued['title']} — {queued['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
+            await message.reply("\\n".join(lines[:51]) if lines else "The music queue is empty.", mention_author=False)
+            return
+
+        if command_name == "volume":
+            if not argument.isdigit() or not 0 <= int(argument) <= 100:
+                await message.reply("Usage: `-mb volume <0-100>`", mention_author=False)
+                return
+            level = int(argument)
+            state["volume"] = level
+            if player is not None and player.connected:
+                await player.set_volume(level)
+            await message.reply(f"Volume set to **{level}%**.", mention_author=False)
+            return
+
+        if command_name == "lyrics":
+            if argument.lower() in {"on", "true", "yes"}:
+                enabled = True
+            elif argument.lower() in {"off", "false", "no"}:
+                enabled = False
+            elif not argument:
+                enabled = not state.get("lyrics_enabled", False)
+            else:
+                await message.reply("Usage: `-mb lyrics [on|off]`", mention_author=False)
+                return
+            state["lyrics_enabled"] = enabled
+            if enabled:
+                await message.reply("Warning: This Feature Is In Beta, Don't Expect A Fully Working Version Soon", mention_author=False)
+            else:
+                await cancel_lyrics(guild_id)
+                await message.reply("Lyrics disabled.", mention_author=False)
+            current = state.get("current")
+            player = state.get("player")
+            if enabled and current is not None and current.get("lyrics") and player is not None:
+                await cancel_lyrics(guild_id)
+                state["lyrics_task"] = asyncio.create_task(
+                    lyrics_loop(guild_id, player, player.channel, current)
+                )
+            return
+
+        if command_name == "stop":
+            state["queue"].clear()
+            await cancel_lyrics(guild_id)
+            if player is not None and player.playing:
+                state["stopping"] = True
+                try:
+                    await player.stop()
+                finally:
+                    state["stopping"] = False
+            state["current"] = None
+            await message.reply("Stopped playback and cleared the queue.", mention_author=False)
+            return
+
+        await message.reply("Unknown command. Use `-mb help` to see available commands.", mention_author=False)
+    except Exception as exc:
+        logger.exception("Prefix command failed (%s): %s", command_name, exc)
+        await message.reply("That command failed. Check the bot console for details.", mention_author=False)
 
 
 @bot.event
