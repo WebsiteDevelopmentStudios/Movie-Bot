@@ -2807,6 +2807,33 @@ async def on_message(message: discord.Message) -> None:
     player = state.get("player")
 
     try:
+        if command_name == "sync":
+            if not message.author.guild_permissions.administrator:
+                await message.reply("You need Administrator permission to use this command.", mention_author=False)
+                return
+            try:
+                bot.tree.clear_commands(guild=message.guild)
+                await bot.tree.sync(guild=message.guild)
+                synced = await bot.tree.sync()
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("Could not reset/sync slash commands from prefix command: %s", exc)
+                await message.reply(
+                    "I could not reset and sync the commands. Check the bot's application-command permissions and try again.",
+                    mention_author=False,
+                )
+                return
+            logger.info(
+                "Cleared guild-specific commands and synced %d global slash command(s) for %s (%s) via -mb sync.",
+                len(synced),
+                message.guild.name,
+                message.guild.id,
+            )
+            await message.reply(
+                f"Removed duplicate server-specific commands and synced {len(synced)} global slash command(s). They may take a little while to refresh.",
+                mention_author=False,
+            )
+            return
+
         if command_name == "uptime":
             await message.reply(f"I have been online for **{format_uptime()}**.", mention_author=False)
             return
@@ -3039,8 +3066,8 @@ async def bot_commands(interaction: discord.Interaction) -> None:
         "**Text command equivalents**\n"
         "`-mb play <song>` · `-mb pause` · `-mb resume` · `-mb skip` · `-mb queue`\n"
         "`-mb volume <0-100>` · `-mb lyrics [on|off]` · `-mb stop` · `-mb join` · `-mb leave`\n"
-        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>`\n"
-        "The `say` commands require Manage Messages permission."
+        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>` · `-mb sync`\n"
+        "The `say` commands require Manage Messages permission. The `sync` commands require Administrator permission."
     )
     await send_interaction_response(interaction, listing, ephemeral=True)
 
