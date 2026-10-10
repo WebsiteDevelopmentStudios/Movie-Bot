@@ -192,3 +192,16 @@ config.json contains only the linked channel ID. The Discord token is never stor
 - Movie commands cannot select arbitrary filesystem paths.
 - Only files directly inside Movies with supported extensions are considered.
 - Movie links are shared as provided; the bot does not scrape provider pages or download movie streams.
+
+## Bot utility commands
+
+The bot also provides these utility commands:
+
+- `/uptime` shows how long the current bot process has been running.
+- `/update` fetches the current `README.md` from this GitHub repository and posts it in the channel, split into Discord-safe messages.
+- `/commands` lists the main slash commands and their `-mb` text-command equivalents.
+- `/say <message>` posts a message as the bot. It requires the `Manage Messages` permission and disables automatic mention notifications.
+
+The music utility commands also work with the `-mb` prefix, for example `-mb uptime`, `-mb update`, `-mb commands`, and `-mb say Hello`. The `say` text command also requires `Manage Messages`.
+
+For prefix commands, enable **Message Content Intent** in the Discord Developer Portal under **Bot → Privileged Gateway Intents**.
