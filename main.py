@@ -2728,6 +2728,63 @@ async def music_stop(interaction: discord.Interaction) -> None:
     await send_interaction_response(interaction, "Stopped playback and cleared the queue.", ephemeral=True)
 
 
+BOT_START_TIME = time.monotonic()
+GITHUB_README_RAW_URL = "https://raw.githubusercontent.com/WebsiteDevelopmentStudios/Movie-Bot/main/README.md"
+
+
+def format_uptime() -> str:
+    total = max(0, int(time.monotonic() - BOT_START_TIME))
+    days, total = divmod(total, 86400)
+    hours, total = divmod(total, 3600)
+    minutes, seconds = divmod(total, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def split_discord_message(text: str, limit: int = 1900) -> list[str]:
+    """Split long content into Discord-safe chunks, preferring line boundaries."""
+    chunks = []
+    remaining = text.strip()
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\\n", 0, limit)
+        if cut < limit // 2:
+            cut = remaining.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    return chunks or ["The README is empty."]
+
+
+async def fetch_github_readme() -> str:
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(GITHUB_README_RAW_URL) as response:
+            response.raise_for_status()
+            return await response.text()
+
+
+async def post_readme(channel) -> int:
+    readme = await fetch_github_readme()
+    chunks = split_discord_message(readme)
+    for index, chunk in enumerate(chunks, 1):
+        await channel.send(
+            chunk,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    return len(chunks)
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     # Text command prefix is intentionally "-mb"; slash commands remain enabled.
@@ -2754,6 +2811,33 @@ async def on_message(message: discord.Message) -> None:
     player = state.get("player")
 
     try:
+        if command_name == "uptime":
+            await message.reply(f"I have been online for **{format_uptime()}**.", mention_author=False)
+            return
+
+        if command_name == "update":
+            await message.reply("Fetching the latest README from GitHub and posting it here...", mention_author=False)
+            try:
+                count = await post_readme(message.channel)
+                await message.reply(f"Posted the GitHub README in {count} message(s).", mention_author=False)
+            except Exception as exc:
+                logger.warning("Could not post GitHub README: %s", exc)
+                await message.reply("I couldn't fetch the GitHub README. Please try again later.", mention_author=False)
+            return
+
+        if command_name == "say":
+            if not message.author.guild_permissions.manage_messages:
+                await message.reply("You need Manage Messages permission to use this command.", mention_author=False)
+                return
+            if not argument:
+                await message.reply("Usage: `-mb say <message>`", mention_author=False)
+                return
+            await message.channel.send(
+                argument,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
         if command_name in {"help", "commands"}:
             await message.reply(
                 "**Movie Bot text commands**\n"
@@ -2763,7 +2847,9 @@ async def on_message(message: discord.Message) -> None:
                 "`-mb queue`\n"
                 "`-mb volume <0-100>`\n"
                 "`-mb lyrics [on|off]`\n"
-                "`-mb join` / `-mb leave`",
+                "`-mb join` / `-mb leave`\n"
+                "`-mb uptime` / `-mb update` / `-mb commands`\n"
+                "`-mb say <message>` (requires Manage Messages)",
                 mention_author=False,
             )
             return
@@ -2913,6 +2999,70 @@ async def on_message(message: discord.Message) -> None:
     except Exception as exc:
         logger.exception("Prefix command failed (%s): %s", command_name, exc)
         await message.reply("That command failed. Check the bot console for details.", mention_author=False)
+
+
+@bot.tree.command(name="uptime", description="Show how long the bot has been online.")
+async def bot_uptime(interaction: discord.Interaction) -> None:
+    await send_interaction_response(
+        interaction,
+        f"I have been online for **{format_uptime()}**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="update", description="Post the latest GitHub README in this channel.")
+async def bot_update(interaction: discord.Interaction) -> None:
+    # Defer publicly so the README is posted in the channel, not as an ephemeral reply.
+    await interaction.response.defer(thinking=True)
+    try:
+        count = await post_readme(interaction.channel)
+    except Exception as exc:
+        logger.warning("Could not post GitHub README from slash command: %s", exc)
+        await interaction.followup.send(
+            "I couldn't fetch the GitHub README. Please try again later.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"Posted the latest GitHub README in {count} message(s).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="commands", description="List the bot's slash and -mb text commands.")
+async def bot_commands(interaction: discord.Interaction) -> None:
+    listing = (
+        "**Music commands**\n"
+        "`/play <song>` · `/pause` · `/resume` · `/skip` · `/queue`\n"
+        "`/volume <0-100>` · `/lyrics [enabled]` · `/stop` · `/join` · `/leave`\n\n"
+        "**Other slash commands**\n"
+        "`/uptime` · `/update` · `/commands` · `/say <message>`\n"
+        "`/channel link` · `/movie list` · `/movie search <title>` · `/movie play <URL>`\n"
+        "`/login youtube` · `/sync` (administrator)\n\n"
+        "**Text command equivalents**\n"
+        "`-mb play <song>` · `-mb pause` · `-mb resume` · `-mb skip` · `-mb queue`\n"
+        "`-mb volume <0-100>` · `-mb lyrics [on|off]` · `-mb stop` · `-mb join` · `-mb leave`\n"
+        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>`\n"
+        "The `say` commands require Manage Messages permission."
+    )
+    await send_interaction_response(interaction, listing, ephemeral=True)
+
+
+@bot.tree.command(name="say", description="Make the bot post a message in this channel.")
+@app_commands.describe(message="The text the bot should post.")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def bot_say(interaction: discord.Interaction, message: str) -> None:
+    text_to_send = message.strip()
+    if not text_to_send:
+        await send_interaction_response(interaction, "Please provide a message to send.", ephemeral=True)
+        return
+    if len(text_to_send) > 2000:
+        await send_interaction_response(interaction, "Messages must be 2,000 characters or fewer.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        text_to_send,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.event
