@@ -198,7 +198,7 @@ config.json contains only the linked channel ID. The Discord token is never stor
 The bot also provides these utility commands:
 
 - `/uptime` shows how long the current bot process has been running.
-- `/update` fetches the current `README.md` from this GitHub repository and posts it in the channel, split into Discord-safe messages.
+- `/update` fetches `updates.txt` and posts the bot's update log in the channel, split into Discord-safe messages.
 - `/commands` lists the main slash commands and their `-mb` text-command equivalents.
 - `/say <message>` posts a message as the bot. It requires the `Manage Messages` permission and disables automatic mention notifications.
 
