@@ -1,0 +1,19 @@
+𝗠𝗢𝗩𝗜𝗘 𝗕𝗢𝗧
+━━━━━━━━━━━━━━━━━━━━
+𝗨𝗣𝗗𝗔𝗧𝗘 𝗟𝗢𝗚
+
+𝗡𝗘𝗪 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦
+• `/uptime` and `-mb uptime` show how long the bot has been online.
+• `/commands` and `-mb commands` list available commands.
+• `/say` and `-mb say` let users with Manage Messages send a message as the bot.
+• `/update` and `-mb update` post this update log in the current channel.
+
+𝗧𝗘𝗫𝗧 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦
+• Sending `-mb` by itself now points you to `-mb commands`.
+• Music text commands use the same queue and player as slash commands.
+
+𝗠𝗨𝗦𝗜𝗖 𝗣𝗟𝗔𝗬𝗕𝗔𝗖𝗞
+• Added playback-stall and stuck-track diagnostics to help identify playback problems.
+
+━━━━━━━━━━━━━━━━━━━━
+𝗧𝗵𝗮𝗻𝗸 𝘆𝗼𝘂 𝗳𝗼𝗿 𝘂𝘀𝗶𝗻𝗴 𝗠𝗼𝘃𝗶𝗲 𝗕𝗼𝘁.
