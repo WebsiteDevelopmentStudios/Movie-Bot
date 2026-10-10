@@ -2468,7 +2468,7 @@ async def on_message(message: discord.Message) -> None:
                 "`/movie list` — list available movies\n"
                 "`/movie search <title>` — search the movie collection\n"
                 "`/movie play <movie>` — play a movie\n"
-                "`/channel link` — choose the movie channel\n"
+                "`/channel link` — choose the movie channel\n",
                 mention_author=False,
             )
             return
