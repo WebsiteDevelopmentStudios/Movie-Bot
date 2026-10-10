@@ -3014,7 +3014,7 @@ async def bot_update(interaction: discord.Interaction) -> None:
     except Exception as exc:
         logger.warning("Could not post update log from slash command: %s", exc)
         await interaction.followup.send(
-            "I couldn't fetch the GitHub README. Please try again later.",
+            "I couldn't fetch the update log. Please try again later.",
             ephemeral=True,
         )
         return
