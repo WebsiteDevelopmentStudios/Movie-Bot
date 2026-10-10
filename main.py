@@ -2872,7 +2872,14 @@ async def on_message(message: discord.Message) -> None:
                 "`-mb lyrics [on|off]`\n"
                 "`-mb join` / `-mb leave`\n"
                 "`-mb uptime` / `-mb update` / `-mb commands`\n"
-                "`-mb say <message>` (requires Manage Messages)",
+                "`-mb say <message>` (requires Manage Messages)\n"
+                "`-mb sync` (requires Administrator)\n\n"
+                "**Movie commands (slash commands)**\n"
+                "`/movie list` — list available movies\n"
+                "`/movie search <title>` — search the movie collection\n"
+                "`/movie play <movie>` — play a movie\n"
+                "`/channel link` — choose the movie channel\n"
+                "`/login youtube` — configure YouTube login",
                 mention_author=False,
             )
             return
@@ -3061,8 +3068,9 @@ async def bot_commands(interaction: discord.Interaction) -> None:
         "`/volume <0-100>` · `/lyrics [enabled]` · `/stop` · `/join` · `/leave`\n\n"
         "**Other slash commands**\n"
         "`/uptime` · `/update` · `/commands` · `/say <message>`\n"
-        "`/channel link` · `/movie list` · `/movie search <title>` · `/movie play <URL>`\n"
-        "`/login youtube` · `/sync` (administrator)\n\n"
+        "`/channel link` · `/movie list` · `/movie search <title>` · `/movie play <movie>`\n"
+        "`/login youtube` · `/sync` (administrator)\n"
+        "Movie features are slash commands; they do not currently have `-mb` text equivalents.\n\n"
         "**Text command equivalents**\n"
         "`-mb play <song>` · `-mb pause` · `-mb resume` · `-mb skip` · `-mb queue`\n"
         "`-mb volume <0-100>` · `-mb lyrics [on|off]` · `-mb stop` · `-mb join` · `-mb leave`\n"
