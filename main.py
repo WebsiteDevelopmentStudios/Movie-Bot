@@ -2618,10 +2618,26 @@ async def on_message(message: discord.Message) -> None:
             if not isinstance(countdowns, dict):
                 countdowns = {}
                 config["countdown_messages"] = countdowns
+
+            countdown_message = None
+            previous = countdowns.get(str(guild_id))
+            if isinstance(previous, dict):
+                try:
+                    previous_channel = bot.get_channel(int(previous["channel_id"]))
+                    if previous_channel is None:
+                        previous_channel = await bot.fetch_channel(int(previous["channel_id"]))
+                    if isinstance(previous_channel, discord.TextChannel):
+                        countdown_message = await previous_channel.fetch_message(int(previous["message_id"]))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException, KeyError, TypeError, ValueError):
+                    countdown_message = None
+
             try:
-                countdown_message = await message.channel.send(embed=build_halloween_embed())
+                if countdown_message is not None:
+                    await countdown_message.edit(embed=build_halloween_embed())
+                else:
+                    countdown_message = await message.channel.send(embed=build_halloween_embed())
                 countdowns[str(guild_id)] = {
-                    "channel_id": message.channel.id,
+                    "channel_id": countdown_message.channel.id,
                     "message_id": countdown_message.id,
                 }
                 save_config(config)
@@ -2633,7 +2649,7 @@ async def on_message(message: discord.Message) -> None:
                 )
                 return
             await message.reply(
-                "Halloween countdown posted here. It refreshes automatically, including after a bot restart.",
+                "Halloween countdown is set up and will refresh automatically, including after a bot restart.",
                 mention_author=False,
             )
             return
