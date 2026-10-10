@@ -7,7 +7,9 @@ import re
 import secrets
 import shutil
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 from html import escape
 
@@ -2126,6 +2128,122 @@ class MovieBot(commands.Bot):
 bot = MovieBot(command_prefix=commands.when_mentioned, intents=intents)
 
 
+HALLOWEEN_GIF_URL = "https://cdn.discordapp.com/attachments/1540581764752220260/1540858289875591208/IMG_9714.gif?ex=6acac39c&is=6ac9721c&hm=a502a514aaa8372aa0fc34c3ae0102527480b9dd75230dd6b9ea9d012a6aeec6"
+STATUS_FILE = BASE_DIR / "status's.txt"
+try:
+    HALLOWEEN_TZ = ZoneInfo(os.getenv("HALLOWEEN_TIMEZONE", "America/Los_Angeles"))
+except Exception:
+    HALLOWEEN_TZ = datetime.now().astimezone().tzinfo
+
+
+def get_next_halloween() -> datetime:
+    now = datetime.now(HALLOWEEN_TZ)
+    year = now.year
+    target = datetime(year, 10, 31, 0, 0, 0, tzinfo=HALLOWEEN_TZ)
+    if target <= now:
+        target = datetime(year + 1, 10, 31, 0, 0, 0, tzinfo=HALLOWEEN_TZ)
+    return target
+
+
+def build_halloween_embed() -> discord.Embed:
+    now = datetime.now(HALLOWEEN_TZ)
+    target = get_next_halloween()
+    remaining_seconds = max(0, int((target - now).total_seconds()))
+    days_remaining = (target.date() - now.date()).days
+    total_hours, remainder = divmod(remaining_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    embed = discord.Embed(
+        title=f"There are {days_remaining} days until Halloween",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Countdown",
+        value=f"`{total_hours:02d}:{minutes:02d}:{seconds:02d}`",
+        inline=False,
+    )
+    embed.set_image(url=HALLOWEEN_GIF_URL)
+    embed.set_footer(text="Updates automatically • Halloween countdown")
+    return embed
+
+
+def load_statuses() -> list[str]:
+    try:
+        entries = STATUS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", STATUS_FILE.name, exc)
+        return ["Watching the days until Halloween"]
+    return [entry.strip() for entry in entries if entry.strip()][:100] or [
+        "Watching the days until Halloween"
+    ]
+
+
+@tasks.loop(seconds=45)
+async def rotate_bot_status() -> None:
+    statuses = load_statuses()
+    if not statuses:
+        return
+    index = rotate_bot_status.current_loop % len(statuses)
+    try:
+        await bot.change_presence(
+            activity=discord.CustomActivity(name=statuses[index]),
+            status=discord.Status.online,
+        )
+    except (discord.HTTPException, RuntimeError) as exc:
+        logger.warning("Could not update bot status: %s", exc)
+
+
+@tasks.loop(seconds=15)
+async def update_halloween_countdowns() -> None:
+    countdowns = config.get("countdown_messages", {})
+    if not isinstance(countdowns, dict) or not countdowns:
+        return
+
+    changed = False
+    for guild_key, details in list(countdowns.items()):
+        if not isinstance(details, dict):
+            continue
+        try:
+            channel_id = int(details["channel_id"])
+            message_id = int(details["message_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            countdown_message = await channel.fetch_message(message_id)
+            await countdown_message.edit(embed=build_halloween_embed())
+        except discord.NotFound:
+            logger.info("Halloween countdown message %s was deleted.", message_id)
+            countdowns.pop(guild_key, None)
+            changed = True
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("Could not update Halloween countdown in channel %s: %s", channel_id, exc)
+
+    if changed:
+        try:
+            save_config(config)
+        except OSError as exc:
+            logger.warning("Could not save removed countdown message configuration: %s", exc)
+
+
+@bot.event
+async def on_ready() -> None:
+    if not rotate_bot_status.is_running():
+        rotate_bot_status.start()
+    if not update_halloween_countdowns.is_running():
+        update_halloween_countdowns.start()
+    logger.info("Logged in as %s (%s).", bot.user, bot.user.id if bot.user else "unknown")
+
+
 @bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
@@ -2483,13 +2601,38 @@ async def on_message(message: discord.Message) -> None:
                 "`-mb uptime` / `-mb update` / `-mb commands`\n"
                 "`-mb say <message>` (requires Manage Messages)\n"
                 "`-mb sync` (requires Administrator)\n\n"
-                "**Movie text commands**\n"
+                "`-mb countdown` — post a Halloween countdown embed in this channel\n"\n                "**Movie text commands**\n"
                 "`-mb movie list` — list available local movies\n"
                 "`-mb movie <title>` — search titles with the movie embed\n"
                 "`-mb movie search <title>` — same search, explicit form\n"
                 "`-mb movie play <URL>` — post a movie page link\n"
                 "`-mb channel link <#channel or ID>` — set the movie channel (Administrator)\n"
                 "**Slash equivalents:** `/movie list`, `/movie search`, `/movie play`, `/channel link`\n",
+                mention_author=False,
+            )
+            return
+
+        if command_name == "countdown":
+            countdowns = config.setdefault("countdown_messages", {})
+            if not isinstance(countdowns, dict):
+                countdowns = {}
+                config["countdown_messages"] = countdowns
+            try:
+                countdown_message = await message.channel.send(embed=build_halloween_embed())
+                countdowns[str(guild_id)] = {
+                    "channel_id": message.channel.id,
+                    "message_id": countdown_message.id,
+                }
+                save_config(config)
+            except (discord.Forbidden, discord.HTTPException, OSError) as exc:
+                logger.warning("Could not create or save Halloween countdown: %s", exc)
+                await message.reply(
+                    "I couldn't create or save the countdown. Check my channel permissions and try again.",
+                    mention_author=False,
+                )
+                return
+            await message.reply(
+                "Halloween countdown posted here. It refreshes automatically, including after a bot restart.",
                 mention_author=False,
             )
             return
@@ -2779,7 +2922,7 @@ async def bot_commands(interaction: discord.Interaction) -> None:
         "**Text command equivalents**\n"
         "`-mb play <song>` · `-mb pause` · `-mb resume` · `-mb skip` · `-mb queue`\n"
         "`-mb volume <0-100>` · `-mb lyrics [on|off]` · `-mb stop` · `-mb join` · `-mb leave`\n"
-        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>` · `-mb sync`\n"
+        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>` · `-mb sync`\n"        "`-mb countdown` — post or replace the Halloween countdown in this channel\n"
         "The `say` commands require Manage Messages permission. The `sync` commands require Administrator permission."
     )
     await send_interaction_response(interaction, listing, ephemeral=True)
