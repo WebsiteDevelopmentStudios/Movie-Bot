@@ -2756,7 +2756,7 @@ def split_discord_message(text: str, limit: int = 1900) -> list[str]:
         if len(remaining) <= limit:
             chunks.append(remaining)
             break
-        cut = remaining.rfind("\\n", 0, limit)
+        cut = remaining.rfind("\n", 0, limit)
         if cut < limit // 2:
             cut = remaining.rfind(" ", 0, limit)
         if cut < limit // 2:
