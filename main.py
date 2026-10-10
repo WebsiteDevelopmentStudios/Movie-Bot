@@ -2483,13 +2483,135 @@ async def on_message(message: discord.Message) -> None:
                 "`-mb uptime` / `-mb update` / `-mb commands`\n"
                 "`-mb say <message>` (requires Manage Messages)\n"
                 "`-mb sync` (requires Administrator)\n\n"
-                "**Movie commands (slash commands)**\n"
-                "`/movie list` — list available movies\n"
-                "`/movie search <title>` — search the movie collection\n"
-                "`/movie play <movie>` — play a movie\n"
-                "`/channel link` — choose the movie channel\n",
+                "**Movie text commands**\n"
+                "`-mb movie list` — list available local movies\n"
+                "`-mb movie search <title>` — search movie titles\n"
+                "`-mb movie play <URL>` — post a movie page link\n"
+                "`-mb channel link <#channel or ID>` — set the movie channel (Administrator)\n"
+                "**Slash equivalents:** `/movie list`, `/movie search`, `/movie play`, `/channel link`\n",
                 mention_author=False,
             )
+            return
+
+        if command_name == "movie":
+            movie_parts = argument.split(maxsplit=1)
+            movie_action = movie_parts[0].lower() if movie_parts else ""
+            movie_argument = movie_parts[1].strip() if len(movie_parts) > 1 else ""
+
+            if movie_action == "list":
+                movies = get_movie_files()
+                if not movies:
+                    await message.reply("No local movies are currently available.", mention_author=False)
+                    return
+                lines = [f"**Available local movies ({len(movies)}):**"]
+                lines.extend(f"• {path.stem}" for path in movies)
+                output = "\\n".join(lines)
+                for start in range(0, len(output), 1900):
+                    await message.channel.send(
+                        output[start:start + 1900],
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
+
+            if movie_action == "search":
+                query = " ".join(movie_argument.split()).strip()
+                if len(query) < 2:
+                    await message.reply("Usage: `-mb movie search <title>`", mention_author=False)
+                    return
+                if len(query) > 100:
+                    await message.reply("Movie searches must be 100 characters or fewer.", mention_author=False)
+                    return
+                try:
+                    results = await search_movies(query)
+                except (asyncio.TimeoutError, aiohttp.ClientError, ValueError, RuntimeError) as exc:
+                    logger.warning("Text-command movie search failed for %r: %s", query, exc)
+                    await message.reply("I couldn't search the movie catalog right now. Please try again later.", mention_author=False)
+                    return
+                if not results:
+                    await message.reply(f"No movies found for **{escape(query)}**.", mention_author=False)
+                    return
+
+                result_lines = [f"**Movie search results for {escape(query)}:**"]
+                for item in results[:10]:
+                    title = str(item.get("title") or "Untitled movie")
+                    year = str(item.get("release_date") or "")[:4]
+                    movie_id = int(item["id"])
+                    suffix = f" ({year})" if year else ""
+                    result_lines.append(
+                        f"• **{escape(title)}{suffix}** — "
+                        f"[VidNest](https://vidnest.fun/movie/{movie_id}) | "
+                        f"[Cineby](https://cineby.tech/movie/{movie_id}/watch)"
+                    )
+                result_lines.append("Use `-mb movie play <URL>` to post a movie page link in the configured movie channel.")
+                output = "\\n".join(result_lines)
+                if len(output) <= 1900:
+                    await message.reply(output, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                else:
+                    await message.reply(output[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return
+
+            if movie_action == "play":
+                if not movie_argument:
+                    await message.reply("Usage: `-mb movie play <URL>`", mention_author=False)
+                    return
+                parsed_movie_url = urlparse(movie_argument)
+                if parsed_movie_url.scheme not in ("http", "https") or not parsed_movie_url.netloc:
+                    await message.reply(
+                        "Provide a movie page URL. Use `-mb movie search <title>` to find a title first.",
+                        mention_author=False,
+                    )
+                    return
+                movie_channel = await get_movie_channel()
+                if movie_channel is None:
+                    await message.reply("The configured movie channel is unavailable. An administrator can set it with `-mb channel link <#channel or ID>`.", mention_author=False)
+                    return
+                try:
+                    await movie_channel.send(
+                        f"▶ **Movie link**\\n{movie_argument}",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    await message.reply("I couldn't post the movie link in the configured channel.", mention_author=False)
+                    return
+                await message.reply(f"Posted the movie link in {movie_channel.mention}. No media was downloaded.", mention_author=False)
+                return
+
+            await message.reply(
+                "Usage: `-mb movie list`, `-mb movie search <title>`, or `-mb movie play <URL>`.",
+                mention_author=False,
+            )
+            return
+
+        if command_name == "channel":
+            channel_parts = argument.split(maxsplit=1)
+            channel_action = channel_parts[0].lower() if channel_parts else ""
+            channel_value = channel_parts[1].strip() if len(channel_parts) > 1 else ""
+            if channel_action != "link":
+                await message.reply("Usage: `-mb channel link <#channel or ID>`", mention_author=False)
+                return
+            if not message.author.guild_permissions.administrator:
+                await message.reply("You need Administrator permission to link the movie channel.", mention_author=False)
+                return
+            if not channel_value:
+                await message.reply("Usage: `-mb channel link <#channel or ID>`", mention_author=False)
+                return
+            channel_id_match = re.fullmatch(r"<#(\\d+)>|(\\d+)", channel_value)
+            if not channel_id_match:
+                await message.reply("Mention a text channel or provide its numeric channel ID.", mention_author=False)
+                return
+            channel_id = int(channel_id_match.group(1) or channel_id_match.group(2))
+            linked_channel = message.guild.get_channel(channel_id)
+            if not isinstance(linked_channel, discord.TextChannel):
+                await message.reply("I couldn't find that text channel in this server.", mention_author=False)
+                return
+            config["channel_id"] = linked_channel.id
+            try:
+                save_config(config)
+            except OSError as exc:
+                logger.error("Could not save movie channel configuration: %s", exc)
+                await message.reply("I couldn't save the movie channel configuration.", mention_author=False)
+                return
+            await message.reply(f"Movie channel linked to {linked_channel.mention}.", mention_author=False)
             return
 
         if command_name == "play":
