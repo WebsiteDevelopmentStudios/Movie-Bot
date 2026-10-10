@@ -8,7 +8,7 @@ import secrets
 import shutil
 import time
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 from html import escape
 
 import aiohttp
