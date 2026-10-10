@@ -2507,79 +2507,53 @@ async def on_message(message: discord.Message) -> None:
                 lines.extend(f"• {path.stem}" for path in movies)
                 output = "\n".join(lines)
                 for start in range(0, len(output), 1900):
-                    await message.channel.send(
-                        output[start:start + 1900],
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                return
-
-            if movie_action == "search":
-                query = " ".join(movie_argument.split()).strip()
-                if len(query) < 2:
-                    await message.reply("Usage: `-mb movie search <title>`", mention_author=False)
-                    return
-                if len(query) > 100:
-                    await message.reply("Movie searches must be 100 characters or fewer.", mention_author=False)
-                    return
-                try:
-                    results = await search_movies(query)
-                except (asyncio.TimeoutError, aiohttp.ClientError, ValueError, RuntimeError) as exc:
-                    logger.warning("Text-command movie search failed for %r: %s", query, exc)
-                    await message.reply("I couldn't search the movie catalog right now. Please try again later.", mention_author=False)
-                    return
-                if not results:
-                    await message.reply(f"No movies found for **{escape(query)}**.", mention_author=False)
-                    return
-
-                result_lines = [f"**Movie search results for {escape(query)}:**"]
-                for item in results[:10]:
-                    title = str(item.get("title") or "Untitled movie")
-                    year = str(item.get("release_date") or "")[:4]
-                    movie_id = int(item["id"])
-                    suffix = f" ({year})" if year else ""
-                    result_lines.append(
-                        f"• **{escape(title)}{suffix}** — "
-                        f"[VidNest](https://vidnest.fun/movie/{movie_id}) | "
-                        f"[Cineby](https://cineby.tech/movie/{movie_id}/watch)"
-                    )
-                result_lines.append("Use `-mb movie play <URL>` to post a movie page link in the configured movie channel.")
-                output = "\n".join(result_lines)
-                if len(output) <= 1900:
-                    await message.reply(output, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
-                else:
-                    await message.reply(output[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                    await message.channel.send(output[start:start + 1900], allowed_mentions=discord.AllowedMentions.none())
                 return
 
             if movie_action == "play":
                 if not movie_argument:
-                    await message.reply("Usage: `-mb movie play <URL>`", mention_author=False)
+                    await message.reply("Usage: -mb movie play <URL>", mention_author=False)
                     return
                 parsed_movie_url = urlparse(movie_argument)
                 if parsed_movie_url.scheme not in ("http", "https") or not parsed_movie_url.netloc:
-                    await message.reply(
-                        "Provide a movie page URL. Use `-mb movie search <title>` to find a title first.",
-                        mention_author=False,
-                    )
+                    await message.reply("Provide a movie page URL. Use -mb movie <title> to find a title first.", mention_author=False)
                     return
                 movie_channel = await get_movie_channel()
                 if movie_channel is None:
-                    await message.reply("The configured movie channel is unavailable. An administrator can set it with `-mb channel link <#channel or ID>`.", mention_author=False)
+                    await message.reply("The configured movie channel is unavailable. An administrator can set it with -mb channel link <#channel or ID>.", mention_author=False)
                     return
                 try:
-                    await movie_channel.send(
-                        f"▶ **Movie link**\n{movie_argument}",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                    await movie_channel.send(f"Movie link\n{movie_argument}", allowed_mentions=discord.AllowedMentions.none())
                 except (discord.Forbidden, discord.HTTPException):
-                    await message.reply("I couldn't post the movie link in the configured channel.", mention_author=False)
+                    await message.reply("Unable to post the movie link in the configured channel.", mention_author=False)
                     return
                 await message.reply(f"Posted the movie link in {movie_channel.mention}. No media was downloaded.", mention_author=False)
                 return
 
-            await message.reply(
-                "Usage: `-mb movie list`, `-mb movie search <title>`, or `-mb movie play <URL>`.",
-                mention_author=False,
-            )
+            # Match /movie search: both -mb movie <title> and the explicit
+            # -mb movie search <title> form use the same interactive picker.
+            query = movie_argument if movie_action == "search" else argument.strip()
+            query = " ".join(query.split()).strip()
+            if len(query) < 2:
+                await message.reply("Usage: -mb movie <title> (or -mb movie list / -mb movie play <URL>).", mention_author=False)
+                return
+            if len(query) > 100:
+                await message.reply("Movie searches must be 100 characters or fewer.", mention_author=False)
+                return
+
+            try:
+                results = await search_movies(query)
+            except (asyncio.TimeoutError, aiohttp.ClientError, ValueError, RuntimeError) as exc:
+                logger.warning("Text-command movie search failed for %r: %s", query, exc)
+                await message.reply("Unable to search the movie catalog right now. Please try again later.", mention_author=False)
+                return
+            if not results:
+                await message.reply(f"No movies found for **{escape(query)}**.", mention_author=False)
+                return
+
+            # Reuse the same selector and embed flow as /movie search.
+            view = VidNestSearchView(message.author.id, results)
+            await message.reply(content=f"Search results for **{escape(query)}** — choose a movie below.", view=view, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
             return
 
         if command_name == "channel":
