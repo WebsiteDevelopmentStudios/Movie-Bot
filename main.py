@@ -2107,6 +2107,25 @@ async def play_next(guild_id: int) -> bool:
     return False
 
 
+# Create the Discord client before registering slash commands and events.
+intents = discord.Intents.default()
+intents.message_content = True
+
+
+class MovieBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        # Connect to the configured external Lavalink node and publish slash commands.
+        await initialize_lavalink()
+        try:
+            synced = await self.tree.sync()
+            logger.info("Synced %d global slash command(s).", len(synced))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("Could not sync global slash commands on startup: %s", exc)
+
+
+bot = MovieBot(command_prefix=commands.when_mentioned, intents=intents)
+
+
 @bot.tree.command(name="play", description="Play a song or Spotify track in your voice channel.")
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
