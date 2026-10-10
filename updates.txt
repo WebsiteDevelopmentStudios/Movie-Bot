@@ -14,7 +14,11 @@
 • `-mb say` requires Manage Messages permission.
 
 𝗠𝗢𝗩𝗜𝗘 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦
-• Command help now includes `/movie list`, `/movie search`, `/movie play`, and `/channel link`.
+• Added `-mb movie list` to list local movie files.
+• Added `-mb movie search <title>` to search titles and show provider page links.
+• Added `-mb movie play <URL>` to post a movie page link in the configured channel.
+• Added administrator command `-mb channel link <#channel or ID>` to configure the movie channel.
+• Slash equivalents remain available: `/movie list`, `/movie search`, `/movie play`, and `/channel link`.
 
 𝗦𝗜𝗠𝗣𝗟𝗜𝗙𝗜𝗘𝗗 𝗦𝗘𝗧𝗨𝗣
 • Removed the YouTube login command, OAuth callback, and cookie-import features.
