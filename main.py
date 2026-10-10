@@ -2152,9 +2152,6 @@ def get_halloween_target(now: datetime | None = None) -> datetime:
 
 def get_daily_halloween3_fact() -> str:
     today = datetime.now(HALLOWEEN_TZ).date().isoformat()
-    current = config.get("halloween3_daily_fact", {})
-    if isinstance(current, dict) and current.get("date") == today and current.get("fact"):
-        return str(current["fact"])
 
     try:
         candidates = [
@@ -2164,6 +2161,18 @@ def get_daily_halloween3_fact() -> str:
     except OSError as exc:
         logger.warning("Could not read %s: %s", HALLOWEEN3_FACTS_FILE.name, exc)
         candidates = []
+
+    current = config.get("halloween3_daily_fact", {})
+    if (
+        isinstance(current, dict)
+        and current.get("date") == today
+        and current.get("fact")
+        and (
+            str(current["fact"]) in candidates
+            or str(current["fact"]).startswith("All currently listed facts have been used.")
+        )
+    ):
+        return str(current["fact"])
 
     history = config.get("halloween3_used_facts", [])
     if not isinstance(history, list):
@@ -2179,9 +2188,8 @@ def get_daily_halloween3_fact() -> str:
     try:
         save_config(config)
     except OSError as exc:
-        logger.warning("Could not save today's Halloween III fact: %s", exc)
+        logger.warning("Could not save today's horror fact: %s", exc)
     return fact
-
 
 def build_halloween_embed() -> discord.Embed:
     now = datetime.now(HALLOWEEN_TZ)
@@ -2203,7 +2211,7 @@ def build_halloween_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="Halloween III: Season of the Witch — Daily Fact",
+        name="Horror Fact of the Day",
         value=get_daily_halloween3_fact(),
         inline=False,
     )
