@@ -2521,6 +2521,7 @@ async def play_next(guild_id: int) -> bool:
 @app_commands.describe(song="A song name, or an open.spotify.com/track URL.")
 async def music_play(interaction: discord.Interaction, song: str) -> None:
     await acknowledge_command(interaction)
+    await interaction.followup.send("The music player is in beta.", ephemeral=True)
     if interaction.guild is None:
         await send_interaction_response(interaction, "This command only works in a server.", ephemeral=True)
         return
@@ -2850,6 +2851,7 @@ async def on_message(message: discord.Message) -> None:
             return
 
         if command_name == "play":
+            await message.reply("The music player is in beta.", mention_author=False)
             if not argument:
                 await message.reply("Usage: `-mb play <song>`", mention_author=False)
                 return
