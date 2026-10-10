@@ -2783,6 +2783,26 @@ async def on_wavelink_track_end(payload) -> None:
 
 
 @bot.event
+async def on_wavelink_track_stuck(payload) -> None:
+    """Log Lavalink playback stalls without restarting or skipping the track."""
+    player = getattr(payload, "player", None)
+    track = getattr(payload, "track", None)
+    guild = getattr(player, "guild", None)
+    threshold = getattr(payload, "threshold", None)
+    if threshold is None:
+        threshold = getattr(payload, "threshold_ms", None)
+    position = getattr(player, "position", None)
+
+    logger.warning(
+        "Lavalink track stuck: guild=%s track=%s position_ms=%s threshold=%s",
+        getattr(guild, "id", "unknown"),
+        getattr(track, "title", "unknown"),
+        position if position is not None else "unknown",
+        threshold if threshold is not None else "unknown",
+    )
+
+
+@bot.event
 async def on_wavelink_track_exception(payload) -> None:
     player = getattr(payload, "player", None)
     if player is None or player.guild is None:
