@@ -2601,7 +2601,8 @@ async def on_message(message: discord.Message) -> None:
                 "`-mb uptime` / `-mb update` / `-mb commands`\n"
                 "`-mb say <message>` (requires Manage Messages)\n"
                 "`-mb sync` (requires Administrator)\n\n"
-                "**Movie text commands**\n"\n                "`-mb countdown` — post a Halloween countdown embed in this channel\n"
+                "**Movie text commands**\n"
+                "`-mb countdown` — post a Halloween countdown embed in this channel\n"
                 "`-mb movie list` — list available local movies\n"
                 "`-mb movie <title>` — search titles with the movie embed\n"
                 "`-mb movie search <title>` — same search, explicit form\n"
@@ -2922,7 +2923,8 @@ async def bot_commands(interaction: discord.Interaction) -> None:
         "**Text command equivalents**\n"
         "`-mb play <song>` · `-mb pause` · `-mb resume` · `-mb skip` · `-mb queue`\n"
         "`-mb volume <0-100>` · `-mb lyrics [on|off]` · `-mb stop` · `-mb join` · `-mb leave`\n"
-        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>` · `-mb sync`\n"\n        "`-mb countdown` — post or replace the Halloween countdown in this channel\n"
+        "`-mb uptime` · `-mb update` · `-mb commands` · `-mb say <message>` · `-mb sync`\n"
+        "`-mb countdown` — post or replace the Halloween countdown in this channel\n"
         "The `say` commands require Manage Messages permission. The `sync` commands require Administrator permission."
     )
     await send_interaction_response(interaction, listing, ephemeral=True)
