@@ -2795,12 +2795,7 @@ async def on_message(message: discord.Message) -> None:
 
     raw = message.content[3:].strip()
     if not raw:
-        await message.reply(
-            "Usage: `-mb play <song>`, `-mb pause`, `-mb resume`, `-mb skip`, "
-            "`-mb queue`, `-mb volume <0-100>`, `-mb lyrics [on|off]`, "
-            "`-mb stop`, `-mb join`, `-mb leave`.",
-            mention_author=False,
-        )
+        await message.reply("Run `-mb commands` to see the available commands.", mention_author=False)
         return
 
     parts = raw.split(maxsplit=1)
