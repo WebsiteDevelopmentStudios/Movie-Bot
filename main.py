@@ -2729,7 +2729,7 @@ async def music_stop(interaction: discord.Interaction) -> None:
 
 
 BOT_START_TIME = time.monotonic()
-GITHUB_README_RAW_URL = "https://raw.githubusercontent.com/WebsiteDevelopmentStudios/Movie-Bot/main/README.md"
+GITHUB_UPDATES_RAW_URL = "https://raw.githubusercontent.com/WebsiteDevelopmentStudios/Movie-Bot/main/updates.txt"
 
 
 def format_uptime() -> str:
@@ -2763,20 +2763,20 @@ def split_discord_message(text: str, limit: int = 1900) -> list[str]:
             cut = limit
         chunks.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip()
-    return chunks or ["The README is empty."]
+    return chunks or ["The update log is empty."]
 
 
-async def fetch_github_readme() -> str:
+async def fetch_updates() -> str:
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(GITHUB_README_RAW_URL) as response:
+        async with session.get(GITHUB_UPDATES_RAW_URL) as response:
             response.raise_for_status()
             return await response.text()
 
 
-async def post_readme(channel) -> int:
-    readme = await fetch_github_readme()
-    chunks = split_discord_message(readme)
+async def post_updates(channel) -> int:
+    updates = await fetch_updates()
+    chunks = split_discord_message(updates)
     for index, chunk in enumerate(chunks, 1):
         await channel.send(
             chunk,
@@ -2811,13 +2811,13 @@ async def on_message(message: discord.Message) -> None:
             return
 
         if command_name == "update":
-            await message.reply("Fetching the latest README from GitHub and posting it here...", mention_author=False)
+            await message.reply("Fetching the latest update log and posting it here...", mention_author=False)
             try:
-                count = await post_readme(message.channel)
-                await message.reply(f"Posted the GitHub README in {count} message(s).", mention_author=False)
+                count = await post_updates(message.channel)
+                await message.reply(f"Posted the update log in {count} message(s).", mention_author=False)
             except Exception as exc:
-                logger.warning("Could not post GitHub README: %s", exc)
-                await message.reply("I couldn't fetch the GitHub README. Please try again later.", mention_author=False)
+                logger.warning("Could not post update log: %s", exc)
+                await message.reply("I couldn't fetch the update log. Please try again later.", mention_author=False)
             return
 
         if command_name == "say":
@@ -3005,21 +3005,21 @@ async def bot_uptime(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(name="update", description="Post the latest GitHub README in this channel.")
+@bot.tree.command(name="update", description="Post the bot update log in this channel.")
 async def bot_update(interaction: discord.Interaction) -> None:
     # Defer publicly so the README is posted in the channel, not as an ephemeral reply.
     await interaction.response.defer(thinking=True)
     try:
-        count = await post_readme(interaction.channel)
+        count = await post_updates(interaction.channel)
     except Exception as exc:
-        logger.warning("Could not post GitHub README from slash command: %s", exc)
+        logger.warning("Could not post update log from slash command: %s", exc)
         await interaction.followup.send(
             "I couldn't fetch the GitHub README. Please try again later.",
             ephemeral=True,
         )
         return
     await interaction.followup.send(
-        f"Posted the latest GitHub README in {count} message(s).",
+        f"Posted the update log in {count} message(s).",
         ephemeral=True,
     )
 
