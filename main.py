@@ -2505,7 +2505,7 @@ async def on_message(message: discord.Message) -> None:
                     return
                 lines = [f"**Available local movies ({len(movies)}):**"]
                 lines.extend(f"• {path.stem}" for path in movies)
-                output = "\\n".join(lines)
+                output = "\n".join(lines)
                 for start in range(0, len(output), 1900):
                     await message.channel.send(
                         output[start:start + 1900],
@@ -2543,7 +2543,7 @@ async def on_message(message: discord.Message) -> None:
                         f"[Cineby](https://cineby.tech/movie/{movie_id}/watch)"
                     )
                 result_lines.append("Use `-mb movie play <URL>` to post a movie page link in the configured movie channel.")
-                output = "\\n".join(result_lines)
+                output = "\n".join(result_lines)
                 if len(output) <= 1900:
                     await message.reply(output, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
                 else:
@@ -2567,7 +2567,7 @@ async def on_message(message: discord.Message) -> None:
                     return
                 try:
                     await movie_channel.send(
-                        f"▶ **Movie link**\\n{movie_argument}",
+                        f"▶ **Movie link**\n{movie_argument}",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except (discord.Forbidden, discord.HTTPException):
@@ -2595,7 +2595,7 @@ async def on_message(message: discord.Message) -> None:
             if not channel_value:
                 await message.reply("Usage: `-mb channel link <#channel or ID>`", mention_author=False)
                 return
-            channel_id_match = re.fullmatch(r"<#(\\d+)>|(\\d+)", channel_value)
+            channel_id_match = re.fullmatch(r"<#(\d+)>|(\d+)", channel_value)
             if not channel_id_match:
                 await message.reply("Mention a text channel or provide its numeric channel ID.", mention_author=False)
                 return
@@ -2704,7 +2704,7 @@ async def on_message(message: discord.Message) -> None:
             for index, queued in enumerate(state.get("queue", []), 1):
                 seconds = queued.get("duration", 0) / 1000
                 lines.append(f"**{index}.** {queued['title']} — {queued['artist']} ({int(seconds // 60)}:{int(seconds % 60):02d})")
-            await message.reply("\\n".join(lines[:51]) if lines else "The music queue is empty.", mention_author=False)
+            await message.reply("\n".join(lines[:51]) if lines else "The music queue is empty.", mention_author=False)
             return
 
         if command_name == "volume":
