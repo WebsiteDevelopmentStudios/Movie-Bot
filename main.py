@@ -2129,6 +2129,8 @@ bot = MovieBot(command_prefix=commands.when_mentioned, intents=intents)
 
 
 HALLOWEEN_GIF_URL = "https://cdn.discordapp.com/attachments/1540581764752220260/1540858289875591208/IMG_9714.gif?ex=6acac39c&is=6ac9721c&hm=a502a514aaa8372aa0fc34c3ae0102527480b9dd75230dd6b9ea9d012a6aeec6"
+HALLOWEEN3_FACTS_FILE = BASE_DIR / "halloween3_facts.txt"
+HALLOWEEN3_YOUTUBE_URL = "https://www.youtube.com/results?search_query=Halloween+III+Season+of+the+Witch+official+trailer"
 STATUS_FILE = BASE_DIR / "status's.txt"
 try:
     HALLOWEEN_TZ = ZoneInfo(os.getenv("HALLOWEEN_TIMEZONE", "America/Los_Angeles"))
@@ -2136,33 +2138,78 @@ except Exception:
     HALLOWEEN_TZ = datetime.now().astimezone().tzinfo
 
 
-def get_next_halloween() -> datetime:
-    now = datetime.now(HALLOWEEN_TZ)
+def get_halloween_target(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(HALLOWEEN_TZ)
     year = now.year
+    if now.month == 10 and now.day == 31:
+        # Keep Halloween special mode active for the whole local calendar day.
+        return datetime(year, 10, 31, 23, 59, 59, tzinfo=HALLOWEEN_TZ)
     target = datetime(year, 10, 31, 0, 0, 0, tzinfo=HALLOWEEN_TZ)
     if target <= now:
         target = datetime(year + 1, 10, 31, 0, 0, 0, tzinfo=HALLOWEEN_TZ)
     return target
 
 
+def get_daily_halloween3_fact() -> str:
+    today = datetime.now(HALLOWEEN_TZ).date().isoformat()
+    current = config.get("halloween3_daily_fact", {})
+    if isinstance(current, dict) and current.get("date") == today and current.get("fact"):
+        return str(current["fact"])
+
+    try:
+        candidates = [
+            line.strip() for line in HALLOWEEN3_FACTS_FILE.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", HALLOWEEN3_FACTS_FILE.name, exc)
+        candidates = []
+
+    history = config.get("halloween3_used_facts", [])
+    if not isinstance(history, list):
+        history = []
+    used = {str(fact).strip() for fact in history}
+    fact = next((item for item in candidates if item not in used), None)
+    if fact is None:
+        fact = "All currently listed facts have been used. Add new facts to halloween3_facts.txt to continue without repeats."
+    else:
+        history.append(fact)
+        config["halloween3_used_facts"] = history
+    config["halloween3_daily_fact"] = {"date": today, "fact": fact}
+    try:
+        save_config(config)
+    except OSError as exc:
+        logger.warning("Could not save today's Halloween III fact: %s", exc)
+    return fact
+
+
 def build_halloween_embed() -> discord.Embed:
     now = datetime.now(HALLOWEEN_TZ)
-    target = get_next_halloween()
+    target = get_halloween_target(now)
     remaining_seconds = max(0, int((target.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()))
-    days_remaining = (target.date() - now.date()).days
+    is_halloween = now.month == 10 and now.day == 31
+    days_remaining = 0 if is_halloween else (target.date() - now.date()).days
     total_hours, remainder = divmod(remaining_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
 
     embed = discord.Embed(
-        title=f"There are {days_remaining} days until Halloween",
+        title="Happy Halloween!" if is_halloween else f"There are {days_remaining} days until Halloween",
         color=discord.Color.orange(),
         timestamp=discord.utils.utcnow(),
     )
     embed.add_field(
-        name="Countdown",
+        name="Countdown" if not is_halloween else "Halloween ends in",
         value=f"`{total_hours:02d}:{minutes:02d}:{seconds:02d}`",
         inline=False,
     )
+    embed.add_field(
+        name="Halloween III: Season of the Witch — Daily Fact",
+        value=get_daily_halloween3_fact(),
+        inline=False,
+    )
+    if is_halloween:
+        embed.description = f"Today's the day! [Watch Halloween III: Season of the Witch on YouTube]({HALLOWEEN3_YOUTUBE_URL})"
+        embed.url = HALLOWEEN3_YOUTUBE_URL
     embed.set_image(url=HALLOWEEN_GIF_URL)
     embed.set_footer(text="Updates automatically • Halloween countdown")
     return embed
