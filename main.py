@@ -2782,6 +2782,58 @@ async def on_wavelink_track_end(payload) -> None:
     await play_next(player.guild.id)
 
 
+# Playback-position diagnostics: detects stalls even when Lavalink does not
+# emit a dedicated TrackStuck event.
+_playback_position_watch: dict[int, dict] = {}
+
+
+@bot.event
+async def on_wavelink_player_update(payload) -> None:
+    player = getattr(payload, "player", None)
+    guild = getattr(player, "guild", None)
+    if player is None or guild is None:
+        return
+
+    guild_id = guild.id
+    state = music_states.get(guild_id)
+    if not state or not state.get("current") or not getattr(player, "playing", False):
+        _playback_position_watch.pop(guild_id, None)
+        return
+
+    position = getattr(payload, "position", None)
+    if position is None:
+        position = getattr(player, "position", None)
+    if position is None:
+        return
+
+    now = time.monotonic()
+    watch = _playback_position_watch.get(guild_id)
+    if watch is None or position > watch["position"]:
+        _playback_position_watch[guild_id] = {
+            "position": position,
+            "last_advance": now,
+            "reported": False,
+        }
+        return
+
+    # Player updates arrive periodically. Log only once per stall, and only
+    # after 10 seconds without forward progress; do not restart or skip.
+    stalled_for = now - watch["last_advance"]
+    if stalled_for >= 10 and not watch["reported"]:
+        current = state.get("current") or {}
+        logger.warning(
+            "Playback position stalled: guild=%s track=%s position_ms=%s stalled_for=%.1fs "
+            "player_playing=%s connected=%s",
+            guild_id,
+            current.get("title", "unknown"),
+            position,
+            stalled_for,
+            getattr(player, "playing", "unknown"),
+            getattr(player, "connected", "unknown"),
+        )
+        watch["reported"] = True
+
+
 @bot.event
 async def on_wavelink_track_stuck(payload) -> None:
     """Log Lavalink playback stalls without restarting or skipping the track."""
