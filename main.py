@@ -2485,7 +2485,8 @@ async def on_message(message: discord.Message) -> None:
                 "`-mb sync` (requires Administrator)\n\n"
                 "**Movie text commands**\n"
                 "`-mb movie list` — list available local movies\n"
-                "`-mb movie search <title>` — search movie titles\n"
+                "`-mb movie <title>` — search titles with the movie embed\n"
+                "`-mb movie search <title>` — same search, explicit form\n"
                 "`-mb movie play <URL>` — post a movie page link\n"
                 "`-mb channel link <#channel or ID>` — set the movie channel (Administrator)\n"
                 "**Slash equivalents:** `/movie list`, `/movie search`, `/movie play`, `/channel link`\n",
